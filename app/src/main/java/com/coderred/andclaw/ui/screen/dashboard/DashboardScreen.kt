@@ -101,6 +101,9 @@ import com.coderred.andclaw.data.PairingRequest
 import com.coderred.andclaw.proot.BundleUpdateFailureState
 import com.coderred.andclaw.ui.component.KeepScreenOnEffect
 import com.coderred.andclaw.ui.component.SessionLogsDialog
+import com.coderred.andclaw.ui.component.TerminalDialog
+import com.coderred.andclaw.ui.component.TerminalLine
+import com.coderred.andclaw.ui.component.TerminalLineKind
 import com.coderred.andclaw.ui.theme.StatusError
 import com.coderred.andclaw.ui.theme.StatusRunning
 import com.coderred.andclaw.ui.theme.StatusStopped
@@ -108,6 +111,7 @@ import com.coderred.andclaw.ui.theme.StatusWarning
 import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -137,6 +141,11 @@ fun DashboardScreen(
     var apiKeyWarningProvider by remember { mutableStateOf<String?>(null) }
     var showSessionLogs by remember { mutableStateOf(false) }
     var logsExpanded by rememberSaveable { mutableStateOf(false) }
+    var showTerminalDialog by remember { mutableStateOf(false) }
+    var terminalCommandInput by rememberSaveable { mutableStateOf("") }
+    var terminalLines by remember { mutableStateOf<List<TerminalLine>>(emptyList()) }
+    var terminalExecuting by remember { mutableStateOf(false) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
 
     // 알림 권한 요청 (Android 13+)
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -195,6 +204,24 @@ fun DashboardScreen(
                     containerColor = Color.Transparent,
                 ),
                 actions = {
+                    IconButton(
+                        onClick = {
+                            if (terminalLines.isEmpty()) {
+                                terminalLines = listOf(
+                                    TerminalLine(
+                                        text = "andClaw terminal ready. Commands run inside proot rootfs.",
+                                        kind = TerminalLineKind.OUTPUT,
+                                    ),
+                                )
+                            }
+                            showTerminalDialog = true
+                        },
+                    ) {
+                        Icon(
+                            Icons.Default.History,
+                            contentDescription = "Open terminal",
+                        )
+                    }
                     IconButton(onClick = { onNavigateToSettings(null) }) {
                         Icon(
                             Icons.Default.Settings,
@@ -280,6 +307,72 @@ fun DashboardScreen(
             entries = sessionLogs,
             isLoading = isLoadingSessionLogs,
             onDismiss = { showSessionLogs = false },
+        )
+    }
+
+    if (showTerminalDialog) {
+        TerminalDialog(
+            lines = terminalLines,
+            commandInput = terminalCommandInput,
+            isExecuting = terminalExecuting,
+            onCommandInputChange = { terminalCommandInput = it },
+            onRunCommand = {
+                val command = terminalCommandInput.trim()
+                if (command.isBlank() || terminalExecuting) return@TerminalDialog
+                terminalCommandInput = ""
+                terminalLines = terminalLines + TerminalLine(
+                    text = "$ $command",
+                    kind = TerminalLineKind.COMMAND,
+                )
+                terminalExecuting = true
+                scope.launch {
+                    val result = viewModel.runTerminalCommand(command)
+                    terminalLines = if (result == null) {
+                        terminalLines + TerminalLine(
+                            text = "Failed to execute command.",
+                            kind = TerminalLineKind.ERROR,
+                        )
+                    } else {
+                        val base = mutableListOf<TerminalLine>()
+                        if (result.exitCode < 0 && result.output.isNotBlank()) {
+                            base += TerminalLine(
+                                text = result.output,
+                                kind = TerminalLineKind.ERROR,
+                            )
+                        }
+                        if (result.output.isNotBlank() && result.exitCode >= 0) {
+                            result.output.lineSequence()
+                                .forEach { line ->
+                                    base += TerminalLine(
+                                        text = line,
+                                        kind = if (result.exitCode == 0) {
+                                            TerminalLineKind.OUTPUT
+                                        } else {
+                                            TerminalLineKind.ERROR
+                                        },
+                                    )
+                                }
+                        }
+                        val exitLine = if (result.timedOut) {
+                            "Command timed out (exit=${result.exitCode})"
+                        } else {
+                            "Command finished (exit=${result.exitCode})"
+                        }
+                        base += TerminalLine(
+                            text = exitLine,
+                            kind = if (result.exitCode == 0 && !result.timedOut) {
+                                TerminalLineKind.OUTPUT
+                            } else {
+                                TerminalLineKind.ERROR
+                            },
+                        )
+                        terminalLines + base
+                    }
+                    terminalExecuting = false
+                }
+            },
+            onClear = { terminalLines = emptyList() },
+            onDismiss = { showTerminalDialog = false },
         )
     }
 

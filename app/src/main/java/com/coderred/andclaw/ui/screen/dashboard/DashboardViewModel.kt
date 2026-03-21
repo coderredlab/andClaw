@@ -24,6 +24,7 @@ import com.coderred.andclaw.data.parseOpenRouterModels
 import com.coderred.andclaw.proot.BundleUpdateFailureState
 import com.coderred.andclaw.proot.BundleUpdateOutcome
 import com.coderred.andclaw.proot.GatewayWsClient
+import com.coderred.andclaw.proot.ProotManager
 import com.coderred.andclaw.proot.WhatsAppLoginCoordinator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -196,6 +197,32 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             userInitiated = true,
             source = "dashboard:manual_restart",
         )
+    }
+
+    suspend fun runTerminalCommand(
+        command: String,
+        timeoutMs: Long = 120_000L,
+    ): ProotManager.CommandResult? {
+        val normalized = command.trim()
+        if (normalized.isBlank()) return null
+        if (!app.prootManager.isProotAvailable) {
+            return ProotManager.CommandResult(
+                exitCode = -2,
+                output = "proot binary is not available. Please complete setup again.",
+            )
+        }
+        if (!app.prootManager.isRootfsInstalled) {
+            return ProotManager.CommandResult(
+                exitCode = -3,
+                output = "Linux rootfs is missing. Please run setup first.",
+            )
+        }
+        return withContext(Dispatchers.IO) {
+            app.prootManager.executeWithResult(
+                command = normalized,
+                timeoutMs = timeoutMs,
+            )
+        }
     }
 
     fun openDashboard(context: Context) {
