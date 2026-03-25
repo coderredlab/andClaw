@@ -226,6 +226,9 @@ class SettingsViewModel(
     val ollamaModelId: StateFlow<String> = prefs.ollamaModelId
         .stateIn(viewModelScope, SharingStarted.Eagerly, "")
 
+    val ollamaCloudModelId: StateFlow<String> = prefs.ollamaCloudModelId
+        .stateIn(viewModelScope, SharingStarted.Eagerly, "")
+
     val openClawVersion: StateFlow<String> = prefs.openClawVersion
         .stateIn(viewModelScope, SharingStarted.Eagerly, "")
 
@@ -255,6 +258,11 @@ class SettingsViewModel(
         .stateIn(viewModelScope, SharingStarted.Eagerly, "auto")
     val memorySearchApiKey: StateFlow<String> = prefs.memorySearchApiKey
         .stateIn(viewModelScope, SharingStarted.Eagerly, "")
+
+    val isGatewayActive: Boolean
+        get() = processManager.gatewayState.value.status.let {
+            it == GatewayStatus.RUNNING || it == GatewayStatus.STARTING || it == GatewayStatus.ERROR
+        }
 
     val isLogSectionUnlocked: StateFlow<Boolean> = prefs.logSectionUnlocked
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
@@ -288,6 +296,9 @@ class SettingsViewModel(
 
     private val _modelLoadError = MutableStateFlow<String?>(null)
     val modelLoadError: StateFlow<String?> = _modelLoadError.asStateFlow()
+
+    private val _hasLoadedModels = MutableStateFlow(false)
+    val hasLoadedModels: StateFlow<Boolean> = _hasLoadedModels.asStateFlow()
 
     private val _whatsappQrState = MutableStateFlow<WhatsAppQrState>(WhatsAppQrState.Idle)
     val whatsappQrState: StateFlow<WhatsAppQrState> = _whatsappQrState.asStateFlow()
@@ -425,6 +436,9 @@ class SettingsViewModel(
                 prefs.setOpenAiCompatibleModelId(previousPrimaryModelId.removePrefix("openai-compatible/"))
             }
             prefs.setApiProvider(provider)
+            if (provider != previousProvider) {
+                _hasLoadedModels.value = false
+            }
             val appliedProvider = prefs.apiProvider.first()
             val appliedLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
             val runtimeChanged = hasRuntimeLaunchConfigChanged(
@@ -533,7 +547,11 @@ class SettingsViewModel(
             val selectedModelProvider = prefs.selectedModelProvider.first()
             val globalPrimaryModelId = prefs.selectedModel.first()
             val compatPrimaryModelId = prefs.openAiCompatibleModelId.first()
-            val ollamaPrimaryModelId = prefs.ollamaModelId.first()
+            val ollamaPrimaryModelId = if (provider == "ollama-cloud") {
+                prefs.ollamaCloudModelId.first()
+            } else {
+                prefs.ollamaModelId.first()
+            }
             val currentSelectedModelIds = prefs.currentProviderSelectedModelIds.first()
             if (models.isEmpty()) {
                 prefs.clearSelectedModels(provider)
@@ -575,6 +593,19 @@ class SettingsViewModel(
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             val previousLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
+            // Ensure the default model is in the provider's selected models list.
+            val bareModelId = PreferencesManager.canonicalizeModelId(provider, modelId)
+            if (bareModelId.isNotBlank()) {
+                val currentSelectedIds = prefs.getSelectedModelIdsForProvider(provider)
+                if (!currentSelectedIds.contains(bareModelId)) {
+                    val updatedIds = currentSelectedIds + bareModelId
+                    prefs.setSelectedModelIdsWithoutActivatingProvider(
+                        provider = provider,
+                        modelIds = updatedIds,
+                        primary = null,
+                    )
+                }
+            }
             prefs.setGlobalPrimaryModel(provider = provider, modelId = modelId)
             val appliedLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
             persistLaunchConfigIfRunnable(appliedLaunchConfig)
@@ -1020,6 +1051,7 @@ class SettingsViewModel(
                             }
                             "minimax" -> put("MINIMAX_API_KEY", apiKey)
                             "openai-compatible" -> put("OPENAI_COMPAT_API_KEY", apiKey)
+                            "ollama", "ollama-cloud" -> put("OLLAMA_API_KEY", apiKey)
                             "openrouter" -> put("OPENROUTER_API_KEY", apiKey)
                             "google" -> {
                                 put("GOOGLE_API_KEY", apiKey)
@@ -1877,6 +1909,7 @@ class SettingsViewModel(
         if (_isLoadingModels.value) return
         _isLoadingModels.value = true
         _modelLoadError.value = null
+        _hasLoadedModels.value = false
 
         viewModelScope.launch {
             try {
@@ -1921,6 +1954,7 @@ class SettingsViewModel(
                 _modelLoadError.value = e.message
             } finally {
                 _isLoadingModels.value = false
+                _hasLoadedModels.value = true
             }
         }
     }
@@ -1935,6 +1969,7 @@ class SettingsViewModel(
         if (_isLoadingModels.value) return
         _isLoadingModels.value = true
         _modelLoadError.value = null
+        _hasLoadedModels.value = false
 
         viewModelScope.launch {
             try {
@@ -1947,13 +1982,18 @@ class SettingsViewModel(
                                 contextLength = entry.contextLength,
                                 maxOutputTokens = entry.maxOutputTokens,
                                 isFree = false,
-                                pricing = if (provider == "ollama") "Local" else "Custom",
+                                pricing = when (provider) {
+                                    "ollama" -> "Local"
+                                    "ollama-cloud" -> "Cloud"
+                                    else -> "Custom"
+                                },
                                 supportsReasoning = entry.supportsReasoning,
                                 supportsImages = entry.supportsImages,
                             )
                         }
                     val providerModels = when (provider) {
                         "ollama" -> fetchOllamaModels(prefs.ollamaBaseUrl.first())
+                        "ollama-cloud" -> fetchOllamaCloudModels()
                         else -> loadBuiltInModels(provider)
                     }
                     (providerModels + persistedSelectedModels).distinctBy { it.id }
@@ -1961,7 +2001,7 @@ class SettingsViewModel(
                 _availableModels.value = models
                 if (models.isEmpty()) {
                     _modelLoadError.value = when (provider) {
-                        "ollama" -> "No models found on Ollama server."
+                        "ollama", "ollama-cloud" -> "No models found on Ollama server."
                         else -> "No built-in models found."
                     }
                 }
@@ -1969,11 +2009,12 @@ class SettingsViewModel(
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 _availableModels.value = emptyList()
                 _modelLoadError.value = when (provider) {
-                    "ollama" -> e.message ?: "Failed to load models from Ollama server."
+                    "ollama", "ollama-cloud" -> e.message ?: "Failed to load models from Ollama server."
                     else -> e.message ?: "Failed to load built-in models."
                 }
             } finally {
                 _isLoadingModels.value = false
+                _hasLoadedModels.value = true
             }
         }
     }
@@ -1992,6 +2033,25 @@ class SettingsViewModel(
                     supportsImages = entry.supportsImages,
                 )
             }
+    }
+
+    private suspend fun fetchOllamaCloudModels(): List<OpenRouterModel> {
+        val apiKey = prefs.getApiKeyForProvider("ollama-cloud")
+        return OpenClawModelCatalogReader.loadOllamaModelsFromServer(
+            baseUrl = "https://ollama.com",
+            apiKey = apiKey,
+        ).map { entry ->
+            OpenRouterModel(
+                id = entry.id,
+                name = entry.name,
+                contextLength = entry.contextWindow,
+                maxOutputTokens = entry.maxTokens,
+                isFree = false,
+                pricing = "Cloud",
+                supportsReasoning = entry.supportsReasoning,
+                supportsImages = entry.supportsImages,
+            )
+        }
     }
 
     private fun parseOpenRouterModelsLocal(jsonBody: String): List<OpenRouterModel> {
@@ -2204,6 +2264,7 @@ class SettingsViewModel(
                 builtInModel("MiniMax-M2.5-highspeed", contextWindow = 204_800, maxTokens = 131_072, supportsReasoning = true),
             )
             "ollama" -> emptyList()
+            "ollama-cloud" -> emptyList()
             "openai-compatible" -> emptyList()
             "google" -> listOf(
                 builtInModel("gemini-2.5-flash", contextWindow = 1_000_000, maxTokens = 8_192),
@@ -2969,6 +3030,7 @@ class SettingsViewModel(
     private fun syncApiKeyAuthProfile(provider: String, apiKey: String) {
         val normalizedProvider = when (provider.lowercase()) {
             "openai-codex" -> "openai"
+            "ollama-cloud" -> "ollama"
             else -> provider.lowercase()
         }
         if (normalizedProvider !in setOf("google", "openai", "anthropic", "openrouter", "openai-compatible", "zai", "kimi-coding", "minimax", "ollama")) return
@@ -3965,7 +4027,7 @@ internal fun resolveSelectionChangePrimaryDirective(
     val normalize: (String) -> String = { modelId ->
         when (normalizedProvider) {
             "openai-compatible" -> modelId.trim().removePrefix("openai-compatible/")
-            "ollama" -> modelId.trim().removePrefix("ollama/")
+            "ollama", "ollama-cloud" -> modelId.trim().removePrefix("ollama/").removePrefix("ollama-cloud/").removeSuffix(":latest")
             else -> modelId.trim()
         }
     }
@@ -3989,9 +4051,9 @@ internal fun resolveSelectionChangePrimaryDirective(
             !normalizedAppliedIds.contains(compatPrimary)
     if (compatPrimaryRemoved) return ""
 
-    val currentOllamaPrimary = ollamaModelId.trim().removePrefix("ollama/")
+    val currentOllamaPrimary = ollamaModelId.trim().removePrefix("ollama/").removePrefix("ollama-cloud/")
     val ollamaPrimaryRemoved =
-        normalizedProvider == "ollama" &&
+        (normalizedProvider == "ollama" || normalizedProvider == "ollama-cloud") &&
             currentOllamaPrimary.isNotBlank() &&
             normalizedCurrentIds.contains(currentOllamaPrimary) &&
             !normalizedAppliedIds.contains(currentOllamaPrimary)

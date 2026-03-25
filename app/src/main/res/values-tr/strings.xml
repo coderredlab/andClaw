@@ -261,6 +261,7 @@ Kurtarma sürerken uygulamayı kapatmayın veya zorla durdurmayın.</string>
     <string name="bug_report_included_gateway_logs">- Gateway UI günlükleri (temizlendi): %1$d satır</string>
     <string name="onboarding_provider_openai_compatible">Özel OpenAI API</string>
     <string name="onboarding_provider_ollama">Ollama (Yerel)</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>

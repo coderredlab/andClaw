@@ -261,6 +261,7 @@
     <string name="bug_report_included_gateway_logs">- गेटवे UI लॉग (सैनिटाइज़्ड): %1$d पंक्तियाँ</string>
     <string name="onboarding_provider_openai_compatible">कस्टम OpenAI API</string>
     <string name="onboarding_provider_ollama">Ollama (लोकल)</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>

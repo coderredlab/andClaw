@@ -262,6 +262,7 @@ Ne fermez pas l’application et ne forcez pas son arrêt tant que la récupéra
     <string name="bug_report_included_gateway_logs">- Journaux UI du gateway (nettoyés) : %1$d lignes</string>
     <string name="onboarding_provider_openai_compatible">API OpenAI personnalisée</string>
     <string name="onboarding_provider_ollama">Ollama (local)</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>

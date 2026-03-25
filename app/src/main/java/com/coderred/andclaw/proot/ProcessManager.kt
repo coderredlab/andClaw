@@ -90,7 +90,16 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { pathToFileURL } from "node:url";
 
-const [channelInput, codeInput] = process.argv.slice(1);
+// Inline os.networkInterfaces() patch for proot compatibility (Node.js v24+ --require + --input-type=module conflict)
+const _origNI = os.networkInterfaces;
+os.networkInterfaces = function() {
+  try { return _origNI.call(this); } catch {
+    return { lo: [{ address: "127.0.0.1", netmask: "255.0.0.0", family: "IPv4", mac: "00:00:00:00:00:00", internal: true, cidr: "127.0.0.1/8" }] };
+  }
+};
+
+const channelInput = process.env.DENY_CHANNEL || process.argv.slice(1).filter(a => a !== "-")[0];
+const codeInput = process.env.DENY_CODE || process.argv.slice(1).filter(a => a !== "-")[1];
 
 function normalizeChannel(value) {
   const normalized = String(value ?? "").trim().toLowerCase();
@@ -170,36 +179,42 @@ function resolveDistDir() {
   return envDir || "/usr/local/lib/node_modules/openclaw/dist";
 }
 
-async function importDistModule(prefix, requiredExports) {
+function findExportByName(moduleExports, targetName) {
+  // minified export에서 원본 이름으로 re-export된 경우 (export { x as originalName })
+  if (typeof moduleExports[targetName] === "function") return moduleExports[targetName];
+  // minified: export 이름을 모르니 모든 function export를 검사하여 .name으로 매칭
+  for (const key of Object.keys(moduleExports)) {
+    const val = moduleExports[key];
+    if (typeof val === "function" && val.name === targetName) return val;
+  }
+  return null;
+}
+
+async function importDistExport(prefix, exportName) {
   const distDir = resolveDistDir();
   const candidates = fs.readdirSync(distDir).filter((name) => name.startsWith(prefix) && name.endsWith(".js")).sort();
   if (candidates.length === 0) {
     throw new Error("missing openclaw module: " + prefix);
   }
-  const incompatibles = [];
+  const errors = [];
   for (const fileName of candidates) {
     const modulePath = path.join(distDir, fileName);
     let loaded;
     try {
       loaded = await import(pathToFileURL(modulePath).href);
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      incompatibles.push(fileName + " import failed: " + reason);
+      errors.push(fileName + " import failed: " + (error instanceof Error ? error.message : String(error)));
       continue;
     }
-    const missing = requiredExports.filter((key) => typeof loaded[key] !== "function");
-    if (missing.length === 0) {
-      return loaded;
-    }
-    incompatibles.push(fileName + " missing exports: " + missing.join(","));
+    const fn = findExportByName(loaded, exportName);
+    if (fn) return fn;
+    errors.push(fileName + " missing: " + exportName);
   }
-  throw new Error("no compatible module for " + prefix + ": " + incompatibles.join("; "));
+  throw new Error("no module for " + prefix + " with " + exportName + ": " + errors.join("; "));
 }
 
-const pairingStoreModule = await importDistModule("pairing-store-", ["o"]);
-const authProfilesModule = await importDistModule("auth-profiles-", ["D"]);
-const removeChannelAllowFromStoreEntry = pairingStoreModule.o;
-const withFileLock = authProfilesModule.D;
+const removeChannelAllowFromStoreEntry = await importDistExport("pairing-store-", "removeChannelAllowFromStoreEntry");
+const withFileLock = await importDistExport("file-lock-", "withFileLock");
 
 const lockOptions = {
   retries: {
@@ -590,6 +605,7 @@ class ProcessManager(
                             "minimax" -> put("MINIMAX_API_KEY", apiKey)
                             "openai-compatible" -> put("OPENAI_COMPAT_API_KEY", apiKey)
                             "ollama" -> put("OLLAMA_API_KEY", apiKey)
+                            "ollama-cloud" -> put("OLLAMA_API_KEY", apiKey)
                             "openrouter" -> put("OPENROUTER_API_KEY", apiKey)
                             "google" -> {
                                 put("GEMINI_API_KEY", apiKey)
@@ -1032,6 +1048,7 @@ class ProcessManager(
                     "minimax" -> "MiniMax-M2.5"
                 "openai-compatible" -> ""
                 "ollama" -> ""
+                "ollama-cloud" -> ""
                     "google" -> "gemini-2.5-flash"
                     else -> "openrouter/free"
                 }
@@ -1113,6 +1130,10 @@ class ProcessManager(
                         val id = modelId.removePrefix("ollama/").removeSuffix(":latest")
                         "ollama/$id"
                     }
+                    "ollama-cloud" -> {
+                        val id = modelId.removePrefix("ollama/").removePrefix("ollama-cloud/").removeSuffix(":latest")
+                        "ollama/$id"
+                    }
                     "google" -> {
                         val id = when {
                             modelId.startsWith("google/") -> modelId.removePrefix("google/")
@@ -1146,6 +1167,7 @@ class ProcessManager(
                 "minimax" -> setOf("minimax/")
                 "openai-compatible" -> setOf("openai-compatible/")
                 "ollama" -> setOf("ollama/")
+                "ollama-cloud" -> setOf("ollama/")
                 "google" -> setOf("google/")
                 else -> setOf("${provider.trim().lowercase()}/")
             }
@@ -1184,7 +1206,7 @@ class ProcessManager(
 
                     modelKey.startsWith("ollama/") -> {
                         val id = modelKey.removePrefix("ollama/").removeSuffix(":latest")
-                        val currentTarget = apiProvider == "ollama" && modelKey in targetModels
+                        val currentTarget = (apiProvider == "ollama" || apiProvider == "ollama-cloud") && modelKey in targetModels
                         currentTarget || registeredCustomModelIds["ollama"].orEmpty().contains(id)
                     }
 
@@ -1372,16 +1394,24 @@ class ProcessManager(
                         "models=${compatEntries.map { it.id }}, baseUrl='$normalizedBaseUrl'"
                 )
                 changed = true
-            } else if (apiProvider == "ollama") {
+            } else if (apiProvider == "ollama" || apiProvider == "ollama-cloud") {
                 val ollamaEntries = normalizedSelectedEntries
-                    .map { entry -> entry.copy(id = entry.id.removePrefix("ollama/").removeSuffix(":latest")) }
-                val normalizedBaseUrl = ollamaBaseUrl.trim().trimEnd('/').ifBlank { "http://127.0.0.1:11434" }
+                    .map { entry -> entry.copy(id = entry.id.removePrefix("ollama-cloud/").removePrefix("ollama/").removeSuffix(":latest")) }
+                val normalizedBaseUrl = if (apiProvider == "ollama-cloud") {
+                    "https://ollama.com"
+                } else {
+                    ollamaBaseUrl.trim().trimEnd('/').ifBlank { "http://127.0.0.1:11434" }
+                }
                 val models = json.optJSONObject("models") ?: JSONObject().also { json.put("models", it) }
                 val providers = models.optJSONObject("providers") ?: JSONObject().also { models.put("providers", it) }
                 providers.put("ollama", JSONObject().apply {
                     put("baseUrl", normalizedBaseUrl)
                     put("api", "ollama")
-                    put("apiKey", if (apiKey.isNotBlank()) "ollama-local" else "ollama-local")
+                    put("apiKey", when {
+                        apiProvider == "ollama-cloud" && apiKey.isNotBlank() -> "OLLAMA_API_KEY"
+                        apiProvider == "ollama-cloud" -> ""
+                        else -> "ollama-local"
+                    })
                     put("models", org.json.JSONArray().apply {
                         ollamaEntries.forEach { entry ->
                             put(buildModelEntryJson(entry, api = "ollama"))
@@ -1392,6 +1422,7 @@ class ProcessManager(
                     modelEntries = ollamaEntries,
                     baseUrl = normalizedBaseUrl,
                     apiKey = apiKey,
+                    apiProvider = apiProvider,
                 )
                 addLog(
                     "[andClaw] Ollama provider configured: " +
@@ -1553,10 +1584,10 @@ class ProcessManager(
                 dcPlugin.put("enabled", channelConfig.discordEnabled && channelConfig.discordBotToken.isNotBlank())
                 entries.put("discord", dcPlugin)
 
-                // WhatsApp
-                val waPlugin = entries.optJSONObject("whatsapp") ?: JSONObject()
-                waPlugin.put("enabled", channelConfig.whatsappEnabled)
-                entries.put("whatsapp", waPlugin)
+                // WhatsApp은 코어 채널이므로 plugins.entries 불필요 (stale entry 정리)
+                if (entries.has("whatsapp")) {
+                    entries.remove("whatsapp")
+                }
 
                 configFile.writeText(json.toString(2))
             } catch (e: Exception) {
@@ -1841,12 +1872,18 @@ class ProcessManager(
         modelEntries: List<ModelSelectionEntry>,
         baseUrl: String,
         apiKey: String,
+        apiProvider: String = "ollama",
     ) {
         try {
             val providerConfig = JSONObject().apply {
                 put("baseUrl", baseUrl)
                 put("api", "ollama")
-                put("apiKey", if (apiKey.isNotBlank()) "\${OLLAMA_API_KEY}" else "ollama-local")
+                put("apiKey", when {
+                    apiProvider == "ollama-cloud" && apiKey.isNotBlank() -> "OLLAMA_API_KEY"
+                    apiProvider == "ollama-cloud" -> ""
+                    apiKey.isNotBlank() -> "OLLAMA_API_KEY"
+                    else -> "ollama-local"
+                })
                 put("models", org.json.JSONArray().apply {
                     modelEntries
                         .map { it.copy(id = it.id.trim()) }
@@ -1964,9 +2001,21 @@ class ProcessManager(
 
     private fun ensurePatchFile() {
         val patchFile = File(prootManager.rootfsDir, "root/.openclaw-patch.js")
-        if (!patchFile.exists()) {
+        val needsUpdate = !patchFile.exists() ||
+            !patchFile.readText().contains("uncaughtException")
+        if (needsUpdate) {
             addLog("[andClaw] Creating Node.js compatibility patch...")
             patchFile.writeText(buildString {
+                // Prevent undici TLS null-socket crash (e.g. Telegram fetch fallback)
+                appendLine("process.on('uncaughtException', function(err) {")
+                appendLine("  if (err && err.message && err.message.includes('setServername')) {")
+                appendLine("    console.error('[openclaw-patch] Suppressed TLS crash:', err.message);")
+                appendLine("    return;")
+                appendLine("  }")
+                appendLine("  console.error('[openclaw] Uncaught exception:', err);")
+                appendLine("  process.exit(1);")
+                appendLine("});")
+                appendLine()
                 appendLine("const os = require('os');")
                 appendLine("const _ni = os.networkInterfaces;")
                 appendLine("os.networkInterfaces = function() {")
@@ -2174,9 +2223,10 @@ class ProcessManager(
                     return@withContext false
                 }
 
-                val command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
-                    "node --input-type=module -e '${escapeSingleQuotedShell(openClawPairingDenyScript)}' " +
-                    "'${escapeSingleQuotedShell(normalizedChannel)}' '${escapeSingleQuotedShell(normalizedCode)}' 2>&1"
+                // heredoc + 환경변수로 stdin 전달 (파일 생성 없이 ESM 스크립트 실행)
+                val command = "DENY_CHANNEL='${escapeSingleQuotedShell(normalizedChannel)}' " +
+                    "DENY_CODE='${escapeSingleQuotedShell(normalizedCode)}' " +
+                    "node --input-type=module 2>&1 <<'__DENY_EOF__'\n${openClawPairingDenyScript}\n__DENY_EOF__"
                 val result = prootManager.executeWithResult(
                     command = command,
                     timeoutMs = 120_000,
@@ -2185,9 +2235,14 @@ class ProcessManager(
 
                 val success = !result.timedOut && result.exitCode == 0
                 if (!success) {
-                    val reason = result.output.lineSequence().lastOrNull { it.isNotBlank() }
+                    val output = result.output.trim()
+                    val reason = output.lineSequence().lastOrNull { it.isNotBlank() && !it.startsWith("Node.js v") }
+                        ?: output.lineSequence().lastOrNull { it.isNotBlank() }
                         ?: "exit=${result.exitCode}"
                     addLog("[andClaw] Pairing deny failed: $reason")
+                    if (output.lines().size > 1) {
+                        addLog("[andClaw] Pairing deny output: ${output.take(500)}")
+                    }
                     return@withContext false
                 }
 
@@ -2287,6 +2342,7 @@ class ProcessManager(
                     "minimax" -> put("MINIMAX_API_KEY", lastApiKey)
                     "openai-compatible" -> put("OPENAI_COMPAT_API_KEY", lastApiKey)
                     "ollama" -> put("OLLAMA_API_KEY", lastApiKey)
+                    "ollama-cloud" -> put("OLLAMA_API_KEY", lastApiKey)
                     "openrouter" -> put("OPENROUTER_API_KEY", lastApiKey)
                     "google" -> {
                         put("GOOGLE_API_KEY", lastApiKey)

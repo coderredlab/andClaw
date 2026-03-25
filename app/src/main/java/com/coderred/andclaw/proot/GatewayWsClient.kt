@@ -42,14 +42,6 @@ class GatewayWsClient(private val prootManager: ProotManager) {
         private val GATEWAY_STATUS_CALL_MUTEX = Mutex()
     }
 
-    data class HealthProbeTimeoutBudget(
-        val normalizedTimeoutMs: Long,
-        val openTimeoutMs: Long,
-        val handshakeTimeoutMs: Long,
-        val statusTimeoutMs: Long,
-        val statusProbeTimeoutMs: Long,
-    )
-
     data class WhatsAppChannelSnapshot(
         val accountId: String?,
         val configured: Boolean?,
@@ -190,66 +182,36 @@ class GatewayWsClient(private val prootManager: ProotManager) {
     }
 
     suspend fun probeGatewayHealth(timeoutMs: Long = 8_000L): Boolean {
-        val budget = resolveHealthProbeTimeoutBudget(timeoutMs)
-        val token = getAuthToken()
+        val normalizedTimeout = timeoutMs.coerceIn(2_000L, 20_000L)
         return try {
-            withTimeoutOrNull(budget.normalizedTimeoutMs) {
-                if (token.isBlank()) {
-                    return@withTimeoutOrNull probeGatewayHealthViaCli(budget)
+            withTimeoutOrNull(normalizedTimeout) {
+                withContext(Dispatchers.IO) {
+                    probeGatewayHealthViaHttp(normalizedTimeout)
                 }
-                if (
-                    !connect(
-                        openTimeoutMs = budget.openTimeoutMs,
-                        handshakeTimeoutMs = budget.handshakeTimeoutMs,
-                    )
-                ) {
-                    return@withTimeoutOrNull probeGatewayHealthViaCli(budget)
-                }
-
-                val probeResult = call(
-                    method = gatewayHealthProbeMethod(),
-                    params = gatewayHealthProbeParams(),
-                    timeoutMs = budget.statusTimeoutMs,
-                )
-                probeResult != null
             } ?: false
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             false
-        } finally {
-            close()
         }
     }
 
-    private suspend fun probeGatewayHealthViaCli(budget: HealthProbeTimeoutBudget): Boolean {
-        val probeResult = callViaGatewayCli(
-            method = gatewayHealthProbeMethod(),
-            params = gatewayHealthProbeParams(),
-            timeoutMs = budget.statusTimeoutMs,
-        )
-        return probeResult != null
-    }
-
-    internal fun gatewayHealthProbeMethod(): String = "health"
-
-    internal fun gatewayHealthProbeParams(): JSONObject = JSONObject()
-
-    internal fun resolveHealthProbeTimeoutBudget(timeoutMs: Long): HealthProbeTimeoutBudget {
-        val normalizedTimeoutMs = timeoutMs.coerceIn(2_000L, 20_000L)
-        val connectTimeoutMs = ((normalizedTimeoutMs * 2) / 3)
-            .coerceIn(1_000L, normalizedTimeoutMs - 1_000L)
-        val openTimeoutMs = (connectTimeoutMs / 2).coerceAtLeast(500L)
-        val handshakeTimeoutMs = (connectTimeoutMs - openTimeoutMs).coerceAtLeast(500L)
-        val statusTimeoutMs = (normalizedTimeoutMs - connectTimeoutMs).coerceAtLeast(1_000L)
-        val statusProbeTimeoutMs = (statusTimeoutMs - 250L).coerceIn(750L, 5_000L)
-        return HealthProbeTimeoutBudget(
-            normalizedTimeoutMs = normalizedTimeoutMs,
-            openTimeoutMs = openTimeoutMs,
-            handshakeTimeoutMs = handshakeTimeoutMs,
-            statusTimeoutMs = statusTimeoutMs,
-            statusProbeTimeoutMs = statusProbeTimeoutMs,
-        )
+    private fun probeGatewayHealthViaHttp(timeoutMs: Long): Boolean {
+        val client = OkHttpClient.Builder()
+            .connectTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .readTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+            .build()
+        val request = Request.Builder()
+            .url("http://127.0.0.1:18789/health")
+            .get()
+            .build()
+        return try {
+            client.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
+        } catch (_: Exception) {
+            false
+        }
     }
 
     /**

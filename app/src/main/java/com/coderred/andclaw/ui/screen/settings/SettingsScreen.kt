@@ -121,6 +121,7 @@ fun SettingsScreen(
     val openAiCompatibleModelId by viewModel.openAiCompatibleModelId.collectAsState()
     val ollamaBaseUrl by viewModel.ollamaBaseUrl.collectAsState()
     val ollamaModelId by viewModel.ollamaModelId.collectAsState()
+    val ollamaCloudModelId by viewModel.ollamaCloudModelId.collectAsState()
     val selectedModel by viewModel.selectedModel.collectAsState()
     val selectedModelProvider by viewModel.selectedModelProvider.collectAsState()
     val selectedModelIds by viewModel.currentProviderSelectedModelIds.collectAsState()
@@ -128,6 +129,7 @@ fun SettingsScreen(
     val availableModels by viewModel.availableModels.collectAsState()
     val isLoadingModels by viewModel.isLoadingModels.collectAsState()
     val modelLoadError by viewModel.modelLoadError.collectAsState()
+    val hasLoadedModels by viewModel.hasLoadedModels.collectAsState()
     val telegramEnabled by viewModel.telegramEnabled.collectAsState()
     val telegramBotToken by viewModel.telegramBotToken.collectAsState()
     val discordEnabled by viewModel.discordEnabled.collectAsState()
@@ -180,6 +182,7 @@ fun SettingsScreen(
             "kimi-coding" -> context.getString(R.string.onboarding_provider_kimi_coding)
             "minimax" -> context.getString(R.string.onboarding_provider_minimax)
             "ollama" -> context.getString(R.string.onboarding_provider_ollama)
+            "ollama-cloud" -> context.getString(R.string.onboarding_provider_ollama_cloud)
             "openai-compatible" -> context.getString(R.string.onboarding_provider_openai_compatible)
             "google" -> context.getString(R.string.onboarding_provider_google)
             else -> provider
@@ -510,6 +513,7 @@ fun SettingsScreen(
                                 "kimi-coding" -> stringResource(R.string.onboarding_provider_kimi_coding)
                                 "minimax" -> stringResource(R.string.onboarding_provider_minimax)
                                 "ollama" -> stringResource(R.string.onboarding_provider_ollama)
+                                "ollama-cloud" -> stringResource(R.string.onboarding_provider_ollama_cloud)
                                 "openai-compatible" -> stringResource(R.string.onboarding_provider_openai_compatible)
                                 "google" -> stringResource(R.string.onboarding_provider_google)
                                 else -> apiProvider.replaceFirstChar { it.uppercase() }
@@ -646,6 +650,7 @@ fun SettingsScreen(
                     SettingClickableRow(
                         title = stringResource(R.string.settings_select_model),
                         value = when {
+                            selectedModelIds.isEmpty() && !hasLoadedModels -> ""
                             selectedModelIds.isEmpty() -> stringResource(R.string.settings_model_none_found)
                             else -> selectedModelIds.joinToString(", ") {
                                 formatSelectedModelLabel(apiProvider, it)
@@ -1039,9 +1044,7 @@ fun SettingsScreen(
             onApplySelection = { models ->
                 viewModel.applySelectedModels(models) { _, changed ->
                     showModelDialog = false
-                    viewModel.shouldShowRestartPromptForRuntimeChange(changed) { shouldShow ->
-                        showRestartHint = shouldShow
-                    }
+                    showRestartHint = changed && viewModel.isGatewayActive
                 }
             },
             onDismiss = { showModelDialog = false },
@@ -1057,9 +1060,7 @@ fun SettingsScreen(
             onApplySelection = { option ->
                 viewModel.setGlobalDefaultModel(option.provider, option.modelId) { changed ->
                     showDefaultModelDialog = false
-                    viewModel.shouldShowRestartPromptForRuntimeChange(changed) { shouldShow ->
-                        showRestartHint = shouldShow
-                    }
+                    showRestartHint = changed && viewModel.isGatewayActive
                 }
             },
             onDismiss = { showDefaultModelDialog = false },
@@ -1072,9 +1073,7 @@ fun SettingsScreen(
             currentProvider = apiProvider,
             onSelectProvider = { provider ->
                 viewModel.setApiProvider(provider) { _, changed ->
-                    viewModel.shouldShowRestartPromptForRuntimeChange(changed) { shouldShow ->
-                        showRestartHint = shouldShow
-                    }
+                    showRestartHint = changed && viewModel.isGatewayActive
                 }
                 showProviderDialog = false
             },
@@ -1096,21 +1095,17 @@ fun SettingsScreen(
             currentModelId = resolveApiKeyDialogModelId(
                 provider = dialogProvider,
                 openAiCompatibleModelId = openAiCompatibleModelId,
-                ollamaModelId = ollamaModelId,
+                ollamaModelId = if (dialogProvider == "ollama-cloud") ollamaCloudModelId else ollamaModelId,
                 selectedModel = selectedModel,
             ),
             onSave = { key ->
                 if (dialogProvider == apiProvider) {
                     viewModel.setApiKey(key) { _, changed ->
-                        viewModel.shouldShowRestartPromptForRuntimeChange(changed) { shouldShow ->
-                            showRestartHint = shouldShow
-                        }
+                        showRestartHint = changed && viewModel.isGatewayActive
                     }
                 } else {
                     viewModel.setApiKeyForProvider(dialogProvider, key) { _, changed ->
-                        viewModel.shouldShowRestartPromptForRuntimeChange(changed) { shouldShow ->
-                            showRestartHint = shouldShow
-                        }
+                        showRestartHint = changed && viewModel.isGatewayActive
                     }
                 }
                 showApiKeyDialog = false
@@ -1127,9 +1122,7 @@ fun SettingsScreen(
                         globalPrimaryProvider = selectedModelProvider,
                     ),
                     onApplied = { changed ->
-                        viewModel.shouldShowRestartPromptForRuntimeChange(changed) { shouldShow ->
-                            showRestartHint = shouldShow
-                        }
+                        showRestartHint = changed && viewModel.isGatewayActive
                     },
                 )
                 showApiKeyDialog = false
@@ -1145,9 +1138,7 @@ fun SettingsScreen(
                         globalPrimaryProvider = selectedModelProvider,
                     ),
                     onApplied = { changed ->
-                        viewModel.shouldShowRestartPromptForRuntimeChange(changed) { shouldShow ->
-                            showRestartHint = shouldShow
-                        }
+                        showRestartHint = changed && viewModel.isGatewayActive
                     },
                 )
                 showApiKeyDialog = false
@@ -2005,7 +1996,7 @@ internal fun resolveApiKeyDialogModelId(
 ): String {
     return when (provider) {
         "openai-compatible" -> openAiCompatibleModelId.removePrefix("openai-compatible/")
-        "ollama" -> ollamaModelId.removePrefix("ollama/")
+        "ollama", "ollama-cloud" -> ollamaModelId.removePrefix("ollama/").removePrefix("ollama-cloud/")
         else -> selectedModel
     }
 }
@@ -2106,7 +2097,7 @@ internal fun formatCanonicalSelectedModelId(
     if (trimmedModelId.isBlank()) return ""
     return when (trimmedProvider) {
         "openai-compatible" -> trimmedModelId.removePrefix("openai-compatible/").trim()
-        "ollama" -> trimmedModelId.removePrefix("ollama/").trim()
+        "ollama", "ollama-cloud" -> trimmedModelId.removePrefix("ollama/").removePrefix("ollama-cloud/").trim()
         else -> trimmedModelId
     }
 }
@@ -2126,7 +2117,7 @@ internal fun formatSelectedModelLabel(
         "zai" -> canonicalModelId.removePrefix("zai/")
         "kimi-coding" -> canonicalModelId.removePrefix("kimi-coding/")
         "minimax" -> canonicalModelId.removePrefix("minimax/")
-        "ollama" -> canonicalModelId.removePrefix("ollama/")
+        "ollama", "ollama-cloud" -> canonicalModelId.removePrefix("ollama/").removePrefix("ollama-cloud/")
         else -> canonicalModelId
     }
 }
@@ -2449,6 +2440,7 @@ private fun ProviderSelectionDialog(
         "kimi-coding" to stringResource(R.string.onboarding_provider_kimi_coding),
         "minimax" to stringResource(R.string.onboarding_provider_minimax),
         "ollama" to stringResource(R.string.onboarding_provider_ollama),
+        "ollama-cloud" to stringResource(R.string.onboarding_provider_ollama_cloud),
         "openai-compatible" to stringResource(R.string.onboarding_provider_openai_compatible),
     )
 
@@ -2457,7 +2449,7 @@ private fun ProviderSelectionDialog(
         shape = RoundedCornerShape(24.dp),
         title = { Text(stringResource(R.string.settings_change_provider)) },
         text = {
-            Column {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
                 providers.forEach { (id, label) ->
                     Row(
                         modifier = Modifier
@@ -2571,6 +2563,7 @@ private fun ApiKeyInputDialog(
         "kimi-coding" -> stringResource(R.string.onboarding_provider_kimi_coding)
         "minimax" -> stringResource(R.string.onboarding_provider_minimax)
         "ollama" -> stringResource(R.string.onboarding_provider_ollama)
+        "ollama-cloud" -> stringResource(R.string.onboarding_provider_ollama_cloud)
         "openai-compatible" -> stringResource(R.string.onboarding_provider_openai_compatible)
         else -> provider.replaceFirstChar { it.uppercase() }
     }
@@ -2585,6 +2578,7 @@ private fun ApiKeyInputDialog(
         "kimi-coding" -> "https://www.kimi.com/coding/docs/en/"
         "minimax" -> "https://platform.minimax.io/document/Quickstart"
         "ollama" -> "https://docs.openclaw.ai/providers/ollama"
+        "ollama-cloud" -> "https://ollama.com/settings/keys"
         else -> null
     }
 

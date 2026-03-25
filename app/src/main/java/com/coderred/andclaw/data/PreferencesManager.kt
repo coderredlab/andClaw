@@ -271,6 +271,8 @@ class PreferencesManager(private val context: Context) {
             "api_key_minimax",
             "api_key_openai_compatible",
             "api_key_ollama",
+            "api_key_ollama_cloud",
+            "ollama_cloud_model_id",
             "openai_compatible_base_url",
             "openai_compatible_model_id",
             "ollama_base_url",
@@ -315,6 +317,8 @@ class PreferencesManager(private val context: Context) {
         private val KEY_OPENAI_COMPATIBLE_BASE_URL = stringPreferencesKey("openai_compatible_base_url")
         private val KEY_OPENAI_COMPATIBLE_MODEL_ID = stringPreferencesKey("openai_compatible_model_id")
         private val KEY_API_KEY_OLLAMA = stringPreferencesKey("api_key_ollama")
+        private val KEY_API_KEY_OLLAMA_CLOUD = stringPreferencesKey("api_key_ollama_cloud")
+        private val KEY_OLLAMA_CLOUD_MODEL_ID = stringPreferencesKey("ollama_cloud_model_id")
 private val KEY_OLLAMA_BASE_URL = stringPreferencesKey("ollama_base_url")
 private val KEY_OLLAMA_MODEL_ID = stringPreferencesKey("ollama_model_id")
 private val OLLAMA_SERVER_PREFERRED_KEY = booleanPreferencesKey("ollama_server_preferred")
@@ -422,6 +426,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             "kimi-coding",
             "minimax",
             "openai-compatible",
+            "ollama-cloud",
             "ollama",
         )
         private val BARE_CODEX_MODEL_IDS = setOf(
@@ -442,6 +447,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                 "minimax" -> "MiniMax-M2.5"
             "openai-compatible" -> ""
             "ollama" -> ""
+            "ollama-cloud" -> ""
                 "google" -> "gemini-2.5-flash"
                 else -> "openrouter/free"
             }
@@ -466,6 +472,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                 "openai-codex",
                 "github-copilot",
                 "openai-compatible",
+                "ollama-cloud",
                 "ollama",
                 "google",
                 "zai",
@@ -475,12 +482,15 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             return candidates.firstOrNull { normalized.startsWith("$it/") }
         }
 
+        fun canonicalizeModelId(provider: String, modelId: String): String =
+            canonicalizeModelIdForProvider(provider, modelId)
+
         private fun canonicalizeModelIdForProvider(provider: String, modelId: String): String {
             val trimmedModelId = modelId.trim()
             if (trimmedModelId.isBlank()) return ""
             return when (normalizeProvider(provider)) {
                 "openai-compatible" -> trimmedModelId.removePrefix("openai-compatible/").trim()
-                "ollama" -> trimmedModelId.removePrefix("ollama/").removeSuffix(":latest").trim()
+                "ollama", "ollama-cloud" -> trimmedModelId.removePrefix("ollama/").removePrefix("ollama-cloud/").removeSuffix(":latest").trim()
                 else -> trimmedModelId
             }
         }
@@ -640,7 +650,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                     "kimi-coding" -> lowerModelId == "k2p5" || lowerModelId.startsWith("kimi-")
                     "minimax" -> lowerModelId.startsWith("minimax-")
                     "openai-compatible" -> true
-                    "ollama" -> true
+                    "ollama", "ollama-cloud" -> true
                     "google" -> lowerModelId.startsWith("gemini")
                     else -> false
                 }
@@ -653,7 +663,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                             trimmedModelId.substringAfter("openai/").lowercase().contains("codex"))
                 }
                 "openai-compatible" -> providerPrefix == "openai-compatible" || providerPrefix == "openai"
-                "ollama" -> providerPrefix == "ollama"
+                "ollama", "ollama-cloud" -> providerPrefix == "ollama" || providerPrefix == "ollama-cloud"
                 else -> providerPrefix == normalizedProvider
             }
         }
@@ -899,6 +909,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             "openai-compatible" -> activeProfile?.apiKey?.trim().orEmpty()
                 .ifBlank { prefs[KEY_API_KEY_OPENAI_COMPATIBLE].orEmpty() }
             "ollama" -> prefs[KEY_API_KEY_OLLAMA] ?: ""
+            "ollama-cloud" -> prefs[KEY_API_KEY_OLLAMA_CLOUD] ?: ""
             "google" -> prefs[KEY_API_KEY_GOOGLE] ?: ""
             else -> legacy
         }
@@ -910,6 +921,10 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
 
     val ollamaModelId: Flow<String> = context.dataStore.data.map { prefs ->
         prefs[KEY_OLLAMA_MODEL_ID]?.trim()?.removePrefix("ollama/")?.removeSuffix(":latest").orEmpty()
+    }
+
+    val ollamaCloudModelId: Flow<String> = context.dataStore.data.map { prefs ->
+        prefs[KEY_OLLAMA_CLOUD_MODEL_ID]?.trim()?.removePrefix("ollama-cloud/")?.removePrefix("ollama/")?.removeSuffix(":latest").orEmpty()
     }
 
     val openAiCompatibleBaseUrl: Flow<String> = context.dataStore.data.map { prefs ->
@@ -1388,6 +1403,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                     it[KEY_OPENAI_COMPATIBLE_PROFILES_JSON] = encodeOpenAiCompatibleProfiles(profiles)
                 }
                 "ollama" -> it[KEY_API_KEY_OLLAMA] = key
+                "ollama-cloud" -> it[KEY_API_KEY_OLLAMA_CLOUD] = key
                 "google" -> it[KEY_API_KEY_GOOGLE] = key
                 else -> { /* no-op */ }
             }
@@ -1413,6 +1429,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                     .ifBlank { snapshot[KEY_API_KEY_OPENAI_COMPATIBLE].orEmpty() }
             }
             "ollama" -> snapshot[KEY_API_KEY_OLLAMA].orEmpty()
+            "ollama-cloud" -> snapshot[KEY_API_KEY_OLLAMA_CLOUD].orEmpty()
             "google" -> snapshot[KEY_API_KEY_GOOGLE].orEmpty()
             else -> legacy
         }
@@ -1437,6 +1454,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                     .ifBlank { snapshot[KEY_API_KEY_OPENAI_COMPATIBLE].orEmpty() }
             }
             "ollama" -> snapshot[KEY_API_KEY_OLLAMA].orEmpty()
+            "ollama-cloud" -> snapshot[KEY_API_KEY_OLLAMA_CLOUD].orEmpty()
             "google" -> snapshot[KEY_API_KEY_GOOGLE].orEmpty()
             else -> legacy
         }
@@ -1802,6 +1820,8 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                         prefs[KEY_OPENAI_COMPATIBLE_MODEL_ID] = explicitPrimary
                     } else if (normalizedProvider == "ollama") {
                         prefs[KEY_OLLAMA_MODEL_ID] = explicitPrimary
+                    } else if (normalizedProvider == "ollama-cloud") {
+                        prefs[KEY_OLLAMA_CLOUD_MODEL_ID] = explicitPrimary
                     }
                 } else if (hasExplicitPrimaryDirective) {
                     if (globalPrimaryProvider == normalizedProvider) {
@@ -1820,6 +1840,8 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                         prefs.remove(KEY_OPENAI_COMPATIBLE_MODEL_ID)
                     } else if (normalizedProvider == "ollama") {
                         prefs.remove(KEY_OLLAMA_MODEL_ID)
+                    } else if (normalizedProvider == "ollama-cloud") {
+                        prefs.remove(KEY_OLLAMA_CLOUD_MODEL_ID)
                     }
                 }
             }
@@ -1892,6 +1914,8 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                 }
             } else if (normalizedProvider == "ollama") {
                 prefs[KEY_OLLAMA_MODEL_ID] = normalizedModelId
+            } else if (normalizedProvider == "ollama-cloud") {
+                prefs[KEY_OLLAMA_CLOUD_MODEL_ID] = normalizedModelId
             }
         }
     }
@@ -2057,6 +2081,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             "openai-compatible" -> activeProfile?.apiKey?.trim().orEmpty()
                 .ifBlank { snapshot[KEY_API_KEY_OPENAI_COMPATIBLE].orEmpty() }
             "ollama" -> snapshot[KEY_API_KEY_OLLAMA].orEmpty()
+            "ollama-cloud" -> snapshot[KEY_API_KEY_OLLAMA_CLOUD].orEmpty()
             "google" -> snapshot[KEY_API_KEY_GOOGLE].orEmpty()
             else -> legacyApiKey
         }
@@ -2094,15 +2119,21 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
         } else {
             ""
         }
-        val ollamaPrimary = if (provider == "ollama") {
-            snapshot[KEY_OLLAMA_MODEL_ID]
+        val ollamaPrimary = when (provider) {
+            "ollama" -> snapshot[KEY_OLLAMA_MODEL_ID]
                 .orEmpty()
                 .trim()
                 .removePrefix("ollama/")
                 .takeIf { it.isNotBlank() && selectedModelIds.contains(it) }
                 .orEmpty()
-        } else {
-            ""
+            "ollama-cloud" -> snapshot[KEY_OLLAMA_CLOUD_MODEL_ID]
+                .orEmpty()
+                .trim()
+                .removePrefix("ollama-cloud/")
+                .removePrefix("ollama/")
+                .takeIf { it.isNotBlank() && selectedModelIds.contains(it) }
+                .orEmpty()
+            else -> ""
         }
         val effectivePrimary = globalPrimary.ifBlank { profilePrimary.ifBlank { ollamaPrimary } }
 
@@ -2885,6 +2916,8 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                     "api_key_minimax" -> prefs[KEY_API_KEY_MINIMAX] = rawValue
                     "api_key_openai_compatible" -> prefs[KEY_API_KEY_OPENAI_COMPATIBLE] = rawValue
                     "api_key_ollama" -> prefs[KEY_API_KEY_OLLAMA] = rawValue
+                    "api_key_ollama_cloud" -> prefs[KEY_API_KEY_OLLAMA_CLOUD] = rawValue
+                    "ollama_cloud_model_id" -> prefs[KEY_OLLAMA_CLOUD_MODEL_ID] = rawValue
                     "openai_compatible_base_url" -> prefs[KEY_OPENAI_COMPATIBLE_BASE_URL] = rawValue
                     "openai_compatible_model_id" -> prefs[KEY_OPENAI_COMPATIBLE_MODEL_ID] = rawValue
                     "ollama_base_url" -> prefs[KEY_OLLAMA_BASE_URL] = rawValue

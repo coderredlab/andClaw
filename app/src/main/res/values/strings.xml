@@ -285,6 +285,7 @@ Do not close or force-stop the app while recovery is in progress.</string>
 
     <string name="onboarding_provider_nvidia">NVIDIA</string>
     <string name="onboarding_provider_ollama">Ollama (Local)</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="settings_openai_compatible_base_url">Base URL (OpenAI-compatible)</string>
     <string name="settings_openai_compatible_model_id">Model ID</string>
     <string name="settings_ollama_base_url">Base URL (Ollama)</string>

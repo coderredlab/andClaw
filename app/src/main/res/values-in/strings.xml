@@ -261,6 +261,7 @@ Jangan tutup atau paksa hentikan aplikasi selama pemulihan masih berlangsung.</s
     <string name="bug_report_included_gateway_logs">- Log UI gateway (disanitasi): %1$d baris</string>
     <string name="onboarding_provider_openai_compatible">API OpenAI kustom</string>
     <string name="onboarding_provider_ollama">Ollama (Lokal)</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>

@@ -267,6 +267,7 @@ Schließen Sie die App nicht und erzwingen Sie keinen Stopp, solange die Wiederh
     <string name="bug_report_included_gateway_logs">- Gateway-UI-Protokolle (bereinigt): %1$d Zeilen</string>
     <string name="onboarding_provider_openai_compatible">Benutzerdefinierte OpenAI-API</string>
     <string name="onboarding_provider_ollama">Ollama (Lokal)</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>

@@ -262,6 +262,7 @@
     <string name="bug_report_included_gateway_logs">- Gateway UIログ（サニタイズ済み）: %1$d 行</string>
     <string name="onboarding_provider_openai_compatible">カスタムOpenAI API</string>
     <string name="onboarding_provider_ollama">Ollama（ローカル）</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>

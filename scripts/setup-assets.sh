@@ -681,6 +681,21 @@ NODE
             fi
         done
 
+        # WhatsApp extension 의존성 설치 (npm 패키지에 node_modules 누락 대응)
+        WA_EXT=/usr/local/lib/node_modules/openclaw/dist/extensions/whatsapp
+        if [ -f \$WA_EXT/package.json ] && [ ! -d \$WA_EXT/node_modules ]; then
+            echo '--- Installing WhatsApp extension dependencies ---'
+            # workspace:* 참조 제거 후 production deps만 설치
+            WA_PKG=\$WA_EXT/package.json python3 -c 'import json,os;p=os.environ[\"WA_PKG\"];d=json.load(open(p));d.pop(\"devDependencies\",None);d.pop(\"peerDependencies\",None);open(p,\"w\").write(json.dumps(d,indent=2))'
+            cd \$WA_EXT && npm install --omit=dev 2>&1
+            # extension 내부 .bin symlink도 제거
+            find \$WA_EXT/node_modules -path '*/.bin/*' -type l -delete || true
+            cd /
+            du -sh \$WA_EXT/node_modules
+        else
+            echo '--- WhatsApp extension dependencies already present, skipping ---'
+        fi
+
         # Windows docker cp에서 symlink 생성 권한 오류를 피하기 위해 .bin 심링크 제거
         find /usr/local/lib/node_modules/openclaw/node_modules -path '*/.bin/*' -type l -delete || true
 

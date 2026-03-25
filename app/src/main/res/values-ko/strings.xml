@@ -271,6 +271,7 @@
     <string name="bug_report_included_gateway_logs">- 게이트웨이 UI 로그(정리됨): %1$d줄</string>
     <string name="onboarding_provider_openai_compatible">커스텀 OpenAI API</string>
     <string name="onboarding_provider_ollama">Ollama (로컬)</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>

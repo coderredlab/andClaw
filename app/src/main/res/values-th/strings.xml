@@ -261,6 +261,7 @@
     <string name="bug_report_included_gateway_logs">- บันทึก UI ของเกตเวย์ (ลบข้อมูลสำคัญแล้ว): %1$d บรรทัด</string>
     <string name="onboarding_provider_openai_compatible">OpenAI API แบบกำหนดเอง</string>
     <string name="onboarding_provider_ollama">Ollama (โลคัล)</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>

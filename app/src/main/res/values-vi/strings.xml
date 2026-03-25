@@ -261,6 +261,7 @@ Trong khi khôi phục đang chạy, đừng đóng hoặc buộc dừng ứng d
     <string name="bug_report_included_gateway_logs">- Nhật ký UI gateway (đã làm sạch): %1$d dòng</string>
     <string name="onboarding_provider_openai_compatible">API OpenAI tùy chỉnh</string>
     <string name="onboarding_provider_ollama">Ollama (cục bộ)</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>

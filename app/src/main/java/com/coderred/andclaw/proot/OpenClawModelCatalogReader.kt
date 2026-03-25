@@ -39,7 +39,7 @@ object OpenClawModelCatalogReader {
         val supportsImages: Boolean?,
     )
 
-    fun loadOllamaModelsFromServer(baseUrl: String): List<ModelEntry> {
+    fun loadOllamaModelsFromServer(baseUrl: String, apiKey: String = ""): List<ModelEntry> {
         // If a test hook is provided, use it to bypass network calls
         testLoaderOverride?.let { override -> return override(baseUrl) }
         val apiBase = resolveOllamaApiBase(baseUrl)
@@ -51,7 +51,13 @@ object OpenClawModelCatalogReader {
             conn.connectTimeout = 15_000
             conn.readTimeout = 15_000
             conn.setRequestProperty("Accept", "application/json")
+            if (apiKey.isNotBlank()) {
+                conn.setRequestProperty("Authorization", "Bearer $apiKey")
+            }
             val status = conn.responseCode
+            if (status == 401 || status == 403) {
+                throw OllamaAuthException("Authentication failed (HTTP $status). Check your API key.")
+            }
             if (status !in 200..299) {
                 return emptyList()
             }
@@ -79,7 +85,7 @@ object OpenClawModelCatalogReader {
                     }
                 }
                 val lowercaseId = id.lowercase()
-                val showDetails = queryOllamaModelDetails(apiBase, id)
+                val showDetails = queryOllamaModelDetails(apiBase, id, apiKey)
                 if (showDetails == null || !showDetails.supportsTools) continue
                 val contextWindow = showDetails?.contextWindow ?: OLLAMA_DEFAULT_CONTEXT_WINDOW
                 val maxTokens = OLLAMA_DEFAULT_MAX_TOKENS
@@ -99,6 +105,8 @@ object OpenClawModelCatalogReader {
                 )
             }
             results
+        } catch (e: OllamaAuthException) {
+            throw e
         } catch (_: Exception) {
             emptyList()
         } finally {
@@ -106,13 +114,15 @@ object OpenClawModelCatalogReader {
         }
     }
 
+    class OllamaAuthException(message: String) : Exception(message)
+
     private fun resolveOllamaApiBase(configuredBaseUrl: String): String {
         return configuredBaseUrl.trim().removeSuffix("/").removeSuffix("/v1").ifBlank {
             "http://127.0.0.1:11434"
         }
     }
 
-    private fun queryOllamaModelDetails(apiBase: String, modelName: String): OllamaModelDetails? {
+    private fun queryOllamaModelDetails(apiBase: String, modelName: String, apiKey: String = ""): OllamaModelDetails? {
         val endpoint = "$apiBase/api/show"
         val url = URL(endpoint)
         val conn = url.openConnection() as HttpURLConnection
@@ -123,8 +133,11 @@ object OpenClawModelCatalogReader {
             conn.doOutput = true
             conn.setRequestProperty("Accept", "application/json")
             conn.setRequestProperty("Content-Type", "application/json")
+            if (apiKey.isNotBlank()) {
+                conn.setRequestProperty("Authorization", "Bearer $apiKey")
+            }
             conn.outputStream.bufferedWriter().use { writer ->
-                writer.write(JSONObject().put("name", modelName).toString())
+                writer.write(JSONObject().put("model", modelName).toString())
             }
             val status = conn.responseCode
             if (status !in 200..299) return null

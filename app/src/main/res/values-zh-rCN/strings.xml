@@ -262,6 +262,7 @@
     <string name="bug_report_included_gateway_logs">- 网关 UI 日志（已脱敏）：%1$d 行</string>
     <string name="onboarding_provider_openai_compatible">自定义 OpenAI API</string>
     <string name="onboarding_provider_ollama">Ollama（本地）</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>

@@ -262,6 +262,7 @@ Non chiudere né forzare l’arresto dell’app mentre il ripristino è in corso
     <string name="bug_report_included_gateway_logs">- Log UI del gateway (sanificati): %1$d righe</string>
     <string name="onboarding_provider_openai_compatible">API OpenAI personalizzata</string>
     <string name="onboarding_provider_ollama">Ollama (locale)</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>

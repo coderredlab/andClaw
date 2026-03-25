@@ -273,6 +273,7 @@ No cierre ni fuerce la detención de la app mientras la recuperación esté en c
     <string name="bug_report_included_gateway_logs">- Registros de UI del gateway (depurados): %1$d líneas</string>
     <string name="onboarding_provider_openai_compatible">API personalizada de OpenAI</string>
     <string name="onboarding_provider_ollama">Ollama (local)</string>
+    <string name="onboarding_provider_ollama_cloud">Ollama Cloud</string>
     <string name="onboarding_provider_zai">Z.ai</string>
     <string name="onboarding_provider_kimi_coding">Kimi Code</string>
     <string name="onboarding_provider_minimax">MiniMax</string>
