@@ -235,6 +235,13 @@
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">登录 Codex</string>
     <string name="settings_codex_oauth_signing_in">登录中…</string>
+    <string name="settings_openai_connection_method">OpenAI 连接方式</string>
+    <string name="settings_openai_codex_subscription">ChatGPT/Codex 订阅（OAuth）</string>
+    <string name="settings_openai_codex_subscription_desc">使用您的 ChatGPT 订阅额度。</string>
+    <string name="settings_openai_platform_api_key">OpenAI Platform API 密钥</string>
+    <string name="settings_openai_platform_api_key_desc">OpenAI Platform API 用量将产生费用。</string>
+    <string name="settings_connection_status_connected">已连接</string>
+    <string name="settings_connection_status_not_connected">未连接</string>
     <string name="settings_codex_oauth_reset_title">重置 Codex 登录</string>
     <string name="settings_codex_oauth_reset_desc">清除已保存的 Codex 状态</string>
     <string name="settings_codex_oauth_reset_confirm_message">将删除已保存的 Codex 登录状态，以便重新登录。其他提供方不会更改。</string>

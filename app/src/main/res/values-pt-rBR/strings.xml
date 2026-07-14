@@ -234,6 +234,13 @@ Falhas: %2$d</string>
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">Entrar no Codex</string>
     <string name="settings_codex_oauth_signing_in">Fazendo login…</string>
+    <string name="settings_openai_connection_method">Método de conexão da OpenAI</string>
+    <string name="settings_openai_codex_subscription">Assinatura ChatGPT/Codex (OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">Usa o limite de uso da sua assinatura do ChatGPT.</string>
+    <string name="settings_openai_platform_api_key">Chave da API OpenAI Platform</string>
+    <string name="settings_openai_platform_api_key_desc">O uso é cobrado pela API OpenAI Platform.</string>
+    <string name="settings_connection_status_connected">Conectado</string>
+    <string name="settings_connection_status_not_connected">Não conectado</string>
     <string name="settings_codex_oauth_reset_title">Redefinir login do Codex</string>
     <string name="settings_codex_oauth_reset_desc">Limpar estado salvo do Codex</string>
     <string name="settings_codex_oauth_reset_confirm_message">O estado de login do Codex salvo será removido para permitir um novo login. Os outros provedores não serão alterados.</string>

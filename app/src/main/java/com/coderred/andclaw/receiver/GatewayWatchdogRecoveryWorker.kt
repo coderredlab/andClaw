@@ -20,6 +20,8 @@ import com.coderred.andclaw.MainActivity
 import com.coderred.andclaw.R
 import com.coderred.andclaw.data.GatewayStatus
 import com.coderred.andclaw.data.PreferencesManager
+import com.coderred.andclaw.data.resolveGatewaySurvivorRuntime
+import com.coderred.andclaw.data.resolveGatewaySurvivorStartupAttemptAgeSeconds
 import com.coderred.andclaw.proroot.ExecutionRuntime
 import com.coderred.andclaw.service.GatewayService
 import kotlinx.coroutines.flow.first
@@ -106,11 +108,22 @@ class GatewayWatchdogRecoveryWorker(
         var gatewayState = processManager?.gatewayState?.value
         var status = gatewayState?.status
         val serviceActive = GatewayService.isInstanceActive
-        val startupAttemptAgeSeconds = processManager?.startupAttemptAgeSeconds()
-        // processManager가 null(서비스 재생성 중)이면 prefs에서 startup attempt 상태를 읽는다
-        val startupAttemptActive = startupAttemptAgeSeconds != null ||
-            (processManager == null && prefs.getGatewaySurvivorMetadata()?.startupAttemptActive == true)
-        val runtime = ExecutionRuntime.fromStorageValue(prefs.executionRuntime.first())
+        val survivorMetadata = prefs.getGatewaySurvivorMetadata()
+        val startupAttemptAgeSeconds = resolveGatewaySurvivorStartupAttemptAgeSeconds(
+            liveStartupAttemptAgeSeconds = processManager?.startupAttemptAgeSeconds(),
+            processManagerAvailable = processManager != null,
+            survivorMetadata = survivorMetadata,
+            nowEpochMs = System.currentTimeMillis(),
+        )
+        val startupAttemptActive = startupAttemptAgeSeconds != null
+        val selectedRuntime = ExecutionRuntime.fromStorageValue(prefs.executionRuntime.first())
+        val runtime = resolveGatewaySurvivorRuntime(
+            startupAttemptActive = startupAttemptActive,
+            runningRuntime = processManager?.runningExecutionRuntime,
+            startingRuntime = processManager?.startingExecutionRuntime,
+            survivorMetadata = survivorMetadata,
+            selectedRuntime = selectedRuntime,
+        )
         val startupGracePeriodSeconds = GatewayWatchdogReceiver.resolveStartingRecoveryGracePeriodSeconds(runtime)
         val runningHealthy = if (status == GatewayStatus.RUNNING) {
             val healthy = processManager?.probeGatewayHealth(timeoutMs = HEALTH_PROBE_TIMEOUT_MS) == true

@@ -235,6 +235,13 @@ Fallite: %2$d</string>
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">Accedi a Codex</string>
     <string name="settings_codex_oauth_signing_in">Accesso in corso…</string>
+    <string name="settings_openai_connection_method">Metodo di connessione OpenAI</string>
+    <string name="settings_openai_codex_subscription">Abbonamento ChatGPT/Codex (OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">Utilizza la quota del suo abbonamento ChatGPT.</string>
+    <string name="settings_openai_platform_api_key">Chiave API OpenAI Platform</string>
+    <string name="settings_openai_platform_api_key_desc">L’utilizzo viene addebitato tramite l’API OpenAI Platform.</string>
+    <string name="settings_connection_status_connected">Connesso</string>
+    <string name="settings_connection_status_not_connected">Non connesso</string>
     <string name="settings_codex_oauth_reset_title">Reimposta accesso Codex</string>
     <string name="settings_codex_oauth_reset_desc">Cancella stato Codex salvato</string>
     <string name="settings_codex_oauth_reset_confirm_message">Lo stato di accesso Codex salvato verrà cancellato per consentire un nuovo accesso. Gli altri provider non vengono modificati.</string>

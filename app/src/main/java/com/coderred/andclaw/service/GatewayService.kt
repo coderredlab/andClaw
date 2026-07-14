@@ -18,17 +18,30 @@ import com.coderred.andclaw.AndClawApp
 import com.coderred.andclaw.MainActivity
 import com.coderred.andclaw.R
 import com.coderred.andclaw.data.GatewaySurvivorMetadata
+import com.coderred.andclaw.data.resolveGatewaySurvivorRuntime
+import com.coderred.andclaw.data.GatewayLaunchConfigSnapshot
+import com.coderred.andclaw.data.OpenAiConnectionMode
+import com.coderred.andclaw.data.OpenAiTransitionPreferencesSnapshot
 import com.coderred.andclaw.data.GatewayStatus
 import com.coderred.andclaw.data.PairingRequest
 import com.coderred.andclaw.data.PreferencesManager
+import com.coderred.andclaw.data.SelectedModelConfigEntry
 import com.coderred.andclaw.proroot.BundleUpdateOutcome
 import com.coderred.andclaw.proroot.ExecutionRuntime
+import com.coderred.andclaw.proroot.OpenAiCanonicalMigrationCoordinator
+import com.coderred.andclaw.proroot.OpenAiCanonicalRuntimeState
+import com.coderred.andclaw.proroot.OpenClawAuthProfileStore
+import com.coderred.andclaw.proroot.OpenClawCodexModelScope
+import com.coderred.andclaw.proroot.OpenClawModelCatalogReader
+import com.coderred.andclaw.proroot.resolveOpenAiDefaultModel
 import com.coderred.andclaw.proroot.ProcessManager
+import com.coderred.andclaw.proroot.ProcessStopResult
 import com.coderred.andclaw.receiver.GatewayWatchdogReceiver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collect
@@ -38,10 +51,590 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
+import org.json.JSONArray
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+
+internal suspend fun prepareGatewayLaunchConfigAfterCanonicalMigration(
+    migrate: suspend () -> Unit,
+    readLaunchConfig: suspend () -> GatewayLaunchConfigSnapshot,
+): GatewayLaunchConfigSnapshot {
+    migrate()
+    return readLaunchConfig()
+}
+
+internal fun isGatewayActiveForOpenAiTransition(status: GatewayStatus): Boolean =
+    status == GatewayStatus.RUNNING || status == GatewayStatus.STARTING
+
+internal enum class OpenAiRequirementServiceDisposition {
+    KEEP_ACTIVE_SERVICE,
+    STOP_INACTIVE_SERVICE,
+}
+
+internal fun resolveOpenAiRequirementServiceDisposition(
+    gatewayActiveAtAttemptStart: Boolean,
+): OpenAiRequirementServiceDisposition =
+    if (gatewayActiveAtAttemptStart) {
+        OpenAiRequirementServiceDisposition.KEEP_ACTIVE_SERVICE
+    } else {
+        OpenAiRequirementServiceDisposition.STOP_INACTIVE_SERVICE
+    }
+
+internal data class GatewayTransitionDesiredStateSnapshot(
+    val desiredRunning: Boolean,
+    val watchdogManaged: Boolean,
+)
+
+internal suspend fun restoreGatewayTransitionDesiredStateSnapshot(
+    snapshot: GatewayTransitionDesiredStateSnapshot,
+    persistDesiredRunning: suspend (Boolean) -> Unit,
+    setWatchdogManaged: (Boolean) -> Unit,
+) {
+    persistDesiredRunning(snapshot.desiredRunning)
+    setWatchdogManaged(snapshot.watchdogManaged)
+}
+
+internal suspend fun stopGatewayForOpenAiTransition(
+    desiredStateSnapshot: GatewayTransitionDesiredStateSnapshot,
+    setTemporaryDesiredStopped: suspend () -> Unit,
+    stopGateway: () -> ProcessStopResult,
+    confirmStoppedState: suspend () -> Unit,
+    restoreDesiredState: suspend (GatewayTransitionDesiredStateSnapshot) -> Unit,
+) {
+    setTemporaryDesiredStopped()
+    val stopResult = stopGateway()
+    if (!stopResult.terminationConfirmed) {
+        withContext(NonCancellable) {
+            restoreDesiredState(desiredStateSnapshot)
+        }
+        error("Gateway did not fully stop before OpenAI mode staging.")
+    }
+    confirmStoppedState()
+}
+
+internal class OpenAiTransitionExecutionRuntimeSnapshot(
+    val oldActualRuntime: ExecutionRuntime,
+    val targetRuntime: ExecutionRuntime,
+) {
+    private var rollbackSelected = false
+
+    fun selectRollbackRuntime() {
+        rollbackSelected = true
+    }
+
+    fun runtimeForNextStart(): ExecutionRuntime =
+        if (rollbackSelected) oldActualRuntime else targetRuntime
+
+    val isRollbackSelected: Boolean
+        get() = rollbackSelected
+}
+
+internal suspend fun <T> withTimedGatewayWakeLock(
+    timeoutMs: Long,
+    acquire: (Long) -> Unit,
+    release: () -> Unit,
+    block: suspend () -> T,
+): T {
+    require(timeoutMs > 0L) { "Wake-lock timeout must be positive." }
+    var acquisitionStarted = false
+    return try {
+        acquisitionStarted = true
+        acquire(timeoutMs)
+        block()
+    } finally {
+        if (acquisitionStarted) {
+            release()
+        }
+    }
+}
+
+internal suspend fun startGatewayForOpenAiTransition(
+    fixedRuntimeTimeoutMs: Long,
+    withWakeLock: suspend (Long, suspend () -> Boolean) -> Boolean,
+    beforeStart: suspend () -> Unit = {},
+    startGateway: suspend () -> Unit,
+    awaitStartupStatus: suspend (Long) -> GatewayStatus?,
+): Boolean {
+    return withWakeLock(fixedRuntimeTimeoutMs) {
+        beforeStart()
+        startGateway()
+        awaitStartupStatus(fixedRuntimeTimeoutMs) == GatewayStatus.RUNNING
+    }
+}
+
+internal class OpenAiTransitionRuntimeRollbackSnapshot private constructor(
+    private val codexBindings: Map<String, ByteArray>,
+    private val sessionManagedFields: Map<String, Map<String, SessionFieldSnapshot>>,
+    private val modelsJsonSnapshot: FileSnapshot,
+) {
+    private data class SessionFieldSnapshot(
+        val present: Boolean,
+        val value: Any? = null,
+    )
+
+    private data class FileSnapshot(
+        val present: Boolean,
+        val content: ByteArray? = null,
+    )
+
+    fun restore(rootfsDir: File) {
+        val sessionsDir = File(rootfsDir, SESSIONS_DIR_PATH)
+        for ((fileName, content) in codexBindings) {
+            writeBytesAtomically(File(sessionsDir, fileName), content)
+        }
+
+        val modelsFile = File(rootfsDir, MODELS_CONFIG_PATH)
+        if (modelsJsonSnapshot.present) {
+            writeBytesAtomically(modelsFile, checkNotNull(modelsJsonSnapshot.content))
+        } else {
+            Files.deleteIfExists(modelsFile.toPath())
+        }
+
+        if (sessionManagedFields.isNotEmpty()) {
+            val sessionsFile = File(rootfsDir, SESSIONS_INDEX_PATH)
+            check(sessionsFile.isFile) {
+                "OpenAI transition sessions index disappeared before rollback."
+            }
+            val sessions = JSONObject(sessionsFile.readText())
+            for ((sessionKey, fields) in sessionManagedFields) {
+                val session = sessions.optJSONObject(sessionKey)
+                    ?: error("OpenAI transition session disappeared before rollback: $sessionKey")
+                for ((fieldName, field) in fields) {
+                    if (field.present) {
+                        session.put(fieldName, copyJsonValue(field.value))
+                    } else {
+                        session.remove(fieldName)
+                    }
+                }
+            }
+            writeBytesAtomically(
+                sessionsFile,
+                sessions.toString(2).toByteArray(StandardCharsets.UTF_8),
+            )
+        }
+
+        check(modelsFile.exists() == modelsJsonSnapshot.present) {
+            "OpenAI transition models.json presence did not match the rollback snapshot."
+        }
+        if (modelsJsonSnapshot.present) {
+            val expected = checkNotNull(modelsJsonSnapshot.content)
+            check(modelsFile.isFile && modelsFile.readBytes().contentEquals(expected)) {
+                "OpenAI transition models.json read-back did not match the rollback snapshot."
+            }
+        }
+
+        for ((fileName, expected) in codexBindings) {
+            val bindingFile = File(sessionsDir, fileName)
+            check(bindingFile.isFile && bindingFile.readBytes().contentEquals(expected)) {
+                "Codex app-server binding was not restored during OpenAI transition rollback: $fileName"
+            }
+        }
+        if (sessionManagedFields.isNotEmpty()) {
+            val sessions = JSONObject(File(rootfsDir, SESSIONS_INDEX_PATH).readText())
+            for ((sessionKey, expectedFields) in sessionManagedFields) {
+                val session = sessions.optJSONObject(sessionKey)
+                    ?: error("OpenAI transition session read-back failed: $sessionKey")
+                val mismatches = expectedFields.filter { (fieldName, expected) ->
+                    val actualPresent = session.has(fieldName)
+                    actualPresent != expected.present ||
+                        (
+                            expected.present &&
+                                !jsonValuesEqual(expected.value, session.opt(fieldName))
+                            )
+                }.keys
+                check(mismatches.isEmpty()) {
+                    "OpenAI session managed fields were not restored for $sessionKey: " +
+                        mismatches.joinToString()
+                }
+            }
+        }
+    }
+
+    companion object {
+        private const val SESSIONS_INDEX_PATH =
+            "root/.openclaw/agents/main/sessions/sessions.json"
+        private const val SESSIONS_DIR_PATH = "root/.openclaw/agents/main/sessions"
+        private const val MODELS_CONFIG_PATH = "root/.openclaw/agents/main/agent/models.json"
+        private val SESSION_MANAGED_FIELDS = listOf(
+            "model",
+            "modelOverride",
+            "modelProvider",
+            "providerOverride",
+            "modelOverrideSource",
+            "modelOverrideCompactionCount",
+            "agentHarnessId",
+            "agentRuntimeOverride",
+            "authProfileOverride",
+            "authProfileOverrideSource",
+        )
+
+        fun capture(rootfsDir: File): OpenAiTransitionRuntimeRollbackSnapshot {
+            val sessionsDir = File(rootfsDir, SESSIONS_DIR_PATH)
+            val bindings = sessionsDir.listFiles()
+                ?.filter { it.isFile && it.name.endsWith(".codex-app-server.json") }
+                ?.associate { it.name to it.readBytes() }
+                .orEmpty()
+            val sessionsFile = File(rootfsDir, SESSIONS_INDEX_PATH)
+            val managedFields = if (sessionsFile.isFile) {
+                val sessions = JSONObject(sessionsFile.readText())
+                sessions.keys().asSequence().mapNotNull { sessionKey ->
+                    val session = sessions.optJSONObject(sessionKey) ?: return@mapNotNull null
+                    sessionKey to SESSION_MANAGED_FIELDS.associateWith { fieldName ->
+                        val present = session.has(fieldName)
+                        SessionFieldSnapshot(
+                            present = present,
+                            value = if (present) copyJsonValue(session.opt(fieldName)) else null,
+                        )
+                    }
+                }.toMap()
+            } else {
+                emptyMap()
+            }
+            val modelsFile = File(rootfsDir, MODELS_CONFIG_PATH)
+            val modelsSnapshot = if (modelsFile.exists()) {
+                check(modelsFile.isFile) {
+                    "OpenAI transition models.json path is not a regular file."
+                }
+                FileSnapshot(present = true, content = modelsFile.readBytes())
+            } else {
+                FileSnapshot(present = false)
+            }
+            return OpenAiTransitionRuntimeRollbackSnapshot(
+                codexBindings = bindings,
+                sessionManagedFields = managedFields,
+                modelsJsonSnapshot = modelsSnapshot,
+            )
+        }
+
+        private fun copyJsonValue(value: Any?): Any = when (value) {
+            is JSONObject -> JSONObject(value.toString())
+            is JSONArray -> JSONArray(value.toString())
+            null -> JSONObject.NULL
+            else -> value
+        }
+
+        private fun jsonValuesEqual(left: Any?, right: Any?): Boolean = when {
+            left is JSONObject && right is JSONObject -> {
+                val leftKeys = left.keys().asSequence().toSet()
+                val rightKeys = right.keys().asSequence().toSet()
+                leftKeys == rightKeys && leftKeys.all { key ->
+                    jsonValuesEqual(left.opt(key), right.opt(key))
+                }
+            }
+            left is JSONArray && right is JSONArray ->
+                left.length() == right.length() &&
+                    (0 until left.length()).all { index ->
+                        jsonValuesEqual(left.opt(index), right.opt(index))
+                    }
+            else -> left == right
+        }
+
+        private fun writeBytesAtomically(file: File, content: ByteArray) {
+            file.parentFile?.mkdirs()
+            val temp = File.createTempFile("${file.name}.", ".tmp", file.parentFile)
+            try {
+                FileOutputStream(temp).use { output ->
+                    output.write(content)
+                    output.fd.sync()
+                }
+                runCatching {
+                    Files.move(
+                        temp.toPath(),
+                        file.toPath(),
+                        StandardCopyOption.ATOMIC_MOVE,
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                }.getOrElse {
+                    Files.move(
+                        temp.toPath(),
+                        file.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                }
+            } finally {
+                temp.delete()
+            }
+        }
+    }
+}
+
+internal suspend fun restoreNonOpenAiGatewayLaunchSnapshot(
+    preferencesManager: PreferencesManager,
+    rootfsDir: File,
+    previousSnapshot: GatewayLaunchConfigSnapshot,
+    preferencesRollbackSnapshot: OpenAiTransitionPreferencesSnapshot?,
+    authSelectionSnapshot: OpenClawAuthProfileStore.OpenAiSelectionSnapshot,
+    runtimeRollbackSnapshot: OpenAiTransitionRuntimeRollbackSnapshot,
+    managedConfigSnapshot: OpenAiCanonicalRuntimeState.ManagedConfigSnapshot,
+    persistRuntimeConfig: (GatewayLaunchConfigSnapshot) -> Unit,
+): GatewayLaunchConfigSnapshot {
+    check(previousSnapshot.apiProvider != "openai") {
+        "Non-OpenAI rollback cannot restore an OpenAI launch snapshot."
+    }
+
+    val preferencesRollback = preferencesRollbackSnapshot?.let {
+        preferencesManager.rollbackOpenAiTransitionPreferences(it)
+    }
+    if (preferencesRollback?.fullyRestored == true) {
+        verifyOpenAiTransitionManagedLaunchSnapshot(
+            previousSnapshot,
+            preferencesManager.getGatewayLaunchConfigSnapshot(),
+        )
+    }
+    OpenClawAuthProfileStore.restoreOpenAiSelectionSnapshot(
+        rootfsDir = rootfsDir,
+        previous = authSelectionSnapshot,
+    )
+    persistRuntimeConfig(previousSnapshot)
+    OpenAiCanonicalRuntimeState.restoreManagedConfigSnapshot(rootfsDir, managedConfigSnapshot)
+    runtimeRollbackSnapshot.restore(rootfsDir)
+    return previousSnapshot
+}
+
+private fun verifyOpenAiTransitionManagedLaunchSnapshot(
+    previous: GatewayLaunchConfigSnapshot,
+    restored: GatewayLaunchConfigSnapshot,
+) {
+    val mismatches = mutableListOf<String>()
+    if (restored.apiProvider != previous.apiProvider) mismatches += "apiProvider"
+    if (restored.openAiConnectionMode != previous.openAiConnectionMode) {
+        mismatches += "openAiConnectionMode"
+    }
+    if (restored.apiKey != previous.apiKey) mismatches += "apiKey"
+    if (restored.selectedModel != previous.selectedModel) mismatches += "selectedModel"
+    if (restored.selectedModelEntries != previous.selectedModelEntries) {
+        mismatches += "selectedModelEntries"
+    }
+    if (restored.primaryModelId != previous.primaryModelId) mismatches += "primaryModelId"
+    if (
+        previous.apiProvider == "openai-compatible" &&
+            restored.openAiCompatibleBaseUrl != previous.openAiCompatibleBaseUrl
+    ) {
+        mismatches += "openAiCompatibleBaseUrl"
+    }
+    if (
+        previous.apiProvider == "ollama" &&
+            restored.ollamaBaseUrl != previous.ollamaBaseUrl
+    ) {
+        mismatches += "ollamaBaseUrl"
+    }
+    if (restored.modelReasoning != previous.modelReasoning) mismatches += "modelReasoning"
+    if (restored.modelImages != previous.modelImages) mismatches += "modelImages"
+    if (restored.modelContext != previous.modelContext) mismatches += "modelContext"
+    if (restored.modelMaxOutput != previous.modelMaxOutput) mismatches += "modelMaxOutput"
+    check(mismatches.isEmpty()) {
+        "Previous non-OpenAI gateway launch fields were not restored: ${mismatches.joinToString()}"
+    }
+}
+
+internal suspend fun stageOpenAiTargetProvider(
+    preferencesManager: PreferencesManager,
+    rootfsDir: File,
+    mode: OpenAiConnectionMode,
+    availableModels: List<OpenClawModelCatalogReader.ModelEntry> =
+        OpenClawModelCatalogReader.loadProviderModels(
+            rootfsDir,
+            OpenClawCodexModelScope.OPENAI_PROVIDER,
+        ),
+): OpenAiTransitionPreferencesSnapshot {
+    val defaultModel = resolveOpenAiDefaultModel(mode, availableModels)?.let { entry ->
+        val scopedModelId = OpenClawCodexModelScope.scopedModelIdForProvider(
+            OpenClawCodexModelScope.OPENAI_PROVIDER,
+            entry.id,
+        )
+        SelectedModelConfigEntry(
+            id = scopedModelId,
+            supportsReasoning = entry.supportsReasoning,
+            supportsImages = entry.supportsImages,
+            contextLength = entry.contextWindow,
+            maxOutputTokens = entry.maxTokens,
+        )
+    }
+    return preferencesManager.stageOpenAiTransitionPreferences(
+        mode = mode,
+        defaultModel = defaultModel,
+    )
+}
+
+internal suspend fun runGatewayStopLifecycle(
+    previousAction: Job?,
+    finalStop: suspend () -> Unit,
+) = withContext(NonCancellable) {
+    previousAction?.cancel(
+        GatewayActionCancellationException(GatewayActionCancellationIntent.STOP),
+    )
+    previousAction?.join()
+    finalStop()
+}
+
+internal enum class GatewayStopReason {
+    MISSING_MODEL,
+    USER_STOP,
+    ;
+
+    fun merge(other: GatewayStopReason): GatewayStopReason =
+        if (this == USER_STOP || other == USER_STOP) USER_STOP else MISSING_MODEL
+}
+
+internal data class GatewayStopRequest(
+    val startId: Int,
+    val reason: GatewayStopReason,
+)
+
+internal fun finalizeGatewayStopIfConfirmed(
+    stopResult: ProcessStopResult,
+    request: GatewayStopRequest,
+    setMissingModelNotice: () -> Unit,
+    clearStoppedNotice: () -> Unit,
+    stopServiceForeground: (Int) -> Unit,
+): Boolean {
+    if (!stopResult.terminationConfirmed) return false
+    if (request.reason == GatewayStopReason.MISSING_MODEL) {
+        setMissingModelNotice()
+    } else {
+        clearStoppedNotice()
+    }
+    stopServiceForeground(request.startId)
+    return true
+}
+
+internal class GatewayActionScheduler<ActionType>(
+    private val scope: CoroutineScope,
+    private val nextActionToken: () -> Long,
+    private val isStopAction: (ActionType) -> Boolean,
+    private val executeStopBarrier: suspend (
+        actionToken: Long,
+        claimFinalRequest: () -> GatewayStopRequest,
+    ) -> Unit,
+    private val onPolicy: (ActionType, ActionType?, String, Int) -> Unit = { _, _, _, _ -> },
+) {
+    private class StopBarrierState(initialRequest: GatewayStopRequest) {
+        private var latestRequest = initialRequest
+        private var acceptingCoalescedStops = true
+
+        @Synchronized
+        fun tryCoalesce(request: GatewayStopRequest): Boolean {
+            if (!acceptingCoalescedStops) return false
+            latestRequest = GatewayStopRequest(
+                startId = request.startId,
+                reason = latestRequest.reason.merge(request.reason),
+            )
+            return true
+        }
+
+        @Synchronized
+        fun claimFinalRequest(): GatewayStopRequest {
+            acceptingCoalescedStops = false
+            return latestRequest
+        }
+    }
+
+    private var currentActionJob: Job? = null
+    private var currentActionType: ActionType? = null
+    private var stopBarrierJob: Job? = null
+    private var stopBarrierState: StopBarrierState? = null
+
+    fun submitStop(
+        actionType: ActionType,
+        startId: Int,
+        reason: GatewayStopReason,
+        onFinally: () -> Unit = {},
+    ) {
+        require(isStopAction(actionType)) { "submitStop requires a STOP action." }
+        val request = GatewayStopRequest(startId = startId, reason = reason)
+        val activeStopBarrier = stopBarrierJob?.takeIf { it.isActive }
+        val activeStopState = stopBarrierState
+        if (
+            activeStopBarrier != null &&
+            activeStopState != null &&
+            activeStopState.tryCoalesce(request)
+        ) {
+            val supersededWaiter = currentActionJob?.takeIf { it !== activeStopBarrier }
+            supersededWaiter?.cancel(
+                GatewayActionCancellationException(GatewayActionCancellationIntent.STOP),
+            )
+            onPolicy(actionType, currentActionType, "coalesce_stop_barrier", startId)
+            currentActionJob = activeStopBarrier
+            currentActionType = actionType
+            return
+        }
+
+        val previousAction = currentActionJob
+        val previousActionType = currentActionType
+        val barrierState = StopBarrierState(request)
+        lateinit var scheduledAction: Job
+        scheduledAction = scope.launch {
+            val actionToken = nextActionToken()
+            try {
+                if (previousAction != null) {
+                    onPolicy(actionType, previousActionType, "cancel_and_join_previous", startId)
+                }
+                runGatewayStopLifecycle(previousAction) {
+                    executeStopBarrier(actionToken, barrierState::claimFinalRequest)
+                }
+            } finally {
+                if (stopBarrierJob === scheduledAction) {
+                    stopBarrierJob = null
+                    stopBarrierState = null
+                }
+                if (currentActionJob === scheduledAction) {
+                    currentActionJob = null
+                    currentActionType = null
+                }
+            }
+        }
+        stopBarrierJob = scheduledAction
+        stopBarrierState = barrierState
+        scheduledAction.invokeOnCompletion { onFinally() }
+        currentActionJob = scheduledAction
+        currentActionType = actionType
+    }
+
+    fun submit(
+        actionType: ActionType,
+        startId: Int,
+        onFinally: () -> Unit = {},
+        block: suspend (Long, Int) -> Unit,
+    ) {
+        require(!isStopAction(actionType)) { "STOP actions must use submitStop." }
+        val activeStopBarrier = stopBarrierJob?.takeIf { it.isActive }
+        val previousAction = currentActionJob
+        val previousActionType = currentActionType
+        lateinit var scheduledAction: Job
+        scheduledAction = scope.launch {
+            try {
+                if (activeStopBarrier != null) {
+                    previousAction
+                        ?.takeIf { it !== activeStopBarrier }
+                        ?.cancelAndJoin()
+                    onPolicy(actionType, previousActionType, "await_stop_barrier", startId)
+                    activeStopBarrier.join()
+                } else {
+                    if (previousAction != null) {
+                        onPolicy(actionType, previousActionType, "cancel_and_join_previous", startId)
+                    }
+                    previousAction?.cancelAndJoin()
+                }
+                val actionToken = nextActionToken()
+                block(actionToken, startId)
+            } finally {
+                if (currentActionJob === scheduledAction) {
+                    currentActionJob = null
+                    currentActionType = null
+                }
+            }
+        }
+        scheduledAction.invokeOnCompletion { onFinally() }
+        currentActionJob = scheduledAction
+        currentActionType = actionType
+    }
+}
 
 class GatewayService : Service() {
 
@@ -50,6 +643,7 @@ class GatewayService : Service() {
         RESTART,
         ATTACH,
         STOP,
+        OPENAI_MODE_TRANSITION,
     }
 
     companion object {
@@ -80,12 +674,15 @@ class GatewayService : Service() {
         const val ACTION_RESTART = "com.coderred.andclaw.action.RESTART"
         const val ACTION_ATTACH = "com.coderred.andclaw.action.ATTACH"
         const val ACTION_VALIDATE_RUNTIME = "com.coderred.andclaw.action.VALIDATE_RUNTIME"
+        const val ACTION_SET_OPENAI_CONNECTION_MODE =
+            "com.coderred.andclaw.action.SET_OPENAI_CONNECTION_MODE"
         const val ACTION_WHATSAPP_LOGIN_GUARD_START = "com.coderred.andclaw.action.WHATSAPP_LOGIN_GUARD_START"
         const val ACTION_WHATSAPP_LOGIN_GUARD_STOP = "com.coderred.andclaw.action.WHATSAPP_LOGIN_GUARD_STOP"
         private const val EXTRA_FROM_WATCHDOG = "from_watchdog"
         private const val EXTRA_USER_INITIATED = "user_initiated"
         private const val EXTRA_TRIGGER_SOURCE = "trigger_source"
         private const val EXTRA_WAKE_LOCK_TIMEOUT_MS = "wake_lock_timeout_ms"
+        private const val EXTRA_OPENAI_CONNECTION_MODE = "openai_connection_mode"
         const val EXTRA_VALIDATE_REQUIRE_PATCHED_NODE_OPTIONS = "require_patched_node_options"
         private const val UNKNOWN_TRIGGER_SOURCE = "unknown"
         private const val STICKY_RECOVERY_TRIGGER_SOURCE = "system:sticky_recovery"
@@ -99,12 +696,42 @@ class GatewayService : Service() {
             }
         }
 
+        internal fun resolveGatewayStickyStartupTimeoutMs(
+            startupAttemptActive: Boolean,
+            runningRuntime: ExecutionRuntime?,
+            startingRuntime: ExecutionRuntime? = null,
+            survivorMetadata: GatewaySurvivorMetadata?,
+            selectedRuntime: ExecutionRuntime,
+        ): Long {
+            val runtime = resolveGatewaySurvivorRuntime(
+                startupAttemptActive = startupAttemptActive,
+                runningRuntime = runningRuntime,
+                startingRuntime = startingRuntime,
+                survivorMetadata = survivorMetadata,
+                selectedRuntime = selectedRuntime,
+            )
+            return resolveGatewayStartupTerminalTimeoutMs(runtime)
+        }
+
         internal fun resolveGatewayRestartTimeoutMs(runtime: ExecutionRuntime): Long {
             return when (runtime) {
                 ExecutionRuntime.PROOT -> PROOT_RESTART_WAKE_LOCK_TIMEOUT_MS
                 ExecutionRuntime.PROROOT -> RESTART_WAKE_LOCK_TIMEOUT_MS
             }
         }
+
+        internal data class GatewayRestartRuntimeAttempt(
+            val runtime: ExecutionRuntime,
+            val timeoutMs: Long,
+        )
+
+        internal fun captureGatewayRestartRuntimeAttempt(
+            targetRuntime: ExecutionRuntime,
+        ): GatewayRestartRuntimeAttempt =
+            GatewayRestartRuntimeAttempt(
+                runtime = targetRuntime,
+                timeoutMs = resolveGatewayRestartTimeoutMs(targetRuntime),
+            )
 
         private var _instance: GatewayService? = null
         private var retainedProcessManager: ProcessManager? = null
@@ -302,7 +929,20 @@ class GatewayService : Service() {
         ): Boolean {
             if (pid == null || pid <= 0) return false
             return status == GatewayStatus.RUNNING ||
+                status == GatewayStatus.ERROR ||
                 (status == GatewayStatus.STARTING && hasActiveStartupAttempt)
+        }
+
+        internal fun shouldClearGatewaySurvivorMetadata(
+            status: GatewayStatus,
+            pid: Int?,
+            hasActiveStartupAttempt: Boolean,
+            hasOwnedProcessRuntime: Boolean,
+            hasObservedLifecycleState: Boolean,
+        ): Boolean {
+            if (!hasObservedLifecycleState) return false
+            if (pid != null || hasActiveStartupAttempt || hasOwnedProcessRuntime) return false
+            return status == GatewayStatus.STOPPED || status == GatewayStatus.ERROR
         }
 
         internal fun survivorMetadataStartupAttemptActive(
@@ -310,6 +950,29 @@ class GatewayService : Service() {
             hasActiveStartupAttempt: Boolean,
         ): Boolean {
             return status == GatewayStatus.STARTING && hasActiveStartupAttempt
+        }
+
+        internal fun resolveOpenAiTransitionMode(rawMode: String?): OpenAiConnectionMode? =
+            OpenAiConnectionMode.fromStorageValue(rawMode)
+
+        internal fun resolveOpenAiTransitionMode(intent: Intent): OpenAiConnectionMode? =
+            resolveOpenAiTransitionMode(intent.getStringExtra(EXTRA_OPENAI_CONNECTION_MODE))
+
+        fun setOpenAiConnectionMode(
+            context: Context,
+            targetMode: OpenAiConnectionMode,
+            source: String = "settings:openai_mode_transition",
+        ) {
+            val intent = Intent(context, GatewayService::class.java).apply {
+                action = ACTION_SET_OPENAI_CONNECTION_MODE
+                putExtra(EXTRA_OPENAI_CONNECTION_MODE, targetMode.storageValue)
+                putExtra(EXTRA_TRIGGER_SOURCE, normalizeTriggerSource(source))
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
         }
 
         fun start(
@@ -411,12 +1074,29 @@ class GatewayService : Service() {
     private lateinit var prefs: PreferencesManager
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val inAppReviewCounterMutex = Mutex()
-    private var actionJob: Job? = null
-    private var actionJobType: GatewayActionType? = null
     private val actionSequence = AtomicLong(0L)
+    private val actionScheduler = GatewayActionScheduler<GatewayActionType>(
+        scope = serviceScope,
+        nextActionToken = actionSequence::incrementAndGet,
+        isStopAction = { actionType -> actionType == GatewayActionType.STOP },
+        executeStopBarrier = { _, claimFinalRequest ->
+            withContext(Dispatchers.IO) {
+                handleStopBarrier(claimFinalRequest)
+            }
+        },
+        onPolicy = { actionType, previousActionType, policy, startId ->
+            pm.appendGatewayDiagnosticLog(
+                "[andClaw][Diag] action=${actionType.name} previous=${previousActionType?.name ?: "UNKNOWN"} policy=$policy startId=$startId",
+            )
+        },
+    )
     private val desiredRunningMutex = Mutex()
+    @Volatile
+    private var watchdogManaged = false
     private var lastPersistedSurvivorPid: Int? = null
     private var lastPersistedSurvivorStartupAttemptActive: Boolean? = null
+    private var lastPersistedSurvivorRuntime: ExecutionRuntime? = null
+    private var lastPersistedSurvivorStartedAtEpochMs: Long? = null
     private val wakeLockGuard = Any()
     private var activeWakeLock: PowerManager.WakeLock? = null
     private val whatsappLoginWakeLockGuard = Any()
@@ -453,25 +1133,53 @@ class GatewayService : Service() {
             pm.gatewayState.collect { state ->
                 val status = state.status
                 val hasActiveStartupAttempt = pm.hasActiveStartupAttempt()
-                if (shouldPersistGatewaySurvivorMetadata(status, state.pid, hasActiveStartupAttempt)) {
+                val processRuntime = if (hasActiveStartupAttempt) {
+                    pm.startingExecutionRuntime ?: pm.runningExecutionRuntime
+                } else {
+                    pm.runningExecutionRuntime ?: pm.startingExecutionRuntime
+                }
+                val processStartedAtEpochMs = pm.processStartedAtEpochMs
+                if (
+                    shouldPersistGatewaySurvivorMetadata(status, state.pid, hasActiveStartupAttempt) &&
+                    processRuntime != null &&
+                    processStartedAtEpochMs != null
+                ) {
                     val startupAttemptActive = survivorMetadataStartupAttemptActive(
                         status,
                         hasActiveStartupAttempt,
                     )
                     if (
                         lastPersistedSurvivorPid != state.pid ||
-                        lastPersistedSurvivorStartupAttemptActive != startupAttemptActive
+                        lastPersistedSurvivorStartupAttemptActive != startupAttemptActive ||
+                        lastPersistedSurvivorRuntime != processRuntime ||
+                        lastPersistedSurvivorStartedAtEpochMs != processStartedAtEpochMs
                     ) {
                         updateGatewaySurvivorMetadata(
                             startupAttemptActive = startupAttemptActive,
                             pidOverride = state.pid,
+                            launchedAtEpochMsOverride = processStartedAtEpochMs,
                         )
                         lastPersistedSurvivorPid = state.pid
                         lastPersistedSurvivorStartupAttemptActive = startupAttemptActive
+                        lastPersistedSurvivorRuntime = processRuntime
+                        lastPersistedSurvivorStartedAtEpochMs = processStartedAtEpochMs
                     }
                 } else {
+                    if (
+                        shouldClearGatewaySurvivorMetadata(
+                            status = status,
+                            pid = state.pid,
+                            hasActiveStartupAttempt = hasActiveStartupAttempt,
+                            hasOwnedProcessRuntime = processRuntime != null,
+                            hasObservedLifecycleState = lastGatewayStatus != null,
+                        )
+                    ) {
+                        prefs.clearGatewaySurvivorMetadata()
+                    }
                     lastPersistedSurvivorPid = null
                     lastPersistedSurvivorStartupAttemptActive = null
+                    lastPersistedSurvivorRuntime = null
+                    lastPersistedSurvivorStartedAtEpochMs = null
                 }
                 if (status != lastGatewayStatus) {
                     val (updatedTracker, counterAction) = advanceInAppReviewRunTracker(
@@ -583,7 +1291,7 @@ class GatewayService : Service() {
                     "[andClaw][Diag] auto_start source=$STICKY_RECOVERY_TRIGGER_SOURCE shouldRecover=$shouldRecover preflightAttach=$shouldPreflightAttach attach=$shouldAttach rejoin=$shouldRejoinStartup status=${stickyStatus?.name ?: "null"} healthy=$stickyHealthy startId=$actionStartId",
                 )
                 if (!shouldRecover) {
-                    GatewayWatchdogReceiver.cancel(applicationContext)
+                    cancelGatewayWatchdog()
                     prefs.clearGatewaySurvivorMetadata()
                     stopServiceForeground(actionStartId)
                     return@runAction
@@ -600,8 +1308,13 @@ class GatewayService : Service() {
                     return@runAction
                 }
                 if (shouldRejoinStartup) {
-                    val runtime = resolveExecutionRuntimeForStartup()
-                    val startupTimeoutMs = resolveGatewayStartupTerminalTimeoutMs(runtime)
+                    val startupTimeoutMs = resolveGatewayStickyStartupTimeoutMs(
+                        startupAttemptActive = true,
+                        runningRuntime = pm.runningExecutionRuntime,
+                        startingRuntime = pm.startingExecutionRuntime,
+                        survivorMetadata = survivorMetadata,
+                        selectedRuntime = resolveExecutionRuntimeForStartup(),
+                    )
                     withTimedWakeLock(startupTimeoutMs) {
                         val finalStatus = awaitGatewayStartupTerminalState(startupTimeoutMs)
                         if (!isActionCurrent(actionToken)) return@withTimedWakeLock
@@ -684,15 +1397,43 @@ class GatewayService : Service() {
                     )
                 }
             }
-            ACTION_STOP -> {
-                runAction(GatewayActionType.STOP, startId) { actionToken, actionStartId ->
-                    handleStop(actionToken = actionToken, startId = actionStartId)
+            ACTION_SET_OPENAI_CONNECTION_MODE -> {
+                val targetMode = resolveOpenAiTransitionMode(intent)
+                if (targetMode == null) {
+                    OpenAiConnectionTransitionState.fail("Invalid OpenAI connection mode.")
+                    serviceScope.launch { stopServiceForeground(startId) }
+                } else {
+                    val transitionAttemptId =
+                        OpenAiConnectionTransitionState.beginAction(targetMode)
+                    runAction(
+                        actionType = GatewayActionType.OPENAI_MODE_TRANSITION,
+                        startId = startId,
+                        onFinally = {
+                            OpenAiConnectionTransitionState.complete(transitionAttemptId)
+                        },
+                    ) { actionToken, actionStartId ->
+                        handleOpenAiConnectionModeTransition(
+                            targetMode = targetMode,
+                            transitionAttemptId = transitionAttemptId,
+                            actionToken = actionToken,
+                            startId = actionStartId,
+                        )
+                    }
                 }
             }
+            ACTION_STOP -> {
+                actionScheduler.submitStop(
+                    actionType = GatewayActionType.STOP,
+                    startId = startId,
+                    reason = GatewayStopReason.USER_STOP,
+                )
+            }
             ACTION_STOP_FOR_MISSING_MODEL -> {
-                runAction(GatewayActionType.STOP, startId) { _, actionStartId ->
-                    stopForMissingModelSelection(actionStartId)
-                }
+                actionScheduler.submitStop(
+                    actionType = GatewayActionType.STOP,
+                    startId = startId,
+                    reason = GatewayStopReason.MISSING_MODEL,
+                )
             }
         }
         return START_STICKY
@@ -909,15 +1650,390 @@ class GatewayService : Service() {
             }
         }
         if (!isActionCurrent(actionToken)) return
-        pm.clearStartupAttempt()
         updateGatewaySurvivorMetadata(startupAttemptActive = false)
         val shouldKeepRunning = prefs.gatewayWasRunning.first() && prefs.isSetupComplete.first()
         if (!isActionCurrent(actionToken)) return
         if (shouldKeepRunning) {
-            GatewayWatchdogReceiver.schedule(applicationContext)
+            scheduleGatewayWatchdog()
         } else {
             stopServiceForeground(startId)
         }
+    }
+
+    private suspend fun prepareCanonicalLaunchConfig(app: AndClawApp): GatewayLaunchConfigSnapshot {
+        return prepareGatewayLaunchConfigAfterCanonicalMigration(
+            migrate = {
+                OpenAiCanonicalMigrationCoordinator(
+                    preferencesManager = prefs,
+                    rootfsDir = app.prorootManager.rootfsDir,
+                ).migrateIfNeeded()
+            },
+            readLaunchConfig = {
+                prefs.ensureCurrentProviderModelSelection()
+                prefs.getGatewayLaunchConfigSnapshot()
+            },
+        )
+    }
+
+    private suspend fun handleOpenAiConnectionModeTransition(
+        targetMode: OpenAiConnectionMode,
+        transitionAttemptId: Long,
+        actionToken: Long,
+        startId: Int,
+    ) {
+        if (!isActionCurrent(actionToken)) return
+        val app = application as AndClawApp
+        val initialGatewayStatus = pm.gatewayState.value.status
+        if (
+            initialGatewayStatus == GatewayStatus.ERROR &&
+            !pm.stop().terminationConfirmed
+        ) {
+            OpenAiConnectionTransitionState.fail(
+                transitionAttemptId,
+                "Gateway error state could not be stopped safely.",
+            )
+            return
+        }
+        val gatewayActive = isGatewayActiveForOpenAiTransition(pm.gatewayState.value.status)
+        val targetRuntime = resolveExecutionRuntimeForStartup()
+        val oldActualRuntime = pm.runningExecutionRuntime ?: pm.startingExecutionRuntime
+        if (gatewayActive && oldActualRuntime == null) {
+            OpenAiConnectionTransitionState.fail(
+                transitionAttemptId,
+                "Active gateway execution runtime is unknown; refusing unsafe transition.",
+            )
+            return
+        }
+        val executionRuntimeSnapshot = OpenAiTransitionExecutionRuntimeSnapshot(
+            oldActualRuntime = oldActualRuntime ?: targetRuntime,
+            targetRuntime = targetRuntime,
+        )
+        val desiredStateBeforeTransition = captureTransitionDesiredState()
+        var preferencesRollbackSnapshot: OpenAiTransitionPreferencesSnapshot? = null
+        var runtimeRollbackSnapshot: OpenAiTransitionRuntimeRollbackSnapshot? = null
+        var authSelectionRollbackSnapshot: OpenClawAuthProfileStore.OpenAiSelectionSnapshot? = null
+        var managedConfigRollbackSnapshot: OpenAiCanonicalRuntimeState.ManagedConfigSnapshot? = null
+        val coordinator = OpenAiConnectionTransitionCoordinator(
+            backend = object : OpenAiConnectionTransitionCoordinator.Backend {
+                override suspend fun currentMode(): OpenAiConnectionMode =
+                    prefs.openAiConnectionMode.first()
+
+                override suspend fun hasUsableCredential(mode: OpenAiConnectionMode): Boolean {
+                    val inventory = OpenClawAuthProfileStore.inspectCredentialInventory(
+                        rootfsDir = app.prorootManager.rootfsDir,
+                        preferenceApiKey = prefs.getApiKeyForProvider("openai"),
+                    )
+                    return when (mode) {
+                        OpenAiConnectionMode.CODEX_SUBSCRIPTION -> inventory.hasUsableCodexOAuth
+                        OpenAiConnectionMode.PLATFORM_API_KEY -> inventory.hasUsableOpenAiApiKey
+                    }
+                }
+
+                override suspend fun readLaunchSnapshot(): GatewayLaunchConfigSnapshot {
+                    managedConfigRollbackSnapshot =
+                        OpenAiCanonicalRuntimeState.captureManagedConfigSnapshot(
+                            app.prorootManager.rootfsDir,
+                        )
+                    runtimeRollbackSnapshot =
+                        OpenAiTransitionRuntimeRollbackSnapshot.capture(app.prorootManager.rootfsDir)
+                    authSelectionRollbackSnapshot =
+                        OpenClawAuthProfileStore.captureOpenAiSelectionSnapshot(
+                            app.prorootManager.rootfsDir,
+                        )
+                    return prefs.getGatewayLaunchConfigSnapshot()
+                }
+
+                override suspend fun stopGateway() {
+                    stopGatewayForOpenAiTransition(
+                        desiredStateSnapshot = desiredStateBeforeTransition,
+                        setTemporaryDesiredStopped = {
+                            forceDesiredStopped(clearSurvivorMetadata = false)
+                        },
+                        stopGateway = pm::stop,
+                        confirmStoppedState = ::clearSurvivorMetadataAfterConfirmedStop,
+                        restoreDesiredState = ::restoreTransitionDesiredState,
+                    )
+                }
+
+                override suspend fun stageCredential(mode: OpenAiConnectionMode) {
+                    val preferredType = mode.toCredentialType()
+                    val profileId = when (mode) {
+                        OpenAiConnectionMode.CODEX_SUBSCRIPTION -> "openai:codex"
+                        OpenAiConnectionMode.PLATFORM_API_KEY -> "openai:api-key"
+                    }
+                    OpenClawAuthProfileStore.activateOpenAiCredential(
+                        rootfsDir = app.prorootManager.rootfsDir,
+                        mode = preferredType,
+                        profileId = profileId,
+                    )
+                }
+
+                override suspend fun persistModeAndCanonicalConfig(
+                    mode: OpenAiConnectionMode,
+                ): GatewayLaunchConfigSnapshot {
+                    preferencesRollbackSnapshot = stageOpenAiTargetProvider(
+                        preferencesManager = prefs,
+                        rootfsDir = app.prorootManager.rootfsDir,
+                        mode = mode,
+                    )
+                    val launchConfig = prepareCanonicalLaunchConfig(app)
+                    check(launchConfig.apiProvider == "openai") {
+                        "Target launch snapshot did not activate the OpenAI provider."
+                    }
+                    check(launchConfig.selectedModelEntries.isNotEmpty()) {
+                        "No model is selected for target OpenAI mode."
+                    }
+                    persistCanonicalLaunchConfig(launchConfig)
+                    OpenAiCanonicalRuntimeState.normalize(app.prorootManager.rootfsDir, mode)
+                    return verifyCanonicalOpenAiReadBack(app, mode)
+                }
+
+                override suspend fun persistedMode(): OpenAiConnectionMode =
+                    prefs.openAiConnectionMode.first()
+
+                override suspend fun startGateway(snapshot: GatewayLaunchConfigSnapshot): Boolean {
+                    check(prefs.openAiConnectionMode.first() == snapshot.openAiConnectionMode) {
+                        "Persisted OpenAI mode does not match process launch snapshot."
+                    }
+                    val launchRuntime = executionRuntimeSnapshot.runtimeForNextStart()
+                    val fixedRuntimeTimeoutMs = resolveGatewayStartupTerminalTimeoutMs(launchRuntime)
+                    return startGatewayForOpenAiTransition(
+                        fixedRuntimeTimeoutMs = fixedRuntimeTimeoutMs,
+                        withWakeLock = { timeoutMs, block ->
+                            withTimedWakeLock(timeoutMs, block)
+                        },
+                        beforeStart = {
+                            if (executionRuntimeSnapshot.isRollbackSelected) {
+                                restoreTransitionDesiredState(desiredStateBeforeTransition)
+                            }
+                        },
+                        startGateway = {
+                            startGatewayProcess(
+                                launchConfig = snapshot,
+                                isRestart = false,
+                                runtimeOverride = launchRuntime,
+                            )
+                        },
+                        awaitStartupStatus = ::awaitGatewayStartupTerminalState,
+                    )
+                }
+
+                override suspend fun restoreCanonicalConfig(
+                    mode: OpenAiConnectionMode,
+                    previousSnapshot: GatewayLaunchConfigSnapshot,
+                ): GatewayLaunchConfigSnapshot {
+                    val selectionSnapshot = checkNotNull(authSelectionRollbackSnapshot) {
+                        "OpenAI auth selection rollback snapshot was not captured."
+                    }
+                    val runtimeSnapshot = checkNotNull(runtimeRollbackSnapshot) {
+                        "OpenAI runtime rollback snapshot was not captured."
+                    }
+                    val managedConfigSnapshot = checkNotNull(managedConfigRollbackSnapshot) {
+                        "OpenAI managed config rollback snapshot was not captured."
+                    }
+                    executionRuntimeSnapshot.selectRollbackRuntime()
+                    if (previousSnapshot.apiProvider != "openai") {
+                        return restoreNonOpenAiGatewayLaunchSnapshot(
+                            preferencesManager = prefs,
+                            rootfsDir = app.prorootManager.rootfsDir,
+                            previousSnapshot = previousSnapshot,
+                            preferencesRollbackSnapshot = preferencesRollbackSnapshot,
+                            authSelectionSnapshot = selectionSnapshot,
+                            runtimeRollbackSnapshot = runtimeSnapshot,
+                            persistRuntimeConfig = ::persistCanonicalLaunchConfig,
+                            managedConfigSnapshot = managedConfigSnapshot,
+                        )
+                    }
+
+                    val preferencesRollback = preferencesRollbackSnapshot?.let {
+                        prefs.rollbackOpenAiTransitionPreferences(it)
+                    }
+                    if (preferencesRollback?.fullyRestored == true) {
+                        verifyOpenAiTransitionManagedLaunchSnapshot(
+                            previousSnapshot,
+                            prefs.getGatewayLaunchConfigSnapshot(),
+                        )
+                    }
+                    persistCanonicalLaunchConfig(previousSnapshot)
+                    OpenClawAuthProfileStore.restoreOpenAiSelectionSnapshot(
+                        rootfsDir = app.prorootManager.rootfsDir,
+                        previous = selectionSnapshot,
+                    )
+                    OpenAiCanonicalRuntimeState.restoreManagedConfigSnapshot(
+                        rootfsDir = app.prorootManager.rootfsDir,
+                        snapshot = managedConfigSnapshot,
+                    )
+                    runtimeSnapshot.restore(app.prorootManager.rootfsDir)
+                    return previousSnapshot
+                }
+            },
+            onPhase = { mode, phase ->
+                OpenAiConnectionTransitionState.update(transitionAttemptId, mode, phase)
+            },
+            onCancellation = {
+                OpenAiConnectionTransitionState.complete(transitionAttemptId)
+            },
+        )
+
+        val result = coordinator.transition(targetMode, gatewayActive)
+        if (!isActionCurrent(actionToken)) return
+        when (result) {
+            is OpenAiConnectionTransitionResult.Success -> {
+                if (gatewayActive) {
+                    updateGatewaySurvivorMetadata(startupAttemptActive = false)
+                    setDesiredRunningAndWatchdog(shouldRun = true, actionToken = actionToken)
+                } else {
+                    forceDesiredStopped()
+                    stopServiceForeground(startId)
+                }
+                OpenAiConnectionTransitionState.complete(transitionAttemptId)
+            }
+
+            OpenAiConnectionTransitionResult.RequiresApiKey -> {
+                OpenAiConnectionTransitionState.fail(
+                    transitionAttemptId,
+                    "OpenAI API key is required.",
+                )
+                preserveOrStopServiceForOpenAiRequirement(
+                    gatewayActiveAtAttemptStart = gatewayActive,
+                    actionToken = actionToken,
+                    startId = startId,
+                )
+            }
+
+            OpenAiConnectionTransitionResult.RequiresCodexLogin -> {
+                OpenAiConnectionTransitionState.fail(
+                    transitionAttemptId,
+                    "Codex login is required.",
+                )
+                preserveOrStopServiceForOpenAiRequirement(
+                    gatewayActiveAtAttemptStart = gatewayActive,
+                    actionToken = actionToken,
+                    startId = startId,
+                )
+            }
+
+            is OpenAiConnectionTransitionResult.Failed -> {
+                if (result.oldGatewayRestored && gatewayActive) {
+                    updateGatewaySurvivorMetadata(startupAttemptActive = false)
+                } else if (!gatewayActive) {
+                    forceDesiredStopped()
+                    stopServiceForeground(startId)
+                }
+                OpenAiConnectionTransitionState.fail(
+                    transitionAttemptId,
+                    result.cause.message ?: "OpenAI connection mode transition failed.",
+                )
+            }
+        }
+    }
+
+    private suspend fun preserveOrStopServiceForOpenAiRequirement(
+        gatewayActiveAtAttemptStart: Boolean,
+        actionToken: Long,
+        startId: Int,
+    ) {
+        when (resolveOpenAiRequirementServiceDisposition(gatewayActiveAtAttemptStart)) {
+            OpenAiRequirementServiceDisposition.KEEP_ACTIVE_SERVICE -> {
+                updateGatewaySurvivorMetadata(startupAttemptActive = false)
+                setDesiredRunningAndWatchdog(shouldRun = true, actionToken = actionToken)
+            }
+            OpenAiRequirementServiceDisposition.STOP_INACTIVE_SERVICE -> {
+                forceDesiredStopped()
+                stopServiceForeground(startId)
+            }
+        }
+    }
+
+    private fun OpenAiConnectionMode.toCredentialType(): OpenClawAuthProfileStore.CredentialType =
+        when (this) {
+            OpenAiConnectionMode.CODEX_SUBSCRIPTION -> OpenClawAuthProfileStore.CredentialType.OAUTH
+            OpenAiConnectionMode.PLATFORM_API_KEY -> OpenClawAuthProfileStore.CredentialType.API_KEY
+        }
+
+    private suspend fun verifyCanonicalOpenAiReadBack(
+        app: AndClawApp,
+        mode: OpenAiConnectionMode,
+    ): GatewayLaunchConfigSnapshot {
+        val inventory = OpenClawAuthProfileStore.inspectCredentialInventory(
+            rootfsDir = app.prorootManager.rootfsDir,
+            preferenceApiKey = prefs.getApiKeyForProvider("openai"),
+        )
+        check(inventory.activeCredentialTypeHint == mode.toCredentialType()) {
+            "Canonical OpenAI auth order did not match target mode."
+        }
+        OpenAiCanonicalRuntimeState.verify(app.prorootManager.rootfsDir, mode)
+        check(prefs.openAiConnectionMode.first() == mode) {
+            "OpenAI mode preference read-back failed."
+        }
+        return prefs.getGatewayLaunchConfigSnapshot().also { snapshot ->
+            check(snapshot.openAiConnectionMode == mode) {
+                "OpenAI launch snapshot read-back failed."
+            }
+        }
+    }
+
+    private fun persistCanonicalLaunchConfig(launchConfig: GatewayLaunchConfigSnapshot) {
+        pm.ensureOpenClawConfig(
+            apiProvider = launchConfig.apiProvider,
+            apiKey = launchConfig.apiKey,
+            selectedModel = launchConfig.selectedModel,
+            selectedModels = launchConfig.selectedModelEntries.map { entry ->
+                ProcessManager.ModelSelectionEntry(
+                    id = entry.id,
+                    supportsReasoning = entry.supportsReasoning,
+                    supportsImages = entry.supportsImages,
+                    contextLength = entry.contextLength,
+                    maxOutputTokens = entry.maxOutputTokens,
+                )
+            },
+            primaryModelId = launchConfig.primaryModelId,
+            openAiCompatibleBaseUrl = launchConfig.openAiCompatibleBaseUrl,
+            ollamaBaseUrl = launchConfig.ollamaBaseUrl,
+            modelReasoning = launchConfig.modelReasoning,
+            modelImages = launchConfig.modelImages,
+            modelContext = launchConfig.modelContext,
+            modelMaxOutput = launchConfig.modelMaxOutput,
+            openAiConnectionMode = launchConfig.openAiConnectionMode,
+        )
+    }
+
+    private suspend fun startGatewayProcess(
+        launchConfig: GatewayLaunchConfigSnapshot,
+        isRestart: Boolean,
+        runtimeOverride: ExecutionRuntime? = null,
+    ) {
+        pm.start(
+            launchConfig.apiProvider,
+            launchConfig.apiKey,
+            launchConfig.selectedModel,
+            launchConfig.selectedModelEntries.map { entry ->
+                ProcessManager.ModelSelectionEntry(
+                    id = entry.id,
+                    supportsReasoning = entry.supportsReasoning,
+                    supportsImages = entry.supportsImages,
+                    contextLength = entry.contextLength,
+                    maxOutputTokens = entry.maxOutputTokens,
+                )
+            },
+            launchConfig.primaryModelId,
+            launchConfig.openAiCompatibleBaseUrl,
+            launchConfig.ollamaBaseUrl,
+            launchConfig.channelConfig,
+            launchConfig.modelReasoning,
+            launchConfig.modelImages,
+            launchConfig.modelContext,
+            launchConfig.modelMaxOutput,
+            launchConfig.braveSearchApiKey,
+            launchConfig.hasExplicitMemorySearchPrefs,
+            launchConfig.memorySearchEnabled,
+            launchConfig.memorySearchProvider,
+            launchConfig.memorySearchApiKey,
+            survivorMetadata = null,
+            probePhase = pm.gatewayProbePhase(isRestart = isRestart),
+            openAiConnectionMode = launchConfig.openAiConnectionMode,
+            runtimeOverride = runtimeOverride,
+        )
     }
 
     private suspend fun handleStart(
@@ -938,7 +2054,7 @@ class GatewayService : Service() {
                         detail = "desired_running_false",
                     ),
                 )
-                GatewayWatchdogReceiver.cancel(applicationContext)
+                cancelGatewayWatchdog()
                 stopServiceForeground(startId)
                 return
             }
@@ -946,9 +2062,16 @@ class GatewayService : Service() {
 
         if (!isActionCurrent(actionToken)) return
         val app = application as AndClawApp
-        val bundleUpdateRequired = runCatching { app.setupManager.isBundleUpdateRequired() }
-            .getOrDefault(true)
-        val runtime = resolveExecutionRuntimeForStartup()
+        val activeStartingRuntime = pm.startingExecutionRuntime?.takeIf {
+            pm.gatewayState.value.status == GatewayStatus.STARTING &&
+                pm.hasActiveStartupAttempt()
+        }
+        val bundleUpdateRequired = if (activeStartingRuntime == null) {
+            runCatching { app.setupManager.isBundleUpdateRequired() }.getOrDefault(true)
+        } else {
+            false
+        }
+        val runtime = activeStartingRuntime ?: resolveExecutionRuntimeForStartup()
         val startupTimeoutMs = resolveGatewayStartupTerminalTimeoutMs(runtime)
 
         val startWakeLockTimeoutMs = resolveStartWakeLockTimeoutMs(
@@ -970,12 +2093,19 @@ class GatewayService : Service() {
             return
         }
 
-        pm.markStartupAttemptStarted()
-        updateGatewaySurvivorMetadata(startupAttemptActive = true)
-        GatewayWatchdogReceiver.schedule(
-            applicationContext,
-            delayMs = startWakeLockTimeoutMs,
-        )
+        scheduleGatewayWatchdog(delayMs = startWakeLockTimeoutMs)
+        if (activeStartingRuntime != null) {
+            pm.appendGatewayDiagnosticLog(
+                "[andClaw][Diag] start_rejoin runtime=${activeStartingRuntime.storageValue}",
+            )
+            withTimedWakeLock(startWakeLockTimeoutMs) {
+                val finalStatus = awaitGatewayStartupTerminalState(startupTimeoutMs)
+                if (!isActionCurrent(actionToken)) return@withTimedWakeLock
+                handleStartupOutcome(finalStatus, actionToken)
+            }
+            return
+        }
+
 
         withTimedWakeLock(startWakeLockTimeoutMs) {
             if (!isActionCurrent(actionToken)) return@withTimedWakeLock
@@ -994,7 +2124,6 @@ class GatewayService : Service() {
                         ),
                     )
                     if (isActionCurrent(actionToken)) {
-                        pm.clearStartupAttempt()
                         // 번들 업데이트 실패 시 부분 설치 상태로 런타임을 시작하면 ENOENT로 연쇄 실패할 수 있다.
                         // 사용자 의도는 유지하고 watchdog 복구를 위해 desired-running 상태만 유지한다.
                         markDesiredRunningAndScheduleWatchdog(actionToken)
@@ -1013,7 +2142,6 @@ class GatewayService : Service() {
                     ),
                 )
                 if (isActionCurrent(actionToken)) {
-                    pm.clearStartupAttempt()
                     markDesiredRunningAndScheduleWatchdog(actionToken)
                 }
                 return@withTimedWakeLock
@@ -1021,8 +2149,22 @@ class GatewayService : Service() {
 
             if (!isActionCurrent(actionToken)) return@withTimedWakeLock
 
-            prefs.ensureCurrentProviderModelSelection()
-            val launchConfig = prefs.getGatewayLaunchConfigSnapshot()
+            val launchConfig = try {
+                prepareCanonicalLaunchConfig(app)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                pm.appendGatewayDiagnosticLog(
+                    buildStartupFailureDiagnosticLine(
+                        stage = "handle_start",
+                        cause = "openai_canonical_migration_failed",
+                        detail = error.message ?: error.javaClass.simpleName,
+                    ),
+                )
+                updateGatewaySurvivorMetadata(startupAttemptActive = false)
+                markDesiredRunningAndScheduleWatchdog(actionToken)
+                return@withTimedWakeLock
+            }
 
             if (!setDesiredRunningAndWatchdog(shouldRun = true, actionToken = actionToken)) {
                 return@withTimedWakeLock
@@ -1072,6 +2214,8 @@ class GatewayService : Service() {
                     null
                 },
                 probePhase = pm.gatewayProbePhase(isRestart = false),
+                openAiConnectionMode = launchConfig.openAiConnectionMode,
+                runtimeOverride = runtime,
             )
 
             val finalStatus = awaitGatewayStartupTerminalState(startupTimeoutMs)
@@ -1098,7 +2242,7 @@ class GatewayService : Service() {
                         detail = "desired_running_false",
                     ),
                 )
-                GatewayWatchdogReceiver.cancel(applicationContext)
+                cancelGatewayWatchdog()
                 stopServiceForeground(startId)
                 return
             }
@@ -1113,7 +2257,7 @@ class GatewayService : Service() {
                         detail = "desired_running_false",
                     ),
                 )
-                GatewayWatchdogReceiver.cancel(applicationContext)
+                cancelGatewayWatchdog()
                 stopServiceForeground(startId)
                 return
             }
@@ -1121,16 +2265,30 @@ class GatewayService : Service() {
 
         // RESTART는 사용자 의도상 running 유지이므로 즉시 desired-running=true를 반영한다.
         if (!setDesiredRunningAndWatchdog(shouldRun = true, actionToken = actionToken)) return
-        pm.markStartupAttemptStarted()
-        updateGatewaySurvivorMetadata(startupAttemptActive = true)
-        val runtime = resolveExecutionRuntimeForStartup()
-        val restartTimeoutMs = resolveGatewayRestartTimeoutMs(runtime)
+        val restartAttempt = captureGatewayRestartRuntimeAttempt(
+            targetRuntime = resolveExecutionRuntimeForStartup(),
+        )
 
-        withTimedWakeLock(restartTimeoutMs) {
+        withTimedWakeLock(restartAttempt.timeoutMs) {
             if (!isActionCurrent(actionToken)) return@withTimedWakeLock
 
-            prefs.ensureCurrentProviderModelSelection()
-            val launchConfig = prefs.getGatewayLaunchConfigSnapshot()
+            val app = application as AndClawApp
+            val launchConfig = try {
+                prepareCanonicalLaunchConfig(app)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                pm.appendGatewayDiagnosticLog(
+                    buildStartupFailureDiagnosticLine(
+                        stage = "handle_restart",
+                        cause = "openai_canonical_migration_failed",
+                        detail = error.message ?: error.javaClass.simpleName,
+                    ),
+                )
+                updateGatewaySurvivorMetadata(startupAttemptActive = false)
+                markDesiredRunningAndScheduleWatchdog(actionToken)
+                return@withTimedWakeLock
+            }
 
             if (!isActionCurrent(actionToken)) return@withTimedWakeLock
             if (launchConfig.selectedModelEntries.isEmpty()) {
@@ -1143,7 +2301,7 @@ class GatewayService : Service() {
                 stopForMissingModelSelection(startId)
                 return@withTimedWakeLock
             }
-            pm.restart(
+            val restartStarted = pm.restart(
                 launchConfig.apiProvider,
                 launchConfig.apiKey,
                 launchConfig.selectedModel,
@@ -1170,29 +2328,67 @@ class GatewayService : Service() {
                 launchConfig.memorySearchProvider,
                 launchConfig.memorySearchApiKey,
                 probePhase = pm.gatewayProbePhase(isRestart = true),
+                openAiConnectionMode = launchConfig.openAiConnectionMode,
+                runtimeOverride = restartAttempt.runtime,
             )
-            val finalStatus = awaitGatewayStartupTerminalState(restartTimeoutMs)
+            if (!restartStarted) {
+                pm.appendGatewayDiagnosticLog(
+                    buildStartupFailureDiagnosticLine(
+                        stage = "handle_restart",
+                        cause = "previous_gateway_termination_unconfirmed",
+                        finalStatus = pm.gatewayState.value.status,
+                        errorMessage = pm.gatewayState.value.errorMessage,
+                    ),
+                )
+                updateGatewaySurvivorMetadata(startupAttemptActive = false)
+                markDesiredRunningAndScheduleWatchdog(actionToken)
+                return@withTimedWakeLock
+            }
+            val finalStatus = awaitGatewayStartupTerminalState(restartAttempt.timeoutMs)
             if (!isActionCurrent(actionToken)) return@withTimedWakeLock
             handleStartupOutcome(finalStatus, actionToken)
         }
     }
 
-    private suspend fun handleStop(actionToken: Long, startId: Int) {
+    private suspend fun handleStopBarrier(
+        claimFinalRequest: () -> GatewayStopRequest,
+    ) {
         // STOP 선점 시 in-flight START/RESTART가 늦게 unwind 되더라도 즉시 wake lock을 해제한다.
         releaseActiveWakeLock()
 
         // STOP 요청은 최신 토큰 여부와 무관하게 항상 desired-running=false를 강제 반영한다.
-        forceDesiredStopped()
-        pm.stop()
-        stopServiceForeground(startId)
+        // 생존 metadata는 실제 종료가 확인되기 전까지 process ownership 증거로 보존한다.
+        forceDesiredStopped(clearSurvivorMetadata = false)
+        val stopResult = pm.stop()
+        if (!stopResult.terminationConfirmed) return
+        clearSurvivorMetadataAfterConfirmedStop()
+        withContext(Dispatchers.Main) {
+            // 이 시점부터 현재 barrier는 추가 STOP을 받지 않는다. 이후 요청은 새 barrier가 소유한다.
+            val finalRequest = claimFinalRequest()
+            finalizeGatewayStopIfConfirmed(
+                stopResult = stopResult,
+                request = finalRequest,
+                setMissingModelNotice = {
+                    pm.setStoppedNotice(getString(R.string.settings_model_none_found))
+                },
+                clearStoppedNotice = pm::clearStoppedNotice,
+                stopServiceForeground = { startId ->
+                    if (stopSelfResult(startId)) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                    }
+                },
+            )
+        }
     }
 
     private suspend fun stopForMissingModelSelection(startId: Int) {
-        releaseActiveWakeLock()
-        pm.stop()
-        pm.setStoppedNotice(getString(R.string.settings_model_none_found))
-        forceDesiredStopped()
-        stopServiceForeground(startId)
+        withContext(Dispatchers.Main) {
+            actionScheduler.submitStop(
+                actionType = GatewayActionType.STOP,
+                startId = startId,
+                reason = GatewayStopReason.MISSING_MODEL,
+            )
+        }
     }
 
     private suspend fun handleStartupOutcome(finalStatus: GatewayStatus?, actionToken: Long) {
@@ -1222,9 +2418,17 @@ class GatewayService : Service() {
 
         if (finalStatus == null) {
             // STARTING 상태 고착 방지
-            pm.stop()
+            if (!pm.stop().terminationConfirmed) {
+                updateGatewaySurvivorMetadata(startupAttemptActive = false)
+                markDesiredRunningAndScheduleWatchdog(actionToken)
+                return
+            }
         }
-        prefs.clearGatewaySurvivorMetadata()
+        if (pm.gatewayState.value.pid == null) {
+            prefs.clearGatewaySurvivorMetadata()
+        } else {
+            updateGatewaySurvivorMetadata(startupAttemptActive = false)
+        }
         // START/RESTART 실패는 사용자 의도를 꺾지 않는다.
         // transient failure 후에도 watchdog/boot/update 경로가 복구를 계속 시도해야 한다.
         markDesiredRunningAndScheduleWatchdog(actionToken)
@@ -1234,27 +2438,79 @@ class GatewayService : Service() {
         setDesiredRunningAndWatchdog(shouldRun = true, actionToken = actionToken)
     }
 
-    private suspend fun forceDesiredStopped() {
+    private suspend fun forceDesiredStopped(clearSurvivorMetadata: Boolean = true) {
         desiredRunningMutex.withLock {
             prefs.setGatewayWasRunning(false)
+            if (clearSurvivorMetadata) {
+                prefs.clearGatewaySurvivorMetadata()
+            }
+            cancelGatewayWatchdog()
+        }
+    }
+
+    private suspend fun clearSurvivorMetadataAfterConfirmedStop() {
+        desiredRunningMutex.withLock {
             prefs.clearGatewaySurvivorMetadata()
-            GatewayWatchdogReceiver.cancel(applicationContext)
+        }
+    }
+
+    private suspend fun captureTransitionDesiredState(): GatewayTransitionDesiredStateSnapshot =
+        desiredRunningMutex.withLock {
+            GatewayTransitionDesiredStateSnapshot(
+                desiredRunning = prefs.gatewayWasRunning.first(),
+                watchdogManaged = watchdogManaged,
+            )
+        }
+
+    private suspend fun restoreTransitionDesiredState(
+        snapshot: GatewayTransitionDesiredStateSnapshot,
+    ) {
+        desiredRunningMutex.withLock {
+            restoreGatewayTransitionDesiredStateSnapshot(
+                snapshot = snapshot,
+                persistDesiredRunning = prefs::setGatewayWasRunning,
+                setWatchdogManaged = { shouldManage ->
+                    if (shouldManage) {
+                        scheduleGatewayWatchdog()
+                    } else {
+                        cancelGatewayWatchdog()
+                    }
+                },
+            )
         }
     }
 
     private suspend fun updateGatewaySurvivorMetadata(
         startupAttemptActive: Boolean,
         pidOverride: Int? = null,
+        launchedAtEpochMsOverride: Long? = null,
     ) {
         val pid = pidOverride ?: pm.gatewayState.value.pid ?: return
         val now = System.currentTimeMillis()
+        val runtime = if (startupAttemptActive) {
+            pm.startingExecutionRuntime ?: pm.runningExecutionRuntime
+        } else {
+            pm.runningExecutionRuntime ?: pm.startingExecutionRuntime
+        } ?: run {
+            pm.appendGatewayDiagnosticLog(
+                "[andClaw][Diag] survivor_metadata_skipped cause=missing_process_runtime pid=$pid",
+            )
+            return
+        }
+        val launchedAtEpochMs = launchedAtEpochMsOverride ?: pm.processStartedAtEpochMs ?: run {
+            pm.appendGatewayDiagnosticLog(
+                "[andClaw][Diag] survivor_metadata_skipped cause=missing_process_start_time pid=$pid",
+            )
+            return
+        }
         prefs.setGatewaySurvivorMetadata(
             GatewaySurvivorMetadata(
                 pid = pid,
-                launchedAtEpochMs = now,
+                launchedAtEpochMs = launchedAtEpochMs,
                 wsEndpoint = DEFAULT_GATEWAY_WS_ENDPOINT,
                 startupAttemptActive = startupAttemptActive,
                 updatedAtEpochMs = now,
+                runtime = runtime,
             ),
         )
     }
@@ -1277,14 +2533,28 @@ class GatewayService : Service() {
 
             if (updateWatchdog) {
                 if (shouldRun) {
-                    GatewayWatchdogReceiver.schedule(applicationContext)
+                    scheduleGatewayWatchdog()
                 } else {
-                    GatewayWatchdogReceiver.cancel(applicationContext)
+                    cancelGatewayWatchdog()
                 }
             }
 
             isActionCurrent(actionToken)
         }
+    }
+
+    private fun scheduleGatewayWatchdog(delayMs: Long? = null) {
+        if (delayMs == null) {
+            GatewayWatchdogReceiver.schedule(applicationContext)
+        } else {
+            GatewayWatchdogReceiver.schedule(applicationContext, delayMs = delayMs)
+        }
+        watchdogManaged = true
+    }
+
+    private fun cancelGatewayWatchdog() {
+        GatewayWatchdogReceiver.cancel(applicationContext)
+        watchdogManaged = false
     }
 
     private suspend fun <T> withTimedWakeLock(timeoutMs: Long, block: suspend () -> T): T {
@@ -1295,14 +2565,18 @@ class GatewayService : Service() {
             "andClaw::GatewayWakeLock",
         ).apply {
             setReferenceCounted(false)
-            acquire(timeoutMs)
         }
-        registerActiveWakeLock(wakeLock)
-        return try {
-            block()
-        } finally {
-            releaseWakeLockInstance(wakeLock)
-        }
+        return withTimedGatewayWakeLock(
+            timeoutMs = timeoutMs,
+            acquire = { lockTimeoutMs ->
+                wakeLock.acquire(lockTimeoutMs)
+                registerActiveWakeLock(wakeLock)
+            },
+            release = {
+                releaseWakeLockInstance(wakeLock)
+            },
+            block = block,
+        )
     }
 
     private suspend fun awaitGatewayStartupTerminalState(timeoutMs: Long): GatewayStatus? {
@@ -1337,62 +2611,16 @@ class GatewayService : Service() {
     private fun runAction(
         actionType: GatewayActionType,
         startId: Int,
+        onFinally: () -> Unit = {},
         block: suspend (Long, Int) -> Unit,
     ) {
-        val actionToken = actionSequence.incrementAndGet()
-        val previousAction = actionJob
-        val previousActionType = actionJobType
-        actionJobType = actionType
-        actionJob = serviceScope.launch {
-            try {
-                if (actionType == GatewayActionType.STOP) {
-                    // STOP은 지연 없이 선점한다. 오래 걸리는 START/RESTART 종료를 기다리지 않는다.
-                    previousAction?.cancel()
-                    if (previousAction != null) {
-                        pm.appendGatewayDiagnosticLog(
-                            "[andClaw][Diag] action=${actionType.name} previous=${previousActionType?.name ?: "UNKNOWN"} policy=cancel_previous startId=$startId",
-                        )
-                        val stopToken = actionToken
-                        serviceScope.launch {
-                            try {
-                                previousAction.join()
-                            } catch (_: CancellationException) {
-                                // ignore
-                            }
-                            withContext(Dispatchers.IO) {
-                                if (!isActionCurrent(stopToken)) return@withContext
-                                // STOP 선점 이후 이전 START/RESTART가 늦게 반영한 상태를 한 번 더 정리한다.
-                                setDesiredRunningAndWatchdog(shouldRun = false, actionToken = stopToken)
-                                pm.stop()
-                            }
-                        }
-                    }
-                } else {
-                    if (previousActionType == GatewayActionType.STOP) {
-                        if (previousAction != null) {
-                            pm.appendGatewayDiagnosticLog(
-                                "[andClaw][Diag] action=${actionType.name} previous=${previousActionType.name} policy=await_previous_stop startId=$startId",
-                            )
-                        }
-                        // STOP 이후 START/RESTART가 들어오면 STOP 완료를 보장한 뒤 진행한다.
-                        previousAction?.join()
-                    } else {
-                        if (previousAction != null) {
-                            pm.appendGatewayDiagnosticLog(
-                                "[andClaw][Diag] action=${actionType.name} previous=${previousActionType?.name ?: "UNKNOWN"} policy=cancel_and_join_previous startId=$startId",
-                            )
-                        }
-                        previousAction?.cancelAndJoin()
-                    }
-                }
-                withContext(Dispatchers.IO) {
-                    if (!isActionCurrent(actionToken)) return@withContext
-                    block(actionToken, startId)
-                }
-            } finally {
-                if (isActionCurrent(actionToken)) {
-                    actionJobType = null
-                }
+        actionScheduler.submit(
+            actionType = actionType,
+            startId = startId,
+            onFinally = onFinally,
+        ) { actionToken, actionStartId ->
+            withContext(Dispatchers.IO) {
+                block(actionToken, actionStartId)
             }
         }
     }

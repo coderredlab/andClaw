@@ -5,11 +5,13 @@ import android.os.FileObserver
 import android.os.SystemClock
 import android.util.Log
 import com.coderred.andclaw.data.ChannelConfig
+import com.coderred.andclaw.data.OpenAiConnectionMode
 import com.coderred.andclaw.data.GatewayState
 import com.coderred.andclaw.data.GatewayStatus
 import com.coderred.andclaw.data.GatewaySurvivorMetadata
 import com.coderred.andclaw.data.PairingRequest
 import com.coderred.andclaw.data.SessionLogEntry
+import com.coderred.andclaw.data.readTextFileLinesBounded
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -38,9 +40,121 @@ internal fun githubCopilotAuthEnv(env: Map<String, String> = System.getenv()): M
         }
     }
 
+internal fun providerAuthEnv(
+    apiProvider: String,
+    apiKey: String,
+    openAiConnectionMode: OpenAiConnectionMode,
+    environment: Map<String, String> = System.getenv(),
+): Map<String, String> = buildMap {
+    val normalizedApiKey = apiKey.trim()
+    if (apiProvider == "github-copilot") {
+        putAll(githubCopilotAuthEnv(environment))
+    }
+    if (normalizedApiKey.isBlank()) return@buildMap
+    when (apiProvider) {
+        "anthropic" -> put("ANTHROPIC_API_KEY", normalizedApiKey)
+        "openai" -> {
+            if (OpenAiCanonicalRuntimeState.launchPolicy(openAiConnectionMode).injectOpenAiApiKey) {
+                put("OPENAI_API_KEY", normalizedApiKey)
+            }
+        }
+        "openai-codex", "github-copilot" -> Unit
+        "zai" -> {
+            put("ZAI_API_KEY", normalizedApiKey)
+            put("Z_AI_API_KEY", normalizedApiKey)
+        }
+        "kimi-coding" -> {
+            put("KIMI_API_KEY", normalizedApiKey)
+            put("KIMICODE_API_KEY", normalizedApiKey)
+        }
+        "minimax" -> put("MINIMAX_API_KEY", normalizedApiKey)
+        "openai-compatible" -> put("OPENAI_COMPAT_API_KEY", normalizedApiKey)
+        "ollama", "ollama-cloud" -> put("OLLAMA_API_KEY", normalizedApiKey)
+        "openrouter" -> put("OPENROUTER_API_KEY", normalizedApiKey)
+        "google" -> {
+            put("GEMINI_API_KEY", normalizedApiKey)
+            put("GOOGLE_API_KEY", normalizedApiKey)
+        }
+        else -> put("OPENAI_API_KEY", normalizedApiKey)
+    }
+}
+
+internal fun resolveOpenAiDefaultModel(
+    mode: OpenAiConnectionMode,
+    availableModels: List<OpenClawModelCatalogReader.ModelEntry>,
+): OpenClawModelCatalogReader.ModelEntry? {
+    val existingModels = availableModels.filter { it.id.isNotBlank() }
+    return when (mode) {
+        OpenAiConnectionMode.PLATFORM_API_KEY ->
+            existingModels.firstOrNull { it.isDefault }
+        OpenAiConnectionMode.CODEX_SUBSCRIPTION ->
+            existingModels.firstOrNull { it.isDefault }
+                ?: existingModels.firstOrNull {
+                    OpenClawCodexModelScope.normalizedBareModelId(it.id) == "gpt-5.6-sol"
+                }
+                ?: existingModels.firstOrNull {
+                    OpenClawCodexModelScope.normalizedBareModelId(it.id) == "gpt-5.5"
+                }
+    }
+}
+
+internal fun applyGatewayProcessEnvironment(
+    processEnvironment: MutableMap<String, String>,
+    launchEnvironment: Map<String, String>,
+    apiProvider: String,
+    openAiConnectionMode: OpenAiConnectionMode,
+) {
+    processEnvironment.remove("OPENAI_API_KEY")
+    processEnvironment.putAll(launchEnvironment)
+    if (
+        apiProvider != "openai" ||
+        openAiConnectionMode != OpenAiConnectionMode.PLATFORM_API_KEY
+    ) {
+        processEnvironment.remove("OPENAI_API_KEY")
+    }
+}
+
+internal fun terminateProcessGracefully(
+    process: Process,
+    gracefulTimeoutMs: Long,
+    forceTimeoutMs: Long,
+): Boolean {
+    if (!process.isAlive) return true
+    process.destroy()
+    if (process.waitFor(gracefulTimeoutMs, TimeUnit.MILLISECONDS)) return true
+    process.destroyForcibly()
+    return process.waitFor(forceTimeoutMs, TimeUnit.MILLISECONDS)
+}
+
+internal fun shouldClearExitedProcesslessOwnership(
+    status: GatewayStatus,
+    hasProcessHandle: Boolean,
+    pid: Int?,
+    pidAlive: Boolean,
+): Boolean =
+    status == GatewayStatus.ERROR &&
+        !hasProcessHandle &&
+        pid != null &&
+        pid > 0 &&
+        !pidAlive
+
+enum class ProcessStopResult {
+    STOPPED,
+    TERMINATION_UNCONFIRMED,
+    ;
+
+    val terminationConfirmed: Boolean
+        get() = this == STOPPED
+}
+
 private val ANDROID_CHROMIUM_EXTRA_ARGS = listOf("--no-zygote", "--no-sandbox", "--single-process", "--disable-dev-shm-usage", "--disable-features=BackForwardCache")
 private const val LEGACY_CHROMIUM_WRAPPER_NAME = "chromium-proot-wrapper.sh"
 private const val BROWSER_PREWARM_USER_DATA_DIR = "/tmp/.chromium-prewarm"
+private const val MAX_SESSION_LOG_BYTES_PER_FILE = 4 * 1024 * 1024
+private const val MAX_SESSION_LOG_LINES_PER_FILE = 2_000
+private const val GATEWAY_GRACEFUL_STOP_TIMEOUT_MS = 5_000L
+private const val GATEWAY_FORCE_STOP_TIMEOUT_MS = 2_000L
+private const val SIGTERM = 15
 
 internal fun parseListeningSocketInodes(procNetContent: String, port: Int): Set<String> {
     if (port !in 1..65535) return emptySet()
@@ -82,6 +196,33 @@ internal fun shouldReattachGatewaySurvivor(
     if (!pidAlive || !healthCheckPassed) return false
     val endpoint = metadata.wsEndpoint.trim().lowercase()
     return endpoint == expectedEndpoint || endpoint == "localhost:18789"
+}
+
+private fun normalizeExecutablePath(path: String): String =
+    runCatching { File(path).canonicalPath }.getOrElse { File(path).absolutePath }
+
+internal fun inferGatewayProcessExecutionRuntime(
+    processExecutablePath: String?,
+    processCommandPath: String?,
+    prootBinaryPath: String,
+    prorootBinaryPath: String,
+): ExecutionRuntime? {
+    val normalizedProotPath = normalizeExecutablePath(prootBinaryPath)
+    val normalizedProrootPath = normalizeExecutablePath(prorootBinaryPath)
+    if (normalizedProotPath == normalizedProrootPath) return null
+
+    val candidates = listOfNotNull(processExecutablePath, processCommandPath)
+        .map(String::trim)
+        .filter(String::isNotEmpty)
+        .map(::normalizeExecutablePath)
+    val inferredRuntimes = candidates.mapNotNull { candidate ->
+        when (candidate) {
+            normalizedProotPath -> ExecutionRuntime.PROOT
+            normalizedProrootPath -> ExecutionRuntime.PROROOT
+            else -> null
+        }
+    }.toSet()
+    return inferredRuntimes.singleOrNull()
 }
 
 internal fun buildOpenClawPairingDenyScript(): String = """
@@ -302,6 +443,7 @@ class ProcessManager(
         private val ANDCLAW_TRUSTED_OPENCLAW_PLUGIN_IDS = listOf(
             "anthropic",
             "browser",
+            "brave",
             "canvas",
             "codex",
             "device-pair",
@@ -345,6 +487,53 @@ class ProcessManager(
     private val _gatewayState = MutableStateFlow(GatewayState())
     val gatewayState: StateFlow<GatewayState> = _gatewayState.asStateFlow()
 
+    private data class StartupAttempt(
+        val generation: Long,
+        val runtime: ExecutionRuntime,
+        val startedAtElapsedMs: Long,
+    )
+
+    private data class RunningAttempt(
+        val generation: Long,
+        val runtime: ExecutionRuntime,
+        val startedAtEpochMs: Long?,
+    )
+
+    private data class GatewayAttemptSnapshot(
+        val status: GatewayStatus,
+        val startupAttempt: StartupAttempt? = null,
+        val runningAttempt: RunningAttempt? = null,
+    )
+
+    private data class StopClaim(
+        val state: GatewayState,
+        val process: Process?,
+        val runningAttempt: RunningAttempt?,
+        val alreadyStopped: Boolean,
+    )
+
+    private val startupAttemptLock = Any()
+    private val stopLock = Any()
+
+    @Volatile
+    private var gatewayAttemptSnapshot = GatewayAttemptSnapshot(
+        status = _gatewayState.value.status,
+    )
+
+    val runningExecutionRuntime: ExecutionRuntime?
+        get() = gatewayAttemptSnapshot.runningAttempt?.runtime
+
+    val startingExecutionRuntime: ExecutionRuntime?
+        get() = gatewayAttemptSnapshot.startupAttempt?.runtime
+
+    val processStartedAtEpochMs: Long?
+        get() = synchronized(startupAttemptLock) {
+            gatewayAttemptSnapshot.runningAttempt?.startedAtEpochMs
+                ?: gatewayAttemptSnapshot.startupAttempt
+                    ?.takeIf { _gatewayState.value.pid != null }
+                    ?.let { startTime.takeIf { startedAt -> startedAt > 0L } }
+        }
+
     private val _logLines = MutableStateFlow<List<String>>(emptyList())
     val logLines: StateFlow<List<String>> = _logLines.asStateFlow()
 
@@ -378,7 +567,6 @@ class ProcessManager(
     /** 미리 띄워놓은 headless_shell 프로세스. 게이트웨이 ready 시 시작, stop 시 정리. */
     private var chromiumPreWarmProcess: Process? = null
     private var lastMemorySearchApiKey: String = ""
-    private var startupAttemptStartedElapsedMs: Long? = null
     private val openClawConfigLock = Any()
 
     private fun generateGatewayAuthToken(): String = java.security.SecureRandom().let { sr ->
@@ -411,54 +599,187 @@ class ProcessManager(
     }
 
     val isRunning: Boolean
-        get() = _gatewayState.value.status == GatewayStatus.RUNNING
+        get() = gatewayAttemptSnapshot.status == GatewayStatus.RUNNING
 
-    internal fun markStartupAttemptStarted(nowElapsedMs: Long = SystemClock.elapsedRealtime()) {
-        startupAttemptStartedElapsedMs = nowElapsedMs
+    private fun beginStartupAttemptIfAllowed(
+        runtime: ExecutionRuntime,
+        nowElapsedMs: Long = SystemClock.elapsedRealtime(),
+    ): StartupAttempt? = synchronized(stopLock) {
+        synchronized(startupAttemptLock) {
+            var current = gatewayAttemptSnapshot
+            val currentPid = _gatewayState.value.pid
+            if (
+                shouldClearExitedProcesslessOwnership(
+                    status = current.status,
+                    hasProcessHandle = process != null,
+                    pid = currentPid,
+                    pidAlive = currentPid?.let { File("/proc/$it").exists() } == true,
+                )
+            ) {
+                current = GatewayAttemptSnapshot(status = GatewayStatus.ERROR)
+                gatewayAttemptSnapshot = current
+                startTime = 0L
+                _gatewayState.value = _gatewayState.value.copy(pid = null)
+            }
+            when {
+                current.status == GatewayStatus.STARTING ||
+                    current.status == GatewayStatus.RUNNING -> null
+                current.status != GatewayStatus.STOPPED &&
+                    current.status != GatewayStatus.ERROR -> null
+                current.status == GatewayStatus.ERROR &&
+                    (process != null || _gatewayState.value.pid != null) -> null
+                else -> {
+                    val attempt = StartupAttempt(
+                        generation = ++startupAttemptGeneration,
+                        runtime = runtime,
+                        startedAtElapsedMs = nowElapsedMs,
+                    )
+                    gatewayAttemptSnapshot = GatewayAttemptSnapshot(
+                        status = GatewayStatus.STARTING,
+                        startupAttempt = attempt,
+                    )
+                    _gatewayState.value = _gatewayState.value.copy(
+                        status = GatewayStatus.STARTING,
+                        uptime = 0L,
+                        errorMessage = null,
+                    )
+                    attempt
+                }
+            }
+        }
     }
 
-    internal fun clearStartupAttempt() {
-        startupAttemptStartedElapsedMs = null
+    private fun currentStartupAttempt(generation: Long): StartupAttempt? =
+        gatewayAttemptSnapshot.startupAttempt?.takeIf { it.generation == generation }
+
+    private fun clearStartupAttempt(attempt: StartupAttempt? = null) {
+        synchronized(startupAttemptLock) {
+            val current = gatewayAttemptSnapshot
+            if (attempt == null || current.startupAttempt === attempt) {
+                gatewayAttemptSnapshot = current.copy(startupAttempt = null)
+            }
+        }
+    }
+
+    private fun publishRunningAttempt(attempt: StartupAttempt): Boolean =
+        synchronized(startupAttemptLock) {
+            val current = gatewayAttemptSnapshot
+            if (current.startupAttempt !== attempt || current.status != GatewayStatus.STARTING) {
+                false
+            } else {
+                gatewayAttemptSnapshot = GatewayAttemptSnapshot(
+                    status = GatewayStatus.RUNNING,
+                    runningAttempt = RunningAttempt(
+                        generation = attempt.generation,
+                        runtime = attempt.runtime,
+                        startedAtEpochMs = startTime.takeIf { it > 0L },
+                    ),
+                )
+                _gatewayState.value = _gatewayState.value.copy(
+                    status = GatewayStatus.RUNNING,
+                    dashboardReady = true,
+                )
+                true
+            }
+        }
+
+    private fun clearRunningAttempt(generation: Long? = null) {
+        synchronized(startupAttemptLock) {
+            val current = gatewayAttemptSnapshot
+            if (generation == null || current.runningAttempt?.generation == generation) {
+                gatewayAttemptSnapshot = current.copy(runningAttempt = null)
+            }
+        }
     }
 
     internal fun startupAttemptAgeSeconds(nowElapsedMs: Long = SystemClock.elapsedRealtime()): Long? {
-        val startedAt = startupAttemptStartedElapsedMs ?: return null
+        val startedAt = gatewayAttemptSnapshot.startupAttempt?.startedAtElapsedMs ?: return null
         return ((nowElapsedMs - startedAt).coerceAtLeast(0L)) / 1000L
     }
 
-    internal fun hasActiveStartupAttempt(): Boolean = startupAttemptStartedElapsedMs != null
+    internal fun hasActiveStartupAttempt(): Boolean =
+        gatewayAttemptSnapshot.startupAttempt != null
 
-    internal fun beginStartupAttemptGeneration(): Long {
-        startupAttemptGeneration += 1
-        return startupAttemptGeneration
-    }
-
-    internal fun invalidateStartupAttemptGeneration() {
-        startupAttemptGeneration += 1
-        startupJob?.cancel()
-        startupJob = null
-    }
-
-    internal fun isStartupAttemptGenerationValid(generation: Long): Boolean {
-        return generation == startupAttemptGeneration
+    internal fun restoreRunningExecutionRuntimeFromSurvivor(
+        metadata: GatewaySurvivorMetadata,
+        expectedStartupGeneration: Long? = null,
+    ): ExecutionRuntime {
+        val runtime = metadata.runtime ?: inferGatewayProcessExecutionRuntime(
+            processExecutablePath = runCatching {
+                File("/proc/${metadata.pid}/exe").canonicalPath
+            }.getOrNull(),
+            processCommandPath = runCatching {
+                File("/proc/${metadata.pid}/cmdline")
+                    .readBytes()
+                    .toString(Charsets.UTF_8)
+                    .substringBefore('\u0000')
+            }.getOrNull(),
+            prootBinaryPath = prorootManager.prootBinaryPath,
+            prorootBinaryPath = prorootManager.prorootBinaryPath,
+        )
+        checkNotNull(runtime) {
+            "Surviving gateway runtime is missing and PID ${metadata.pid} executable cannot be identified safely."
+        }
+        synchronized(startupAttemptLock) {
+            if (
+                expectedStartupGeneration != null &&
+                gatewayAttemptSnapshot.startupAttempt?.generation != expectedStartupGeneration
+            ) {
+                throw kotlinx.coroutines.CancellationException("Startup attempt invalidated during survivor reattach")
+            }
+            val generation = ++startupAttemptGeneration
+            gatewayAttemptSnapshot = GatewayAttemptSnapshot(
+                status = GatewayStatus.RUNNING,
+                runningAttempt = RunningAttempt(
+                    generation = generation,
+                    runtime = runtime,
+                    startedAtEpochMs = metadata.launchedAtEpochMs,
+                ),
+            )
+            _gatewayState.value = _gatewayState.value.copy(
+                status = GatewayStatus.RUNNING,
+                uptime = 0L,
+                pid = metadata.pid,
+                errorMessage = null,
+                dashboardReady = true,
+            )
+            startTime = metadata.launchedAtEpochMs
+        }
+        return runtime
     }
 
     fun setConfigurationError(message: String) {
-        clearStartupAttempt()
+        synchronized(startupAttemptLock) {
+            gatewayAttemptSnapshot = GatewayAttemptSnapshot(status = GatewayStatus.ERROR)
+            _gatewayState.value = _gatewayState.value.copy(
+                status = GatewayStatus.ERROR,
+                errorMessage = message,
+            )
+        }
         addLog("[andClaw] $message")
-        _gatewayState.value = _gatewayState.value.copy(
-            status = GatewayStatus.ERROR,
-            errorMessage = message,
-        )
     }
 
-    fun setStoppedNotice(message: String) {
-        clearStartupAttempt()
-        addLog("[andClaw] $message")
-        _gatewayState.value = _gatewayState.value.copy(
-            status = GatewayStatus.STOPPED,
-            errorMessage = message,
-        )
+    fun setStoppedNotice(message: String): Boolean {
+        val applied = synchronized(startupAttemptLock) {
+            if (gatewayAttemptSnapshot.status != GatewayStatus.STOPPED) {
+                false
+            } else {
+                _gatewayState.value = _gatewayState.value.copy(errorMessage = message)
+                true
+            }
+        }
+        if (applied) {
+            addLog("[andClaw] $message")
+        }
+        return applied
+    }
+
+    fun clearStoppedNotice() {
+        synchronized(startupAttemptLock) {
+            if (gatewayAttemptSnapshot.status == GatewayStatus.STOPPED) {
+                _gatewayState.value = _gatewayState.value.copy(errorMessage = null)
+            }
+        }
     }
 
     suspend fun probeGatewayHealth(timeoutMs: Long = 8_000L): Boolean {
@@ -502,6 +823,7 @@ class ProcessManager(
      * @param apiProvider AI 모델 공급자 (anthropic, openai, openrouter)
      * @param apiKey API 키
      * @param selectedModel 사용자가 선택한 모델 ID (빈 문자열이면 기본값 사용)
+     * @param runtimeOverride 고정된 전환 시도에서 사용할 실행 런타임. null이면 현재 선택값을 한 번 캡처한다.
      */
     fun start(
         apiProvider: String = "",
@@ -523,62 +845,54 @@ class ProcessManager(
         memorySearchApiKey: String = "",
         survivorMetadata: GatewaySurvivorMetadata? = null,
         probePhase: String = "gateway-start",
+        openAiConnectionMode: OpenAiConnectionMode = OpenAiConnectionMode.CODEX_SUBSCRIPTION,
+        runtimeOverride: ExecutionRuntime? = null,
     ) {
-        val status = _gatewayState.value.status
-        if (status == GatewayStatus.RUNNING || status == GatewayStatus.STARTING) return
-
-        markStartupAttemptStarted()
+        val runtimeSnapshot = runtimeOverride ?: prorootManager.selectedRuntime
+        // STARTING 판단과 generation 소유권 생성을 한 snapshot 전환으로 묶는다.
+        // duplicate START는 전환 전이면 startup generation에, 전환 후면 running generation에 합류한다.
+        val attempt = beginStartupAttemptIfAllowed(runtimeSnapshot) ?: return
 
         val normalizedMemorySearchProvider = normalizeMemorySearchProvider(memorySearchProvider)
         val normalizedMemorySearchApiKey = memorySearchApiKey.trim()
+        val effectiveApiKey = if (
+            apiProvider == "openai" &&
+            !OpenAiCanonicalRuntimeState.launchPolicy(openAiConnectionMode).injectOpenAiApiKey
+        ) {
+            ""
+        } else {
+            apiKey
+        }
 
         lastChannelConfig = channelConfig
         lastApiProvider = apiProvider
-        lastApiKey = apiKey
+        lastApiKey = effectiveApiKey
         lastBraveSearchApiKey = braveSearchApiKey
         if (applyMemorySearchConfig) {
             lastMemorySearchEnabled = memorySearchEnabled
             lastMemorySearchProvider = normalizedMemorySearchProvider
             lastMemorySearchApiKey = normalizedMemorySearchApiKey
         }
-        val runtimeSnapshot = prorootManager.selectedRuntime
 
-        _gatewayState.value = _gatewayState.value.copy(
-            status = GatewayStatus.STARTING,
-            uptime = 0L,
-            errorMessage = null,
-        )
-        addLog("[andClaw] Starting gateway...")
-
-        // 새 scope 생성
-        invalidateStartupAttemptGeneration()
         scope?.cancel()
         val newScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         scope = newScope
-        val startupGeneration = beginStartupAttemptGeneration()
+        addLog("[andClaw] Starting gateway...")
 
         startupJob = newScope.launch {
             var launchedProcess: Process? = null
             var localOutputJob: Job? = null
             var localUptimeJob: Job? = null
+            var launchedPid: Int? = null
 
             suspend fun ensureStartupAttemptStillValid() {
                 currentCoroutineContext().ensureActive()
-                if (!isStartupAttemptGenerationValid(startupGeneration)) {
+                if (currentStartupAttempt(attempt.generation) !== attempt) {
                     throw kotlinx.coroutines.CancellationException("Startup attempt invalidated")
                 }
             }
 
             try {
-                // 패치 파일이 없으면 생성
-                ensurePatchFile()
-                ensureCodexAppServerDiagnosticsWrapper()
-                // .profile에 누락된 환경변수 보충 + 캐시 디렉토리 보장 (기존 사용자 대응)
-                ensureProfileEnvVars()
-                invalidateCompileCacheIfVersionChanged()
-                cleanupStalePidCacheDirs()
-                ensureStartupAttemptStillValid()
-
                 val survivorPidAlive = survivorMetadata?.pid?.let { pid ->
                     pid > 0 && File("/proc/$pid").exists()
                 } == true
@@ -594,19 +908,45 @@ class ProcessManager(
                         healthCheckPassed = survivorHealthy,
                     )
                 ) {
-                    clearStartupAttempt()
-                    startTime = System.currentTimeMillis()
-                    _gatewayState.value = _gatewayState.value.copy(
-                        status = GatewayStatus.RUNNING,
-                        uptime = 0L,
-                        pid = survivorMetadata?.pid,
-                        errorMessage = null,
-                        dashboardReady = true,
+                    ensureStartupAttemptStillValid()
+                    val reattachedMetadata = checkNotNull(survivorMetadata)
+                    val survivorRuntime = restoreRunningExecutionRuntimeFromSurvivor(
+                        metadata = reattachedMetadata,
+                        expectedStartupGeneration = attempt.generation,
                     )
-                    addLog("[andClaw] Reattached to surviving gateway (PID: ${survivorMetadata?.pid ?: "?"})")
+                    addLog(
+                        "[andClaw] Reattached to surviving gateway " +
+                            "(PID: ${reattachedMetadata.pid}, runtime: ${survivorRuntime.storageValue})",
+                    )
                     startPairingObserver()
                     return@launch
                 }
+
+                if (!prorootManager.isRuntimeAvailable(runtimeSnapshot)) {
+                    val runtimeUnavailableMessage =
+                        "Selected runtime (${runtimeSnapshot.storageValue}) is not available."
+                    synchronized(startupAttemptLock) {
+                        if (gatewayAttemptSnapshot.startupAttempt === attempt) {
+                            gatewayAttemptSnapshot = GatewayAttemptSnapshot(status = GatewayStatus.ERROR)
+                            _gatewayState.value = _gatewayState.value.copy(
+                                status = GatewayStatus.ERROR,
+                                errorMessage = runtimeUnavailableMessage,
+                                pid = null,
+                            )
+                        }
+                    }
+                    addLog("[andClaw] $runtimeUnavailableMessage")
+                    return@launch
+                }
+
+                // 패치 파일이 없으면 생성
+                ensurePatchFile()
+                ensureCodexAppServerDiagnosticsWrapper()
+                // .profile에 누락된 환경변수 보충 + 캐시 디렉토리 보장 (기존 사용자 대응)
+                ensureProfileEnvVars()
+                invalidateCompileCacheIfVersionChanged()
+                cleanupStalePidCacheDirs()
+                ensureStartupAttemptStillValid()
 
                 // 기존 게이트웨이 인스턴스 정리 (supervised + orphan 프로세스)
                 stopSupervisedGatewayIfRunning()
@@ -617,7 +957,8 @@ class ProcessManager(
                 // config 파일 생성/갱신 (모델, 게이트웨이, 브라우저 설정)
                 ensureOpenClawConfig(
                     apiProvider = apiProvider,
-                    apiKey = apiKey,
+                    openAiConnectionMode = openAiConnectionMode,
+                    apiKey = effectiveApiKey,
                     selectedModel = selectedModel,
                     selectedModels = selectedModels,
                     primaryModelId = primaryModelId,
@@ -637,16 +978,6 @@ class ProcessManager(
                 ensureChannelConfig(channelConfig)
                 ensureStartupAttemptStillValid()
 
-                if (!prorootManager.isRuntimeAvailable(runtimeSnapshot)) {
-                    clearStartupAttempt()
-                    _gatewayState.value = _gatewayState.value.copy(
-                        status = GatewayStatus.ERROR,
-                        errorMessage = "Selected runtime (${runtimeSnapshot.storageValue}) is not available.",
-                        pid = null,
-                    )
-                    addLog("[andClaw] Selected runtime (${runtimeSnapshot.storageValue}) is not available")
-                    return@launch
-                }
                 prorootManager.prepareRuntime(runtimeSnapshot)
                 val osReleaseRepair = runCatching { prorootManager.repairRootfsOsReleaseFiles() }.getOrNull()
                 if (osReleaseRepair?.changed == true) {
@@ -684,37 +1015,13 @@ class ProcessManager(
                         CODEX_APP_SERVER_ARGS.joinToString(" "),
                     )
 
-                    if (apiProvider == "github-copilot") {
-                        putAll(githubCopilotAuthEnv())
-                    }
-
-                    // API 키를 환경변수로 전달
-                    if (apiKey.isNotBlank()) {
-                        when (apiProvider) {
-                            "anthropic" -> put("ANTHROPIC_API_KEY", apiKey)
-                            "openai" -> put("OPENAI_API_KEY", apiKey)
-                            "openai-codex" -> { /* OAuth provider: no API key env needed */ }
-                            "github-copilot" -> { /* OAuth/env provider: env already resolved above */ }
-                            "zai" -> {
-                                put("ZAI_API_KEY", apiKey)
-                                put("Z_AI_API_KEY", apiKey)
-                            }
-                            "kimi-coding" -> {
-                                put("KIMI_API_KEY", apiKey)
-                                put("KIMICODE_API_KEY", apiKey)
-                            }
-                            "minimax" -> put("MINIMAX_API_KEY", apiKey)
-                            "openai-compatible" -> put("OPENAI_COMPAT_API_KEY", apiKey)
-                            "ollama" -> put("OLLAMA_API_KEY", apiKey)
-                            "ollama-cloud" -> put("OLLAMA_API_KEY", apiKey)
-                            "openrouter" -> put("OPENROUTER_API_KEY", apiKey)
-                            "google" -> {
-                                put("GEMINI_API_KEY", apiKey)
-                                put("GOOGLE_API_KEY", apiKey)
-                            }
-                            else -> put("OPENAI_API_KEY", apiKey)
-                        }
-                    }
+                    putAll(
+                        providerAuthEnv(
+                            apiProvider = apiProvider,
+                            apiKey = effectiveApiKey,
+                            openAiConnectionMode = openAiConnectionMode,
+                        ),
+                    )
 
                     // Brave Search API 키
                     if (braveSearchApiKey.isNotBlank()) {
@@ -750,32 +1057,47 @@ class ProcessManager(
 
                 // 프로세스 시작
                 val pb = ProcessBuilder(cmd).redirectErrorStream(true)
-                pb.environment().putAll(env)
+                applyGatewayProcessEnvironment(
+                    processEnvironment = pb.environment(),
+                    launchEnvironment = env,
+                    apiProvider = apiProvider,
+                    openAiConnectionMode = openAiConnectionMode,
+                )
 
                 addLog("[andClaw] Command: ${cmd.joinToString(" ")}")
 
                 ensureStartupAttemptStillValid()
-                launchedProcess = pb.start()
-                runCatching { launchedProcess.outputStream.close() }
-                if (!isStartupAttemptGenerationValid(startupGeneration)) {
-                    runCatching { launchedProcess.destroyForcibly() }
-                    runCatching { launchedProcess.waitFor(2, TimeUnit.SECONDS) }
-                    throw kotlinx.coroutines.CancellationException("Startup attempt invalidated after process launch")
-                }
-                process = launchedProcess
-                startTime = System.currentTimeMillis()
-
-                _gatewayState.value = _gatewayState.value.copy(
-                    status = GatewayStatus.STARTING,
-                    uptime = 0L,
-                    pid = getProcessId(launchedProcess),
-                    dashboardReady = false,
+                val acceptedProcess = synchronized(stopLock) {
+                    synchronized(startupAttemptLock) {
+                        if (
+                            gatewayAttemptSnapshot.startupAttempt !== attempt ||
+                            gatewayAttemptSnapshot.status != GatewayStatus.STARTING
+                        ) {
+                            null
+                        } else {
+                            val startedProcess = pb.start()
+                            launchedProcess = startedProcess
+                            runCatching { startedProcess.outputStream.close() }
+                            process = startedProcess
+                            startTime = System.currentTimeMillis()
+                            launchedPid = getProcessId(startedProcess)
+                            _gatewayState.value = _gatewayState.value.copy(
+                                status = GatewayStatus.STARTING,
+                                uptime = 0L,
+                                pid = launchedPid,
+                                dashboardReady = false,
+                            )
+                            startedProcess
+                        }
+                    }
+                } ?: throw kotlinx.coroutines.CancellationException(
+                    "Gateway stop overtook process launch",
                 )
                 addLog("[andClaw] Gateway process started (PID: ${_gatewayState.value.pid ?: "?"})")
 
                 // stdout/stderr 스트림 읽기
                 localOutputJob = newScope.launch {
-                    readProcessOutput(launchedProcess)
+                    readProcessOutput(acceptedProcess, attempt)
                 }
                 outputJob = localOutputJob
 
@@ -791,45 +1113,111 @@ class ProcessManager(
 
                 // 프로세스 종료 대기
                 val exitCode = withContext(Dispatchers.IO) {
-                    launchedProcess.waitFor()
+                    acceptedProcess.waitFor()
                 }
 
                 localUptimeJob?.cancel()
-                addLog("[andClaw] Gateway process exited (exit code: $exitCode)")
-
-                // 예기치 않은 종료 (사용자가 stop()을 호출하지 않았는데 종료된 경우)
-                if (_gatewayState.value.status == GatewayStatus.RUNNING ||
-                    _gatewayState.value.status == GatewayStatus.STARTING) {
-                    clearStartupAttempt()
-                    _gatewayState.value = _gatewayState.value.copy(
-                        status = GatewayStatus.ERROR,
-                        errorMessage = "Process terminated unexpectedly (exit: $exitCode)",
-                        pid = null,
-                    )
+                val ownsAttempt = synchronized(startupAttemptLock) {
+                    val current = gatewayAttemptSnapshot
+                    val ownsGeneration =
+                        current.startupAttempt === attempt ||
+                            current.runningAttempt?.generation == attempt.generation
+                    if (
+                        ownsGeneration &&
+                        (current.status == GatewayStatus.RUNNING ||
+                            current.status == GatewayStatus.STARTING)
+                    ) {
+                        gatewayAttemptSnapshot = GatewayAttemptSnapshot(
+                            status = GatewayStatus.ERROR,
+                            runningAttempt = current.runningAttempt ?: RunningAttempt(
+                                generation = attempt.generation,
+                                runtime = attempt.runtime,
+                                startedAtEpochMs = startTime.takeIf { it > 0L },
+                            ),
+                        )
+                        _gatewayState.value = _gatewayState.value.copy(
+                            status = GatewayStatus.ERROR,
+                            errorMessage = "Process terminated unexpectedly (exit: $exitCode)",
+                        )
+                    }
+                    ownsGeneration
+                }
+                if (ownsAttempt) {
+                    addLog("[andClaw] Gateway process exited (exit code: $exitCode)")
                 }
             } catch (_: kotlinx.coroutines.CancellationException) {
                 // 정상적인 취소 (재시작 등)
                 // 단, 취소 시 이미 띄운 프로세스가 살아있으면 명시적으로 정리해서 포트 점유를 방지한다.
                 localOutputJob?.cancel()
                 localUptimeJob?.cancel()
-                launchedProcess?.let { proc ->
-                    if (proc.isAlive) {
+                val cancelledProcess = launchedProcess
+                val cancellationTerminationConfirmed = cancelledProcess == null ||
+                    if (!cancelledProcess.isAlive) {
+                        true
+                    } else {
                         addLog("[andClaw] Cancelling in-flight gateway start; killing spawned process")
-                        runCatching { proc.destroyForcibly() }
-                        runCatching { proc.waitFor(2, TimeUnit.SECONDS) }
+                        runCatching { cancelledProcess.destroyForcibly() }
+                        runCatching {
+                            cancelledProcess.waitFor(2, TimeUnit.SECONDS)
+                        }.getOrDefault(false)
+                    }
+                if (cancellationTerminationConfirmed && cancelledProcess != null) {
+                    synchronized(startupAttemptLock) {
+                        if (process === cancelledProcess) {
+                            process = null
+                            clearRunningAttempt(attempt.generation)
+                        }
                     }
                 }
-                if (process === launchedProcess) {
-                    process = null
+                if (!cancellationTerminationConfirmed && cancelledProcess != null) {
+                    synchronized(startupAttemptLock) {
+                        if (process === cancelledProcess && _gatewayState.value.pid == launchedPid) {
+                            gatewayAttemptSnapshot = GatewayAttemptSnapshot(
+                                status = GatewayStatus.ERROR,
+                                runningAttempt = RunningAttempt(
+                                    generation = attempt.generation,
+                                    runtime = attempt.runtime,
+                                    startedAtEpochMs = startTime.takeIf { it > 0L },
+                                ),
+                            )
+                            _gatewayState.value = _gatewayState.value.copy(
+                                status = GatewayStatus.ERROR,
+                                errorMessage = "Gateway termination could not be confirmed.",
+                            )
+                        }
+                    }
                 }
+                clearStartupAttempt(attempt)
             } catch (e: Exception) {
                 addLog("[andClaw] Error: ${e.message}")
-                clearStartupAttempt()
-                _gatewayState.value = _gatewayState.value.copy(
-                    status = GatewayStatus.ERROR,
-                    errorMessage = e.message,
-                    pid = null,
-                )
+                synchronized(startupAttemptLock) {
+                    if (
+                        gatewayAttemptSnapshot.startupAttempt === attempt ||
+                        gatewayAttemptSnapshot.runningAttempt?.generation == attempt.generation
+                    ) {
+                        val ownsLaunchedProcess =
+                            launchedProcess != null &&
+                                process === launchedProcess &&
+                                _gatewayState.value.pid == launchedPid
+                        gatewayAttemptSnapshot = GatewayAttemptSnapshot(
+                            status = GatewayStatus.ERROR,
+                            runningAttempt = if (ownsLaunchedProcess) {
+                                RunningAttempt(
+                                    generation = attempt.generation,
+                                    runtime = attempt.runtime,
+                                    startedAtEpochMs = startTime.takeIf { it > 0L },
+                                )
+                            } else {
+                                null
+                            },
+                        )
+                        _gatewayState.value = _gatewayState.value.copy(
+                            status = GatewayStatus.ERROR,
+                            errorMessage = e.message,
+                            pid = _gatewayState.value.pid.takeIf { ownsLaunchedProcess },
+                        )
+                    }
+                }
             } finally {
                 if (startupJob === currentCoroutineContext()[Job]) {
                     startupJob = null
@@ -840,11 +1228,43 @@ class ProcessManager(
                 if (uptimeJob === localUptimeJob) {
                     uptimeJob = null
                 }
-                if (process === launchedProcess && launchedProcess?.isAlive != true) {
-                    process = null
+                val finishedProcess = launchedProcess
+                if (finishedProcess != null && !finishedProcess.isAlive) {
+                    clearTerminatedOwnedProcess(
+                        finishedProcess = finishedProcess,
+                        expectedPid = launchedPid,
+                        generation = attempt.generation,
+                    )
                 }
             }
         }
+    }
+
+    internal fun clearTerminatedOwnedProcess(
+        finishedProcess: Process,
+        expectedPid: Int?,
+        generation: Long,
+    ): Boolean = synchronized(startupAttemptLock) {
+        val current = gatewayAttemptSnapshot
+        val ownsGeneration =
+            current.startupAttempt?.generation == generation ||
+                current.runningAttempt?.generation == generation
+        if (
+            finishedProcess.isAlive ||
+            process !== finishedProcess ||
+            _gatewayState.value.pid != expectedPid ||
+            !ownsGeneration
+        ) {
+            return@synchronized false
+        }
+        process = null
+        startTime = 0L
+        gatewayAttemptSnapshot = current.copy(
+            startupAttempt = null,
+            runningAttempt = null,
+        )
+        _gatewayState.value = _gatewayState.value.copy(pid = null)
+        true
     }
 
     /**
@@ -933,58 +1353,125 @@ class ProcessManager(
         }
     }
 
-    fun stop() {
-        stopPreWarmedChromium()
-        clearStartupAttempt()
-        invalidateStartupAttemptGeneration()
-        scope?.cancel()
-        val currentStatus = _gatewayState.value.status
-        if (currentStatus != GatewayStatus.RUNNING && currentStatus != GatewayStatus.STARTING) return
-        val pidFromState = _gatewayState.value.pid
-
-        _gatewayState.value = _gatewayState.value.copy(status = GatewayStatus.STOPPING)
-        addLog("[andClaw] Stopping gateway...")
-
-        outputJob?.cancel()
-        uptimeJob?.cancel()
-        stopPairingObserver()
-
-        var stoppedByHandle = false
-
-        // 프로세스 핸들이 있는 일반 케이스 종료
-        process?.let { proc ->
-            proc.destroyForcibly()
-            runCatching {
-                proc.waitFor(2, TimeUnit.SECONDS)
+    fun stop(): ProcessStopResult = synchronized(stopLock) {
+        val stopClaim = synchronized(startupAttemptLock) {
+            val currentState = _gatewayState.value
+            val managedProcess = process
+            val runningAttempt = gatewayAttemptSnapshot.runningAttempt
+                ?: gatewayAttemptSnapshot.startupAttempt
+                    ?.takeIf { managedProcess != null && currentState.pid != null }
+                    ?.let { attempt ->
+                        RunningAttempt(
+                            generation = attempt.generation,
+                            runtime = attempt.runtime,
+                            startedAtEpochMs = startTime.takeIf { it > 0L },
+                        )
+                    }
+            val alreadyStopped =
+                gatewayAttemptSnapshot.status == GatewayStatus.STOPPED &&
+                    managedProcess == null &&
+                    currentState.pid == null
+            startupAttemptGeneration += 1
+            gatewayAttemptSnapshot = GatewayAttemptSnapshot(
+                status = if (alreadyStopped) GatewayStatus.STOPPED else GatewayStatus.STOPPING,
+                runningAttempt = runningAttempt,
+            )
+            if (!alreadyStopped) {
+                _gatewayState.value = currentState.copy(status = GatewayStatus.STOPPING)
             }
-            stoppedByHandle = true
+            StopClaim(
+                state = currentState,
+                process = managedProcess,
+                runningAttempt = runningAttempt,
+                alreadyStopped = alreadyStopped,
+            )
+        }
+        val currentState = stopClaim.state
+        val managedProcess = stopClaim.process
+        val runningAttempt = stopClaim.runningAttempt
+        val alreadyStopped = stopClaim.alreadyStopped
+        if (alreadyStopped) {
+            stopPreWarmedChromium()
+            return@synchronized ProcessStopResult.STOPPED
         }
 
-        // 프로세스-데스 이후 survivor 재부착 케이스: process 핸들이 없으므로 PID 기반 종료 시도
-        if (!stoppedByHandle && pidFromState != null && pidFromState > 0) {
-            val isAlive = File("/proc/$pidFromState").exists()
-            if (isAlive) {
-                val killed = runCatching {
-                    android.os.Process.killProcess(pidFromState)
+        stopPreWarmedChromium()
+        addLog("[andClaw] Stopping gateway...")
+
+        val pidFromState = currentState.pid
+        val terminationConfirmed = when {
+            managedProcess != null -> {
+                terminateProcessGracefully(
+                    process = managedProcess,
+                    gracefulTimeoutMs = GATEWAY_GRACEFUL_STOP_TIMEOUT_MS,
+                    forceTimeoutMs = GATEWAY_FORCE_STOP_TIMEOUT_MS,
+                )
+            }
+            pidFromState != null && pidFromState > 0 && File("/proc/$pidFromState").exists() -> {
+                android.os.Process.sendSignal(pidFromState, SIGTERM)
+                if (waitForPidExit(pidFromState, GATEWAY_GRACEFUL_STOP_TIMEOUT_MS)) {
                     true
-                }.getOrDefault(false)
-                if (killed) {
-                    stoppedByHandle = true
-                    addLog("[andClaw] Stopped reattached gateway by PID: $pidFromState")
+                } else {
+                    android.os.Process.killProcess(pidFromState)
+                    waitForPidExit(pidFromState, GATEWAY_FORCE_STOP_TIMEOUT_MS)
+                }
+            }
+            else -> {
+                stopSupervisedGatewayIfRunning()
+                if (waitForPortReleaseGracefully(GATEWAY_PORT, GATEWAY_GRACEFUL_STOP_TIMEOUT_MS)) {
+                    true
+                } else {
+                    killProcessesHoldingPort(GATEWAY_PORT)
+                    waitForPortReleaseGracefully(GATEWAY_PORT, GATEWAY_FORCE_STOP_TIMEOUT_MS)
                 }
             }
         }
 
-        // 최후 fallback: supervised gateway stop 요청
-        if (!stoppedByHandle) {
-            stopSupervisedGatewayIfRunning()
+
+        val result = synchronized(startupAttemptLock) {
+            val managedProcessDeathConfirmed =
+                managedProcess != null &&
+                    !managedProcess.isAlive &&
+                    (process === managedProcess || process == null)
+            if (
+                (terminationConfirmed || managedProcessDeathConfirmed) &&
+                (process === managedProcess || process == null)
+            ) {
+                process = null
+                startTime = 0L
+                gatewayAttemptSnapshot = GatewayAttemptSnapshot(status = GatewayStatus.STOPPED)
+                _gatewayState.value = GatewayState(status = GatewayStatus.STOPPED)
+                ProcessStopResult.STOPPED
+            } else {
+                gatewayAttemptSnapshot = GatewayAttemptSnapshot(
+                    status = GatewayStatus.ERROR,
+                    runningAttempt = runningAttempt,
+                )
+                _gatewayState.value = _gatewayState.value.copy(
+                    status = GatewayStatus.ERROR,
+                    errorMessage = "Gateway termination could not be confirmed.",
+                )
+                ProcessStopResult.TERMINATION_UNCONFIRMED
+            }
         }
 
-        process = null
-
-        gatewayUsesTls = false
-        _gatewayState.value = GatewayState(status = GatewayStatus.STOPPED)
-        addLog("[andClaw] Gateway stopped")
+        if (result.terminationConfirmed) {
+            stopPairingObserver()
+            outputJob?.cancel()
+            uptimeJob?.cancel()
+            startupJob?.cancel()
+            startupJob = null
+            scope?.cancel()
+            outputJob = null
+            uptimeJob = null
+        }
+        if (result.terminationConfirmed) {
+            gatewayUsesTls = false
+            addLog("[andClaw] Gateway stopped")
+        } else {
+            addLog("[andClaw] Gateway termination could not be confirmed")
+        }
+        result
     }
 
     /**
@@ -1010,11 +1497,16 @@ class ProcessManager(
         memorySearchApiKey: String = "",
         survivorMetadata: GatewaySurvivorMetadata? = null,
         probePhase: String = "gateway-restart",
-    ) {
-        markStartupAttemptStarted()
-        stop()
+        openAiConnectionMode: OpenAiConnectionMode = OpenAiConnectionMode.CODEX_SUBSCRIPTION,
+        runtimeOverride: ExecutionRuntime? = null,
+    ): Boolean {
+        val runtimeSnapshot = runtimeOverride ?: prorootManager.selectedRuntime
+        if (!stop().terminationConfirmed) {
+            return false
+        }
         start(
             apiProvider = apiProvider,
+            openAiConnectionMode = openAiConnectionMode,
             apiKey = apiKey,
             selectedModel = selectedModel,
             selectedModels = selectedModels,
@@ -1033,17 +1525,22 @@ class ProcessManager(
             memorySearchApiKey = memorySearchApiKey,
             survivorMetadata = survivorMetadata,
             probePhase = probePhase,
+            runtimeOverride = runtimeSnapshot,
         )
+        return true
     }
 
     /**
      * 리소스 정리
      */
-    fun destroy() {
-        stop()
+    fun destroy(): Boolean {
+        if (!stop().terminationConfirmed) {
+            return false
+        }
         stopPairingObserver()
         scope?.cancel()
         scope = null
+        return true
     }
 
     /**
@@ -1055,23 +1552,25 @@ class ProcessManager(
         if (!sessionsDir.exists()) return emptyList()
 
         try {
-            // 가장 최근 수정된 .jsonl 파일 찾기
-            val jsonlFiles = sessionsDir.listFiles { f -> f.extension == "jsonl" }
+            val jsonlFiles = sessionsDir.listFiles { file -> file.extension == "jsonl" }
                 ?.sortedByDescending { it.lastModified() }
                 ?: return emptyList()
-
             val entries = mutableListOf<SessionLogEntry>()
 
             for (file in jsonlFiles) {
                 if (entries.size >= 50) break
 
-                val lines = file.readLines().filter { it.isNotBlank() }
-                for (line in lines.reversed()) {
+                val lines = readTextFileLinesBounded(
+                    file = file,
+                    maxBytes = MAX_SESSION_LOG_BYTES_PER_FILE,
+                    maxLines = MAX_SESSION_LOG_LINES_PER_FILE,
+                    fromEnd = true,
+                )
+                for (line in lines.asReversed()) {
                     if (entries.size >= 50) break
                     try {
                         val json = JSONObject(line)
-                        val type = json.optString("type", "")
-                        if (type != "message") continue
+                        if (json.optString("type", "") != "message") continue
 
                         val msg = json.optJSONObject("message") ?: continue
                         val role = msg.optString("role", "")
@@ -1083,17 +1582,15 @@ class ProcessManager(
                         val timestamp = json.optString("timestamp", "").ifBlank {
                             json.optString("ts", "")
                         }
-
-                        // content 미리보기 추출
                         val contentPreview = extractContentPreview(msg)
-
-                        // 토큰 사용량
                         val usage = msg.optJSONObject("usage")
                         val tokenUsage = if (usage != null) {
                             usage.optInt("totalTokens", 0).let {
                                 if (it > 0) it else usage.optInt("outputTokens", 0) + usage.optInt("inputTokens", 0)
                             }
-                        } else 0
+                        } else {
+                            0
+                        }
 
                         entries.add(
                             SessionLogEntry(
@@ -1172,6 +1669,7 @@ class ProcessManager(
         memorySearchEnabled: Boolean? = null,
         memorySearchProvider: String? = null,
         memorySearchApiKey: String? = null,
+        openAiConnectionMode: OpenAiConnectionMode = OpenAiConnectionMode.CODEX_SUBSCRIPTION,
     ) {
         val configFile = File(prorootManager.rootfsDir, "root/.openclaw/openclaw.json")
 
@@ -1212,14 +1710,18 @@ class ProcessManager(
             }
 
             val installedOpenClawVersion = readInstalledOpenClawVersion()
-            if (OpenClawCodexModelScope.usesOpenAiAppServerAuth(installedOpenClawVersion)) {
-                ensureCodexAppServerOpenAiAuthProfileMirror()
-            }
-            val installedCodexBareModelIds = if (apiProvider == "openai-codex") {
-                readInstalledCodexBareModelIds(installedOpenClawVersion)
+            val installedOpenAiModels = if (apiProvider in setOf("openai", "openai-codex")) {
+                OpenClawModelCatalogReader.loadProviderModels(
+                    prorootManager.rootfsDir,
+                    OpenClawCodexModelScope.OPENAI_PROVIDER,
+                )
             } else {
-                emptySet()
+                emptyList()
             }
+            val installedCodexBareModelIds = installedOpenAiModels
+                .map { OpenClawCodexModelScope.bareModelId(it.id) }
+                .filter(String::isNotBlank)
+                .toSet()
 
             val normalizedSelectedEntries = selectedModels
                 .mapNotNull { entry ->
@@ -1251,11 +1753,9 @@ class ProcessManager(
                 val defaultModelId = when (apiProvider) {
                     "openrouter" -> "openrouter/free"
                     "anthropic" -> "claude-sonnet-4-5"
-                    "openai" -> "gpt-5-mini"
-                    "openai-codex" -> OpenClawCodexModelScope.preferredBareModelId(
-                        installedOpenClawVersion,
-                        installedCodexBareModelIds,
-                    )
+                    "openai", "openai-codex" ->
+                        resolveOpenAiDefaultModel(openAiConnectionMode, installedOpenAiModels)?.id
+                            ?: error("No canonical OpenAI default model is available for ${openAiConnectionMode.storageValue}.")
                     "github-copilot" -> "gpt-4o"
                     "zai" -> "glm-5"
                     "kimi-coding" -> "k2p5"
@@ -1630,12 +2130,20 @@ class ProcessManager(
                 changed = true
             }
 
+            if (
+                apiProvider == "openai" &&
+                OpenAiCanonicalRuntimeState.applyConfigPolicy(json, openAiConnectionMode)
+            ) {
+                changed = true
+            }
+
             sanitizeAgentModelState(
                 apiProvider = apiProvider,
                 selectedEntries = normalizedSelectedEntries,
                 providerScopedModels = targetModels.toSet(),
                 primaryProviderScopedModel = targetModel,
                 installedOpenClawVersion = installedOpenClawVersion,
+                openAiConnectionMode = openAiConnectionMode,
             )
 
                 // gateway 설정 (mode 및 controlUi.allowedOrigins)
@@ -1727,18 +2235,6 @@ class ProcessManager(
         val repaired = normalizeDirectoryPermissions(openClawDir)
         if (repaired > 0) {
             addLog("[andClaw] Repaired OpenClaw directory permissions ($repaired dirs)")
-        }
-    }
-
-    private fun ensureCodexAppServerOpenAiAuthProfileMirror() {
-        runCatching {
-            val changed = OpenClawAuthProfileStore.mirrorCodexAppServerOpenAiProfile(prorootManager.rootfsDir)
-            if (changed) {
-                addLog("[andClaw] Mirrored Codex OAuth profile for Codex app-server auth")
-            }
-            changed
-        }.onFailure { throwable ->
-            addLog("[andClaw] Codex app-server auth profile migration failed: ${throwable.message}")
         }
     }
 
@@ -2039,6 +2535,24 @@ class ProcessManager(
             val processUid = uidLine.split("\\s+".toRegex()).getOrNull(1)?.toIntOrNull() ?: return false
             processUid == uid
         }.getOrDefault(false)
+    }
+
+    private fun waitForPidExit(pid: Int, timeoutMs: Long): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (!File("/proc/$pid").exists()) return true
+            Thread.sleep(50)
+        }
+        return !File("/proc/$pid").exists()
+    }
+
+    private fun waitForPortReleaseGracefully(port: Int, timeoutMs: Long): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (findListeningSocketInodes(port).isEmpty()) return true
+            Thread.sleep(200)
+        }
+        return findListeningSocketInodes(port).isEmpty()
     }
 
     private fun waitForPortRelease(port: Int, timeoutMs: Long): Boolean {
@@ -2362,14 +2876,26 @@ class ProcessManager(
         apiProvider: String,
     ): Boolean {
         val providers = config.optJSONObject("models")?.optJSONObject("providers") ?: return false
-        val keepProvider = when (apiProvider) {
+        val normalizedApiProvider = apiProvider.trim().lowercase()
+        val keepProvider = when (normalizedApiProvider) {
+            "openai", "openai-codex" -> OpenClawCodexModelScope.OPENAI_PROVIDER
             "ollama", "ollama-cloud" -> "ollama"
             else -> null
         }
+        val staleOpenAiProviders = setOf(
+            OpenClawCodexModelScope.LEGACY_PROVIDER,
+            OpenClawCodexModelScope.LEGACY_CODEX_PROVIDER,
+            "ollama",
+        )
         val keys = providers.keys().asSequence().toList()
         var changed = false
         keys.forEach { provider ->
-            if (provider != keepProvider) {
+            val shouldRemove = if (keepProvider == OpenClawCodexModelScope.OPENAI_PROVIDER) {
+                provider.trim().lowercase() in staleOpenAiProviders
+            } else {
+                provider != keepProvider
+            }
+            if (shouldRemove) {
                 providers.remove(provider)
                 changed = true
             }
@@ -2446,6 +2972,7 @@ class ProcessManager(
         providerScopedModels: Set<String>,
         primaryProviderScopedModel: String,
         installedOpenClawVersion: String?,
+        openAiConnectionMode: OpenAiConnectionMode,
     ) {
         val selectedModelIds = selectedAgentModelIds(
             apiProvider = apiProvider,
@@ -2469,6 +2996,7 @@ class ProcessManager(
         sanitizeAgentSessionsJson(
             targetProvider = targetProvider,
             targetModel = targetSessionModel,
+            openAiConnectionMode = openAiConnectionMode,
         )
     }
 
@@ -2558,6 +3086,7 @@ class ProcessManager(
     private fun sanitizeAgentSessionsJson(
         targetProvider: String,
         targetModel: String,
+        openAiConnectionMode: OpenAiConnectionMode,
     ) {
         val file = File(prorootManager.rootfsDir, "root/.openclaw/agents/main/sessions/sessions.json")
         if (!file.exists()) return
@@ -2573,6 +3102,7 @@ class ProcessManager(
                         entry = entry,
                         targetProvider = targetProvider,
                         targetModel = targetModel,
+                        openAiConnectionMode = openAiConnectionMode,
                     )
                 ) {
                     changed = true
@@ -2592,7 +3122,15 @@ class ProcessManager(
         entry: JSONObject,
         targetProvider: String,
         targetModel: String,
+        openAiConnectionMode: OpenAiConnectionMode,
     ): Boolean {
+        if (
+            targetProvider == "openai" &&
+            sessionHasExplicitNonOpenAiRoute(entry)
+        ) {
+            return false
+        }
+
         var changed = false
         val previousOverrideModel = entry.optString("modelOverride").trim()
         val previousModel = entry.optString("model").trim()
@@ -2625,8 +3163,52 @@ class ProcessManager(
             }
         }
 
+
+        if (targetProvider == "openai") {
+            for (key in listOf("agentHarnessId", "agentRuntimeOverride")) {
+                if (entry.has(key)) {
+                    entry.remove(key)
+                    changed = true
+                }
+            }
+            val targetProfileId =
+                OpenAiCanonicalRuntimeState.launchPolicy(openAiConnectionMode).authProfileId
+            val authProfileOverride = entry.optString("authProfileOverride").trim()
+            val isOpenAiProfileOverride =
+                authProfileOverride.startsWith("openai:") ||
+                    authProfileOverride.startsWith("openai-codex:")
+            if (isOpenAiProfileOverride && authProfileOverride != targetProfileId) {
+                entry.remove("authProfileOverride")
+                entry.remove("authProfileOverrideSource")
+                changed = true
+            }
+        }
         return changed
     }
+    private fun sessionHasExplicitNonOpenAiRoute(entry: JSONObject): Boolean {
+        val openAiProviders = setOf("openai", "openai-codex", "codex", "codex-cli")
+        val providerRefs = listOf("modelProvider", "providerOverride", "provider")
+            .map { entry.optString(it).trim().lowercase() }
+            .filter(String::isNotBlank)
+        if (providerRefs.any { it !in openAiProviders }) return true
+        val modelRefs = listOf("model", "modelOverride")
+            .map { entry.optString(it).trim().lowercase() }
+            .filter { it.contains("/") }
+        if (
+            modelRefs.any {
+                it.substringBefore("/") !in openAiProviders
+            }
+        ) {
+            return true
+        }
+        val authProfileRefs = listOf("authProfileOverride", "authProfile")
+            .map { entry.optString(it).trim().lowercase() }
+            .filter(String::isNotBlank)
+        return authProfileRefs.any {
+            it.substringBefore(":") !in openAiProviders
+        }
+    }
+
 
     private fun normalizeAgentSessionModelForComparison(
         targetProvider: String,
@@ -2742,7 +3324,11 @@ class ProcessManager(
     }
 
     private fun codexAgentProviderAliases(): Set<String> {
-        return setOf(OpenClawCodexModelScope.LEGACY_PROVIDER, OpenClawCodexModelScope.CODEX_PROVIDER)
+        return setOf(
+            OpenClawCodexModelScope.OPENAI_PROVIDER,
+            OpenClawCodexModelScope.LEGACY_PROVIDER,
+            OpenClawCodexModelScope.LEGACY_CODEX_PROVIDER,
+        )
     }
 
     private fun mergeAgentProviderModelsJson(
@@ -3269,14 +3855,17 @@ class ProcessManager(
         _logLines.value = if (current.size > 1000) current.takeLast(1000) else current
     }
 
-    private suspend fun readProcessOutput(process: Process) = withContext(Dispatchers.IO) {
+    private suspend fun readProcessOutput(
+        process: Process,
+        attempt: StartupAttempt,
+    ) = withContext(Dispatchers.IO) {
         try {
             BufferedReader(InputStreamReader(process.inputStream)).use { reader ->
                 var line: String?
                 while (reader.readLine().also { line = it } != null) {
                     line?.let {
                         addLog(it)
-                        parseLogLine(it)
+                        parseLogLine(it, attempt)
                     }
                 }
             }
@@ -3288,18 +3877,23 @@ class ProcessManager(
     /**
      * OpenClaw 로그에서 상태 정보를 파싱한다.
      */
-    private fun parseLogLine(line: String) {
+    private fun parseLogLine(line: String, attempt: StartupAttempt) {
+        if (currentStartupAttempt(attempt.generation) !== attempt) return
         val lineLower = line.lowercase()
 
         // 게이트웨이 ready 상태 감지 (HTTP 서버 리슨 시작)
         val isPortConflict = lineLower.contains("already listening on ws://127.0.0.1:18789") ||
             lineLower.contains("port 18789 is already in use")
         if (isPortConflict) {
-            clearStartupAttempt()
-            _gatewayState.value = _gatewayState.value.copy(
-                status = GatewayStatus.ERROR,
-                errorMessage = "Port 18789 is already in use",
-            )
+            synchronized(startupAttemptLock) {
+                if (gatewayAttemptSnapshot.startupAttempt === attempt) {
+                    gatewayAttemptSnapshot = GatewayAttemptSnapshot(status = GatewayStatus.ERROR)
+                    _gatewayState.value = _gatewayState.value.copy(
+                        status = GatewayStatus.ERROR,
+                        errorMessage = "Port 18789 is already in use",
+                    )
+                }
+            }
             return
         }
 
@@ -3326,11 +3920,7 @@ class ProcessManager(
         if (isGatewayReady ||
             lineLower.contains("browser") && lineLower.contains("control listening") ||
             lineLower.contains("browser/server") && lineLower.contains("listening")) {
-            clearStartupAttempt()
-            _gatewayState.value = _gatewayState.value.copy(
-                status = GatewayStatus.RUNNING,
-                dashboardReady = true,
-            )
+            if (!publishRunningAttempt(attempt)) return
             addLog("[andClaw] Gateway is ready!")
         }
     }

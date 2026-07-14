@@ -37,6 +37,7 @@ object OpenClawModelCatalogReader {
         val maxTokens: Int,
         val supportsReasoning: Boolean,
         val supportsImages: Boolean,
+        val isDefault: Boolean = false,
     )
 
     private data class OllamaModelDetails(
@@ -241,7 +242,7 @@ object OpenClawModelCatalogReader {
     }
 
     fun loadProviderModels(rootfsDir: File?, provider: String): List<ModelEntry> {
-        val normalizedProvider = provider.trim().lowercase()
+        val normalizedProvider = canonicalProvider(provider)
         if (normalizedProvider.isBlank()) return emptyList()
 
         val bundled = loadFromBundledCatalog(normalizedProvider)
@@ -255,6 +256,15 @@ object OpenClawModelCatalogReader {
             .distinctBy { it.id.lowercase() }
     }
 
+    fun canonicalProvider(provider: String): String {
+        return when (val normalized = provider.trim().lowercase()) {
+            OpenClawCodexModelScope.LEGACY_PROVIDER,
+            OpenClawCodexModelScope.LEGACY_CODEX_PROVIDER,
+            -> OpenClawCodexModelScope.OPENAI_PROVIDER
+            else -> normalized
+        }
+    }
+
     private var bundledCatalogCache: JSONObject? = null
 
     private fun loadFromBundledCatalog(provider: String): List<ModelEntry> {
@@ -264,17 +274,23 @@ object OpenClawModelCatalogReader {
                 .let { JSONObject(it) }
         }.getOrNull()?.also { bundledCatalogCache = it } ?: return emptyList()
 
-        val models = json.optJSONArray(provider) ?: return emptyList()
+        return parseBundledCatalog(json, provider)
+    }
+
+    internal fun parseBundledCatalog(json: JSONObject, provider: String): List<ModelEntry> {
+        val canonicalProvider = canonicalProvider(provider)
+        val models = json.optJSONArray(canonicalProvider) ?: return emptyList()
         return (0 until models.length()).mapNotNull { i ->
             val m = models.optJSONObject(i) ?: return@mapNotNull null
             ModelEntry(
                 id = m.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null,
                 name = m.optString("name").ifBlank { m.optString("id") },
-                provider = m.optString("provider", provider),
+                provider = canonicalProvider(m.optString("provider", canonicalProvider)),
                 contextWindow = m.optInt("contextWindow", 0),
                 maxTokens = m.optInt("maxTokens", 0),
                 supportsReasoning = m.optBoolean("reasoning", false),
                 supportsImages = m.optBoolean("images", false),
+                isDefault = m.optBoolean("isDefault", false),
             )
         }
     }
@@ -287,7 +303,7 @@ object OpenClawModelCatalogReader {
     }
 
     fun loadSyntheticFallbackModelIds(rootfsDir: File?, provider: String): Set<String> {
-        val normalizedProvider = provider.trim().lowercase()
+        val normalizedProvider = canonicalProvider(provider)
         if (normalizedProvider.isBlank()) return emptySet()
         return findRuntimeModelCatalogFiles(rootfsDir)
             .asSequence()
@@ -299,7 +315,7 @@ object OpenClawModelCatalogReader {
 
                 parseSyntheticFallbackSpecs(fallbackSection).asSequence().mapNotNull { spec ->
                     val resolvedProvider = resolveToken(spec.providerToken, constants) ?: return@mapNotNull null
-                    if (!resolvedProvider.equals(normalizedProvider, ignoreCase = true)) return@mapNotNull null
+                    if (canonicalProvider(resolvedProvider) != normalizedProvider) return@mapNotNull null
                     resolveToken(spec.idToken, constants)
                 }
             }
@@ -311,7 +327,7 @@ object OpenClawModelCatalogReader {
         provider: String,
         baseEntries: List<ModelEntry>,
     ): List<ModelEntry> {
-        val normalizedProvider = provider.trim().lowercase()
+        val normalizedProvider = canonicalProvider(provider)
         if (normalizedProvider.isBlank()) return emptyList()
         return readSyntheticFallbackEntries(rootfsDir, normalizedProvider, baseEntries)
             .distinctBy { it.id.lowercase() }
@@ -339,7 +355,7 @@ object OpenClawModelCatalogReader {
 
                 parseSyntheticFallbackSpecs(fallbackSection).asSequence().mapNotNull { spec ->
                     val resolvedProvider = resolveToken(spec.providerToken, constants) ?: return@mapNotNull null
-                    if (!resolvedProvider.equals(provider, ignoreCase = true)) return@mapNotNull null
+                    if (canonicalProvider(resolvedProvider) != provider) return@mapNotNull null
 
                     val resolvedId = resolveToken(spec.idToken, constants) ?: return@mapNotNull null
                     if (baseEntries.any { it.id.equals(resolvedId, ignoreCase = true) }) return@mapNotNull null

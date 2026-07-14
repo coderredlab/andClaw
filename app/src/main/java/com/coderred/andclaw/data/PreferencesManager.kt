@@ -3,6 +3,7 @@ package com.coderred.andclaw.data
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
@@ -25,6 +26,67 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+
+enum class OpenAiConnectionMode(val storageValue: String, val selectionScope: String) {
+    CODEX_SUBSCRIPTION("codex-subscription", "openai|codex-subscription"),
+    PLATFORM_API_KEY("platform-api-key", "openai|platform-api-key");
+
+    companion object {
+        fun fromStorageValue(value: String?): OpenAiConnectionMode? = when (value?.trim()?.lowercase()) {
+            CODEX_SUBSCRIPTION.storageValue,
+            CODEX_SUBSCRIPTION.name.lowercase(),
+            -> CODEX_SUBSCRIPTION
+
+            PLATFORM_API_KEY.storageValue,
+            PLATFORM_API_KEY.name.lowercase(),
+            -> PLATFORM_API_KEY
+
+            else -> null
+        }
+    }
+}
+
+data class OpenAiConnectionModeResolutionInput(
+    val canonicalMode: String? = null,
+    val hasUsableCodexCredential: Boolean = false,
+    val hasUsablePlatformApiKeyCredential: Boolean = false,
+    val legacyProvider: String? = null,
+    val sqliteActiveModeHint: OpenAiConnectionMode? = null,
+    val configActiveModeHint: OpenAiConnectionMode? = null,
+)
+
+data class OpenAiMigrationPreferencesSnapshot(
+    val migrationComplete: Boolean,
+    val canonicalMode: String?,
+    val activeProvider: String?,
+    val preferenceApiKey: String?,
+    val hasLegacyActiveReference: Boolean,
+)
+
+fun resolveOpenAiConnectionMode(
+    input: OpenAiConnectionModeResolutionInput,
+): OpenAiConnectionMode {
+    OpenAiConnectionMode.fromStorageValue(input.canonicalMode)?.let { return it }
+
+    if (input.hasUsableCodexCredential xor input.hasUsablePlatformApiKeyCredential) {
+        return if (input.hasUsableCodexCredential) {
+            OpenAiConnectionMode.CODEX_SUBSCRIPTION
+        } else {
+            OpenAiConnectionMode.PLATFORM_API_KEY
+        }
+    }
+
+    if (input.hasUsableCodexCredential && input.hasUsablePlatformApiKeyCredential) {
+        when (input.legacyProvider?.trim()?.lowercase()) {
+            "openai-codex", "codex" -> return OpenAiConnectionMode.CODEX_SUBSCRIPTION
+            "openai" -> return OpenAiConnectionMode.PLATFORM_API_KEY
+        }
+        input.sqliteActiveModeHint?.let { return it }
+        input.configActiveModeHint?.let { return it }
+    }
+
+    return OpenAiConnectionMode.CODEX_SUBSCRIPTION
+}
 
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "andclaw_prefs")
 
@@ -128,6 +190,49 @@ internal fun hasOpenClawModelsStatusAuth(output: String?, providerId: String): B
 
         false
     }.getOrDefault(false)
+}
+
+internal data class OpenAiTransitionPreferenceValue<T>(
+    val present: Boolean,
+    val value: T?,
+)
+
+internal data class OpenAiTransitionManagedPreferences(
+    val apiProvider: OpenAiTransitionPreferenceValue<String>,
+    val openAiConnectionMode: OpenAiTransitionPreferenceValue<String>,
+    val selectedModel: OpenAiTransitionPreferenceValue<String>,
+    val selectedModelProvider: OpenAiTransitionPreferenceValue<String>,
+    val selectedModelReasoning: OpenAiTransitionPreferenceValue<Boolean>,
+    val selectedModelImages: OpenAiTransitionPreferenceValue<Boolean>,
+    val selectedModelContext: OpenAiTransitionPreferenceValue<String>,
+    val selectedModelMaxOutput: OpenAiTransitionPreferenceValue<String>,
+)
+
+internal data class OpenAiTransitionModelScopePreferences(
+    val selectedModelIds: OpenAiTransitionPreferenceValue<List<String>>,
+    val primaryModelId: OpenAiTransitionPreferenceValue<String>,
+    val metadataById: OpenAiTransitionPreferenceValue<Map<String, SelectedModelConfigEntry>>,
+)
+
+internal data class OpenAiTransitionPreferencesSnapshot(
+    val targetScope: String,
+    val previousManaged: OpenAiTransitionManagedPreferences,
+    val stagedManaged: OpenAiTransitionManagedPreferences,
+    val previousTargetScope: OpenAiTransitionModelScopePreferences,
+    val stagedTargetScope: OpenAiTransitionModelScopePreferences,
+)
+
+internal data class OpenAiTransitionPreferencesRollbackResult(
+    val apiProviderRestored: Boolean,
+    val openAiConnectionModeRestored: Boolean,
+    val globalModelSelectionRestored: Boolean,
+    val targetModelScopeRestored: Boolean,
+) {
+    val fullyRestored: Boolean
+        get() = apiProviderRestored &&
+            openAiConnectionModeRestored &&
+            globalModelSelectionRestored &&
+            targetModelScopeRestored
 }
 
 class PreferencesManager(private val context: Context) {
@@ -260,6 +365,7 @@ class PreferencesManager(private val context: Context) {
         // are intentionally excluded.
         val TRANSFER_EXPORTABLE_KEYS: Set<String> = setOf(
             "api_provider",
+            "openai_connection_mode",
             "api_key",
             "api_key_openrouter",
             "api_key_openai",
@@ -303,6 +409,9 @@ class PreferencesManager(private val context: Context) {
         private val KEY_SETUP_COMPLETE = booleanPreferencesKey("setup_complete")
         private val KEY_ONBOARDING_COMPLETE = booleanPreferencesKey("onboarding_complete")
         private val KEY_API_PROVIDER = stringPreferencesKey("api_provider")
+        private val KEY_OPENAI_CONNECTION_MODE = stringPreferencesKey("openai_connection_mode")
+        private val KEY_OPENAI_CANONICAL_MIGRATION_COMPLETE =
+            booleanPreferencesKey("openai_canonical_migration_2026_7_1_complete")
         private val KEY_API_KEY = stringPreferencesKey("api_key")
         private val KEY_API_KEY_OPENROUTER = stringPreferencesKey("api_key_openrouter")
         private val KEY_API_KEY_ANTHROPIC = stringPreferencesKey("api_key_anthropic")
@@ -360,6 +469,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
         private val KEY_GATEWAY_SURVIVOR_STARTUP_ATTEMPT_ACTIVE =
             booleanPreferencesKey("gateway_survivor_startup_attempt_active")
         private val KEY_GATEWAY_SURVIVOR_UPDATED_AT = longPreferencesKey("gateway_survivor_updated_at")
+        private val KEY_GATEWAY_SURVIVOR_RUNTIME = stringPreferencesKey("gateway_survivor_runtime")
         private val KEY_BUNDLE_UPDATE_FAIL_COUNT_BY_VERSION = stringPreferencesKey("bundle_update_fail_count_by_version")
         private val KEY_BUNDLE_UPDATE_LAST_FAIL_AT = longPreferencesKey("bundle_update_last_fail_at")
         private val KEY_BUNDLE_UPDATE_LAST_FAIL_ELAPSED = longPreferencesKey("bundle_update_last_fail_elapsed")
@@ -413,6 +523,119 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                 "nvidia" -> "openrouter"
                 else -> raw
             }
+        }
+        private fun canonicalizeApiProvider(provider: String): String = when (normalizeProvider(provider)) {
+            "openai-codex", "codex" -> "openai"
+            else -> normalizeProvider(provider)
+        }
+
+        private fun legacyOpenAiModeForProvider(provider: String?): OpenAiConnectionMode? =
+            when (normalizeProvider(provider.orEmpty())) {
+                "openai-codex", "codex" -> OpenAiConnectionMode.CODEX_SUBSCRIPTION
+                "openai" -> OpenAiConnectionMode.PLATFORM_API_KEY
+                else -> null
+            }
+
+        private fun storedOpenAiMode(snapshot: Preferences): OpenAiConnectionMode =
+            OpenAiConnectionMode.fromStorageValue(snapshot[KEY_OPENAI_CONNECTION_MODE])
+                ?: legacyOpenAiModeForProvider(snapshot[KEY_API_PROVIDER])
+                ?: OpenAiConnectionMode.CODEX_SUBSCRIPTION
+
+        private fun modelSelectionStorageKey(
+            provider: String,
+            openAiMode: OpenAiConnectionMode?,
+        ): String {
+            val normalizedProvider = normalizeProvider(provider)
+            return when (normalizedProvider) {
+                "openai-codex", "codex" -> OpenAiConnectionMode.CODEX_SUBSCRIPTION.selectionScope
+                "openai" -> (openAiMode ?: OpenAiConnectionMode.PLATFORM_API_KEY).selectionScope
+                else -> normalizedProvider
+            }
+        }
+
+        private fun canonicalizeOpenAiModelReference(modelId: String): String {
+            val normalized = modelId.trim()
+            if (normalized.isBlank() || normalized.startsWith("openai/")) return normalized
+            val legacyPrefixes = listOf("openai-codex/", "codex-cli/", "codex/")
+            val legacyPrefix = legacyPrefixes.firstOrNull(normalized::startsWith)
+            return when {
+                legacyPrefix != null -> "openai/${normalized.removePrefix(legacyPrefix)}"
+                !normalized.contains("/") -> "openai/$normalized"
+                else -> normalized
+            }
+        }
+
+        private fun migrateLegacyOpenAiModelScopes(
+            selectedByProvider: MutableMap<String, List<String>>,
+            metadataByProvider: MutableMap<String, Map<String, SelectedModelConfigEntry>>,
+            primaryByProvider: MutableMap<String, String>,
+            legacyGlobalPrimary: String,
+            legacyGlobalProvider: String,
+        ) {
+            fun copyScope(
+                legacyProviders: List<String>,
+                mode: OpenAiConnectionMode,
+            ) {
+                val scope = mode.selectionScope
+                val sourceProvider = legacyProviders.firstOrNull {
+                    selectedByProvider[it].orEmpty().isNotEmpty() ||
+                        metadataByProvider[it].orEmpty().isNotEmpty() ||
+                        primaryByProvider[it].orEmpty().isNotBlank()
+                }
+                if (!selectedByProvider.containsKey(scope)) {
+                    sourceProvider
+                        ?.let(selectedByProvider::get)
+                        ?.takeIf { it.isNotEmpty() }
+                        ?.let { selectedByProvider[scope] = it }
+                }
+                if (!metadataByProvider.containsKey(scope)) {
+                    sourceProvider
+                        ?.let(metadataByProvider::get)
+                        ?.takeIf { it.isNotEmpty() }
+                        ?.let { metadataByProvider[scope] = it }
+                }
+                if (!primaryByProvider.containsKey(scope)) {
+                    val legacyPrimary = sourceProvider
+                        ?.let(primaryByProvider::get)
+                        .orEmpty()
+                        .ifBlank {
+                            legacyGlobalPrimary.takeIf {
+                                normalizeProvider(legacyGlobalProvider) in legacyProviders
+                            }.orEmpty()
+                        }
+                    if (
+                        legacyPrimary.isNotBlank() &&
+                        selectedByProvider[scope].orEmpty().contains(legacyPrimary)
+                    ) {
+                        primaryByProvider[scope] = legacyPrimary
+                    }
+                }
+
+                selectedByProvider[scope]?.let { selected ->
+                    selectedByProvider[scope] = selected
+                        .map(::canonicalizeOpenAiModelReference)
+                        .filter(String::isNotBlank)
+                        .distinct()
+                }
+                metadataByProvider[scope]?.let { metadata ->
+                    metadataByProvider[scope] = metadata.values
+                        .map { entry ->
+                            val canonicalId = canonicalizeOpenAiModelReference(entry.id)
+                            canonicalId to entry.copy(id = canonicalId)
+                        }
+                        .filter { (id, _) -> id.isNotBlank() }
+                        .toMap()
+                }
+                primaryByProvider[scope]?.let { primary ->
+                    primaryByProvider[scope] = canonicalizeOpenAiModelReference(primary)
+                }
+            }
+
+            copyScope(
+                listOf("openai-codex", "codex", "codex-cli"),
+                OpenAiConnectionMode.CODEX_SUBSCRIPTION,
+            )
+            copyScope(listOf("openai"), OpenAiConnectionMode.PLATFORM_API_KEY)
         }
 
         private val MODEL_SELECTION_PROVIDERS = listOf(
@@ -471,6 +694,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                 "openai",
                 "openai-codex",
                 "codex",
+                "codex-cli",
                 "github-copilot",
                 "openai-compatible",
                 "ollama-cloud",
@@ -490,6 +714,15 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             val trimmedModelId = modelId.trim()
             if (trimmedModelId.isBlank()) return ""
             return when (normalizeProvider(provider)) {
+                "openai", "openai-codex", "codex", "codex-cli" -> {
+                    val bareModelId = trimmedModelId
+                        .removePrefix("openai/")
+                        .removePrefix("openai-codex/")
+                        .removePrefix("codex-cli/")
+                        .removePrefix("codex/")
+                        .trim()
+                    "openai/$bareModelId"
+                }
                 "openai-compatible" -> trimmedModelId.removePrefix("openai-compatible/").trim()
                 "ollama", "ollama-cloud" -> trimmedModelId.removePrefix("ollama/").removePrefix("ollama-cloud/").removeSuffix(":latest").trim()
                 else -> trimmedModelId
@@ -638,13 +871,8 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                 return when (normalizedProvider) {
                     "openrouter" -> trimmedModelId.contains("/")
                     "anthropic" -> lowerModelId.startsWith("claude")
-                    "openai" -> {
-                        val looksLikeOpenAiFamily = lowerModelId.startsWith("gpt-") ||
-                            lowerModelId.matches(Regex("""o\d+.*"""))
-                        looksLikeOpenAiFamily && !lowerModelId.contains("codex")
-                    }
-                    "openai-codex" -> {
-                        lowerModelId.contains("codex") || lowerModelId in BARE_CODEX_MODEL_IDS
+                    "openai", "openai-codex", "codex", "codex-cli" -> {
+                        lowerModelId.startsWith("gpt-") || lowerModelId.matches(Regex("""o\d+.*"""))
                     }
                     "github-copilot" -> true
                     "zai" -> lowerModelId.startsWith("glm-")
@@ -658,11 +886,8 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             }
             return when (normalizedProvider) {
                 "openrouter" -> providerPrefix != "openai-compatible" && providerPrefix != "openai-codex"
-                "openai-codex" -> {
-                    providerPrefix == "openai-codex" ||
-                        providerPrefix == "codex" ||
-                        (providerPrefix == "openai" &&
-                            trimmedModelId.substringAfter("openai/").lowercase().contains("codex"))
+                "openai", "openai-codex", "codex", "codex-cli" -> {
+                    providerPrefix in setOf("openai", "openai-codex", "codex", "codex-cli")
                 }
                 "openai-compatible" -> providerPrefix == "openai-compatible" || providerPrefix == "openai"
                 "ollama", "ollama-cloud" -> providerPrefix == "ollama" || providerPrefix == "ollama-cloud"
@@ -709,6 +934,36 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             }
             return root.toString()
         }
+        private fun decodeStringMap(raw: String?): Map<String, String> {
+            if (raw.isNullOrBlank()) return emptyMap()
+            return runCatching {
+                val json = org.json.JSONObject(raw)
+                buildMap {
+                    val keys = json.keys()
+                    while (keys.hasNext()) {
+                        val rawKey = keys.next()
+                        val key = normalizeProvider(rawKey)
+                        val value = json.optString(rawKey).trim()
+                        if (key.isNotBlank() && value.isNotBlank()) {
+                            put(key, value)
+                        }
+                    }
+                }
+            }.getOrDefault(emptyMap())
+        }
+
+        private fun encodeStringMap(map: Map<String, String>): String {
+            val root = org.json.JSONObject()
+            map.forEach { (rawKey, rawValue) ->
+                val key = normalizeProvider(rawKey)
+                val value = rawValue.trim()
+                if (key.isNotBlank() && value.isNotBlank()) {
+                    root.put(key, value)
+                }
+            }
+            return root.toString()
+        }
+
 
         private fun decodeModelMetadataByProvider(
             raw: String?,
@@ -885,12 +1140,10 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
     }
 
     val apiProvider: Flow<String> = context.dataStore.data.map { prefs ->
-        when (prefs[KEY_API_PROVIDER]) {
-            "nvidia" -> "openrouter"
-            null, "" -> "openrouter"
-            else -> prefs[KEY_API_PROVIDER] ?: "openrouter"
-        }
+        canonicalizeApiProvider(prefs[KEY_API_PROVIDER] ?: "openrouter").ifBlank { "openrouter" }
     }
+
+    val openAiConnectionMode: Flow<OpenAiConnectionMode> = context.dataStore.data.map(::storedOpenAiMode)
 
     val apiKey: Flow<String> = combine(
         apiProvider,
@@ -1030,11 +1283,28 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
         activeProfileInput: OpenAiCompatibleProfile? = null,
         includeLegacyGlobalFallback: Boolean = false,
     ): List<String> {
-        val normalizedProvider = normalizeProvider(provider)
+        val normalizedProvider = canonicalizeApiProvider(provider)
+        val openAiMode = if (normalizeProvider(provider) in setOf("openai-codex", "codex")) {
+            OpenAiConnectionMode.CODEX_SUBSCRIPTION
+        } else {
+            storedOpenAiMode(snapshot)
+        }
+        val selectionKey = modelSelectionStorageKey(normalizedProvider, openAiMode)
+        val legacySelectionKey = if (normalizedProvider == "openai") {
+            if (openAiMode == OpenAiConnectionMode.CODEX_SUBSCRIPTION) "openai-codex" else "openai"
+        } else {
+            normalizedProvider
+        }
         val selectedByProvider = selectedByProviderInput
             ?: decodeStringListMap(snapshot[KEY_SELECTED_MODELS_BY_PROVIDER_JSON])
-        val selectedFromProvider = selectedByProvider[normalizedProvider].orEmpty()
-            .map { canonicalizeModelIdForProvider(normalizedProvider, it) }
+        val selectedFromProvider = if (normalizedProvider == "openai") {
+            selectedByProvider[selectionKey].orEmpty()
+        } else {
+            selectedByProvider[selectionKey]
+                .orEmpty()
+                .ifEmpty { selectedByProvider[legacySelectionKey].orEmpty() }
+        }
+            .map { canonicalizeModelIdForProvider(legacySelectionKey, it) }
             .filter { it.isNotBlank() }
             .distinct()
         if (selectedFromProvider.isNotEmpty()) {
@@ -1053,18 +1323,18 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             }
         }
 
-        if (!includeLegacyGlobalFallback) return emptyList()
+        if (normalizedProvider == "openai" || !includeLegacyGlobalFallback) return emptyList()
 
         val globalPrimaryProvider = resolveSelectedModelProvider(
             snapshot = snapshot,
             selectedByProviderInput = selectedByProvider,
         )
         val legacySelectedModelRaw = snapshot[KEY_SELECTED_MODEL].orEmpty().trim()
-        val canonicalLegacyModelId = canonicalizeModelIdForProvider(normalizedProvider, legacySelectedModelRaw)
+        val canonicalLegacyModelId = canonicalizeModelIdForProvider(legacySelectionKey, legacySelectedModelRaw)
         return canonicalLegacyModelId
             .takeIf {
-                globalPrimaryProvider == normalizedProvider &&
-                    isLegacyModelCompatibleWithProvider(normalizedProvider, it)
+                canonicalizeApiProvider(globalPrimaryProvider) == normalizedProvider &&
+                    isLegacyModelCompatibleWithProvider(legacySelectionKey, it)
             }
             ?.let(::listOf)
             .orEmpty()
@@ -1084,7 +1354,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
     }
 
     val selectedModelProvider: Flow<String> = context.dataStore.data.map { prefs ->
-        resolveSelectedModelProvider(prefs)
+        canonicalizeApiProvider(resolveSelectedModelProvider(prefs))
     }
 
     private val globalPrimarySelection: Flow<Pair<String, String>> = combine(
@@ -1113,6 +1383,14 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
     val selectedModelsByProvider: Flow<Map<String, List<String>>> = context.dataStore.data.map { prefs ->
         decodeStringListMap(prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON])
     }
+    private val primaryModelsByProvider: Flow<Map<String, String>> = context.dataStore.data.map { prefs ->
+        decodeStringMap(prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON])
+    }
+
+    private val currentProviderSelectionScope: Flow<Pair<String, OpenAiConnectionMode>> = combine(
+        apiProvider,
+        openAiConnectionMode,
+    ) { provider, mode -> provider to mode }
 
     val selectedModelMetadataByProvider: Flow<Map<String, Map<String, SelectedModelConfigEntry>>> =
         context.dataStore.data.map { prefs ->
@@ -1123,20 +1401,35 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
         }
 
     val currentProviderSelectedModelIds: Flow<List<String>> = combine(
-        apiProvider,
+        currentProviderSelectionScope,
         selectedModelsByProvider,
         selectedModel,
         selectedModelProvider,
         activeOpenAiCompatibleProfile,
-    ) { provider, selectedByProvider, legacySelectedModel, globalPrimaryProvider, activeProfile ->
-        val normalizedProvider = normalizeProvider(provider)
-        val fromMulti = selectedByProvider[normalizedProvider]
-            .orEmpty()
-            .map { canonicalizeModelIdForProvider(normalizedProvider, it) }
+    ) { providerAndMode, selectedByProvider, legacySelectedModel, globalPrimaryProvider, activeProfile ->
+        val normalizedProvider = canonicalizeApiProvider(providerAndMode.first)
+        val mode = providerAndMode.second
+        val selectionKey = modelSelectionStorageKey(normalizedProvider, mode)
+        val legacySelectionKey = if (normalizedProvider == "openai") {
+            if (mode == OpenAiConnectionMode.CODEX_SUBSCRIPTION) "openai-codex" else "openai"
+        } else {
+            normalizedProvider
+        }
+        val fromMulti = if (normalizedProvider == "openai") {
+            selectedByProvider[selectionKey].orEmpty()
+        } else {
+            selectedByProvider[selectionKey]
+                .orEmpty()
+                .ifEmpty { selectedByProvider[legacySelectionKey].orEmpty() }
+        }
+            .map { canonicalizeModelIdForProvider(legacySelectionKey, it) }
             .filter { it.isNotBlank() }
             .distinct()
         if (fromMulti.isNotEmpty()) {
             return@combine fromMulti
+        }
+        if (normalizedProvider == "openai") {
+            return@combine emptyList()
         }
         if (normalizedProvider == "openai-compatible") {
             val profileSelectedIds = activeProfile?.selectedModels
@@ -1148,34 +1441,40 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                 return@combine profileSelectedIds
             }
         }
-        if (globalPrimaryProvider != normalizedProvider) {
+        if (canonicalizeApiProvider(globalPrimaryProvider) != normalizedProvider) {
             return@combine emptyList()
         }
-        val canonicalLegacyModelId = canonicalizeModelIdForProvider(normalizedProvider, legacySelectedModel)
+        val canonicalLegacyModelId = canonicalizeModelIdForProvider(legacySelectionKey, legacySelectedModel)
         canonicalLegacyModelId
-            .takeIf { isLegacyModelCompatibleWithProvider(normalizedProvider, it) }
+            .takeIf { isLegacyModelCompatibleWithProvider(legacySelectionKey, it) }
             ?.let(::listOf)
             .orEmpty()
     }
 
     val currentProviderPrimaryModelId: Flow<String> = combine(
-        apiProvider,
+        currentProviderSelectionScope,
         currentProviderSelectedModelIds,
         globalPrimarySelection,
         openAiCompatibleModelId,
-    ) { provider, selectedModelIds, globalPrimarySelection, compatPrimaryModelId ->
+        primaryModelsByProvider,
+    ) { providerAndMode, selectedModelIds, globalPrimarySelection, compatPrimaryModelId, primaryByProvider ->
         if (selectedModelIds.isEmpty()) return@combine ""
-        val normalizedProvider = normalizeProvider(provider)
+        val normalizedProvider = canonicalizeApiProvider(providerAndMode.first)
+        val selectionKey = modelSelectionStorageKey(normalizedProvider, providerAndMode.second)
         val legacySelectedModel = globalPrimarySelection.first
-        val globalPrimaryProvider = globalPrimarySelection.second
+        val globalPrimaryProvider = canonicalizeApiProvider(globalPrimarySelection.second)
         val normalizedLegacyModelId = canonicalizeModelIdForProvider(normalizedProvider, legacySelectedModel)
+        val scopedPrimary = primaryByProvider[selectionKey]
+            .orEmpty()
+            .takeIf(selectedModelIds::contains)
+            .orEmpty()
         when {
-            // Non-compat providers do not keep a separate provider-local primary anymore.
-            // A radio selection is meaningful only for the single global primary model.
-            normalizedLegacyModelId.isNotBlank() &&
+            scopedPrimary.isNotBlank() -> scopedPrimary
+
+            normalizedProvider != "openai" &&
+                normalizedLegacyModelId.isNotBlank() &&
                 globalPrimaryProvider == normalizedProvider &&
-                selectedModelIds.contains(normalizedLegacyModelId) &&
-                isLegacyModelCompatibleWithProvider(normalizedProvider, normalizedLegacyModelId) ->
+                selectedModelIds.contains(normalizedLegacyModelId) ->
                 normalizedLegacyModelId
 
             normalizedProvider == "openai-compatible" -> {
@@ -1231,20 +1530,37 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
     }
 
     val currentProviderSelectedModelEntries: Flow<List<SelectedModelConfigEntry>> = combine(
-        apiProvider,
+        currentProviderSelectionScope,
         currentProviderSelectedModelIds,
         selectedModelMetadataByProvider,
         currentProviderLegacySelectedModelEntry,
-    ) { provider, selectedModelIds, metadataByProvider, legacySelectedModelEntry ->
-        val normalizedProvider = normalizeProvider(provider)
+    ) { providerAndMode, selectedModelIds, metadataByProvider, legacySelectedModelEntry ->
+        val normalizedProvider = canonicalizeApiProvider(providerAndMode.first)
+        val selectionKey = modelSelectionStorageKey(normalizedProvider, providerAndMode.second)
+        val legacySelectionKey = if (
+            normalizedProvider == "openai" &&
+            providerAndMode.second == OpenAiConnectionMode.CODEX_SUBSCRIPTION
+        ) {
+            "openai-codex"
+        } else {
+            normalizedProvider
+        }
+        val metadataFromProvider = if (normalizedProvider == "openai") {
+            metadataByProvider[selectionKey].orEmpty()
+        } else {
+            metadataByProvider[selectionKey]
+                .orEmpty()
+                .ifEmpty { metadataByProvider[legacySelectionKey].orEmpty() }
+        }
         val metadataById = canonicalizeMetadataByIdForProvider(
-            normalizedProvider,
-            metadataByProvider[normalizedProvider].orEmpty(),
+            legacySelectionKey,
+            metadataFromProvider,
         )
         selectedModelIds.map { modelId ->
             metadataById[modelId]
                 ?: legacySelectedModelEntry?.takeIf {
-                    canonicalizeModelIdForProvider(normalizedProvider, it.id) == modelId
+                    normalizedProvider != "openai" &&
+                        canonicalizeModelIdForProvider(legacySelectionKey, it.id) == modelId
                 }?.copy(id = modelId)
                 ?: defaultModelMetadata(modelId)
         }
@@ -1283,7 +1599,577 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
         context.dataStore.edit { it[KEY_ONBOARDING_COMPLETE] = complete }
     }
 
+    suspend fun getOpenAiMigrationPreferencesSnapshot(): OpenAiMigrationPreferencesSnapshot {
+        val snapshot = context.dataStore.data.first()
+        val selectedByProvider = decodeStringListMap(snapshot[KEY_SELECTED_MODELS_BY_PROVIDER_JSON])
+        val primaryByProvider = decodeStringMap(snapshot[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON])
+        val metadataByProvider = decodeModelMetadataByProvider(snapshot[KEY_MODEL_METADATA_BY_PROVIDER_JSON])
+        val legacyProviderKeys = setOf("openai", "openai-codex", "codex", "codex-cli")
+        val legacyModelPrefixes = listOf("openai-codex/", "codex/", "codex-cli/")
+        fun isLegacyModelReference(value: String): Boolean {
+            val normalized = value.trim().lowercase()
+            return legacyModelPrefixes.any(normalized::startsWith)
+        }
+        val rawProvider = snapshot[KEY_API_PROVIDER]
+        val selectedModelProvider = normalizeProvider(snapshot[KEY_SELECTED_MODEL_PROVIDER].orEmpty())
+        val hasLegacyActiveReference =
+            normalizeProvider(rawProvider.orEmpty()) in setOf("openai-codex", "codex", "codex-cli") ||
+                selectedModelProvider in setOf("openai-codex", "codex", "codex-cli") ||
+                isLegacyModelReference(snapshot[KEY_SELECTED_MODEL].orEmpty()) ||
+                selectedByProvider.any { (provider, models) ->
+                    provider in legacyProviderKeys || models.any(::isLegacyModelReference)
+                } ||
+                primaryByProvider.any { (provider, model) ->
+                    provider in legacyProviderKeys || isLegacyModelReference(model)
+                } ||
+                metadataByProvider.any { (provider, entries) ->
+                    provider in legacyProviderKeys ||
+                        entries.any { (modelId, entry) ->
+                            isLegacyModelReference(modelId) || isLegacyModelReference(entry.id)
+                        }
+                }
+        return OpenAiMigrationPreferencesSnapshot(
+            migrationComplete = snapshot[KEY_OPENAI_CANONICAL_MIGRATION_COMPLETE] == true,
+            canonicalMode = snapshot[KEY_OPENAI_CONNECTION_MODE],
+            activeProvider = rawProvider,
+            preferenceApiKey = snapshot[KEY_API_KEY_OPENAI]
+                ?.trim()
+                ?.takeIf(String::isNotBlank)
+                ?: snapshot[KEY_API_KEY]
+                    ?.trim()
+                    ?.takeIf(String::isNotBlank)
+                    ?.takeIf {
+                        normalizeProvider(rawProvider.orEmpty()) in
+                            setOf("openai", "openai-codex", "codex", "codex-cli")
+                    },
+            hasLegacyActiveReference = hasLegacyActiveReference,
+        )
+    }
+
+    suspend fun canonicalizeOpenAiModelPreferences(): Boolean {
+        var changed = false
+        context.dataStore.edit { prefs ->
+            val before = prefs.asMap().toMap()
+            val legacyGlobalProvider = prefs[KEY_SELECTED_MODEL_PROVIDER].orEmpty()
+            val legacyGlobalPrimary = prefs[KEY_SELECTED_MODEL].orEmpty()
+            val selectedByProvider =
+                decodeStringListMap(prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON]).toMutableMap()
+            val metadataByProvider =
+                decodeModelMetadataByProvider(prefs[KEY_MODEL_METADATA_BY_PROVIDER_JSON]).toMutableMap()
+            val primaryByProvider =
+                decodeStringMap(prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON]).toMutableMap()
+            migrateLegacyOpenAiModelScopes(
+                selectedByProvider = selectedByProvider,
+                metadataByProvider = metadataByProvider,
+                primaryByProvider = primaryByProvider,
+                legacyGlobalPrimary = legacyGlobalPrimary,
+                legacyGlobalProvider = legacyGlobalProvider,
+            )
+            for (legacyProvider in listOf("openai", "openai-codex", "codex", "codex-cli")) {
+                selectedByProvider.remove(legacyProvider)
+                metadataByProvider.remove(legacyProvider)
+                primaryByProvider.remove(legacyProvider)
+            }
+
+            if (
+                normalizeProvider(legacyGlobalProvider) in
+                setOf("openai", "openai-codex", "codex", "codex-cli")
+            ) {
+                prefs[KEY_SELECTED_MODEL] = canonicalizeOpenAiModelReference(legacyGlobalPrimary)
+            }
+            if (selectedByProvider.isEmpty()) {
+                prefs.remove(KEY_SELECTED_MODELS_BY_PROVIDER_JSON)
+            } else {
+                prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON] = encodeStringListMap(selectedByProvider)
+            }
+            if (metadataByProvider.isEmpty()) {
+                prefs.remove(KEY_MODEL_METADATA_BY_PROVIDER_JSON)
+            } else {
+                prefs[KEY_MODEL_METADATA_BY_PROVIDER_JSON] = encodeModelMetadataByProvider(metadataByProvider)
+            }
+            if (primaryByProvider.isEmpty()) {
+                prefs.remove(KEY_PRIMARY_MODEL_BY_PROVIDER_JSON)
+            } else {
+                prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON] = encodeStringMap(primaryByProvider)
+            }
+            changed = prefs.asMap() != before
+        }
+        return changed
+    }
+
+    suspend fun applyCanonicalOpenAiMode(
+        input: OpenAiConnectionModeResolutionInput,
+    ): Boolean {
+        var changed = false
+        context.dataStore.edit { prefs ->
+            val before = prefs.asMap().toMap()
+            val rawProvider = prefs[KEY_API_PROVIDER]
+            val rawSelectedModelProvider = prefs[KEY_SELECTED_MODEL_PROVIDER]
+            val resolutionInput = input.copy(
+                canonicalMode = input.canonicalMode ?: prefs[KEY_OPENAI_CONNECTION_MODE],
+                legacyProvider = input.legacyProvider ?: rawProvider,
+            )
+            prefs[KEY_OPENAI_CONNECTION_MODE] = resolveOpenAiConnectionMode(resolutionInput).storageValue
+            if (
+                normalizeProvider(rawProvider.orEmpty()) in
+                setOf("openai", "openai-codex", "codex", "codex-cli")
+            ) {
+                prefs[KEY_API_PROVIDER] = "openai"
+            }
+            if (
+                normalizeProvider(rawSelectedModelProvider.orEmpty()) in
+                setOf("openai", "openai-codex", "codex", "codex-cli")
+            ) {
+                prefs[KEY_SELECTED_MODEL_PROVIDER] = "openai"
+            }
+            changed = prefs.asMap() != before
+        }
+        return changed
+    }
+
+    suspend fun markOpenAiCanonicalMigrationComplete() {
+        setOpenAiCanonicalMigrationComplete(true)
+    }
+
+    internal suspend fun setOpenAiCanonicalMigrationComplete(complete: Boolean) {
+        context.dataStore.edit { prefs ->
+            if (complete) {
+                prefs[KEY_OPENAI_CANONICAL_MIGRATION_COMPLETE] = true
+            } else {
+                prefs.remove(KEY_OPENAI_CANONICAL_MIGRATION_COMPLETE)
+            }
+        }
+    }
+
+    suspend fun migrateOpenAiPreferences(
+        input: OpenAiConnectionModeResolutionInput,
+    ): Boolean {
+        val modelsChanged = canonicalizeOpenAiModelPreferences()
+        val modeChanged = applyCanonicalOpenAiMode(input)
+        return modelsChanged || modeChanged
+    }
+
+    internal suspend fun stageOpenAiTransitionPreferences(
+        mode: OpenAiConnectionMode,
+        defaultModel: SelectedModelConfigEntry?,
+    ): OpenAiTransitionPreferencesSnapshot {
+        lateinit var transitionSnapshot: OpenAiTransitionPreferencesSnapshot
+        context.dataStore.edit { prefs ->
+            val previousManaged = captureOpenAiTransitionManagedPreferences(prefs)
+            val selectedByProvider =
+                decodeStringListMap(prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON]).toMutableMap()
+            val primaryByProvider =
+                decodeStringMap(prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON]).toMutableMap()
+            val metadataByProvider =
+                decodeModelMetadataByProvider(prefs[KEY_MODEL_METADATA_BY_PROVIDER_JSON]).toMutableMap()
+            val targetScope = mode.selectionScope
+            val previousTargetScope = captureOpenAiTransitionModelScopePreferences(
+                targetScope = targetScope,
+                selectedByProvider = selectedByProvider,
+                primaryByProvider = primaryByProvider,
+                metadataByProvider = metadataByProvider,
+            )
+            val selectionProvider = when (mode) {
+                OpenAiConnectionMode.CODEX_SUBSCRIPTION -> "openai-codex"
+                OpenAiConnectionMode.PLATFORM_API_KEY -> "openai"
+            }
+            val existingIds = selectedByProvider[targetScope]
+                .orEmpty()
+                .map { canonicalizeModelIdForProvider(selectionProvider, it) }
+                .filter(String::isNotBlank)
+                .distinct()
+            val stagedIds = if (existingIds.isNotEmpty()) {
+                existingIds
+            } else {
+                val fallback = checkNotNull(defaultModel) {
+                    "No canonical OpenAI default model is available for ${mode.storageValue}."
+                }
+                listOf(canonicalizeModelIdForProvider(selectionProvider, fallback.id))
+            }
+            val existingPrimary = primaryByProvider[targetScope]
+                ?.let { canonicalizeModelIdForProvider(selectionProvider, it) }
+                .orEmpty()
+                .takeIf(stagedIds::contains)
+                .orEmpty()
+            val stagedPrimary = existingPrimary.ifBlank { stagedIds.first() }
+            val stagedMetadata = canonicalizeMetadataByIdForProvider(
+                selectionProvider,
+                metadataByProvider[targetScope].orEmpty(),
+            ).filterKeys(stagedIds::contains).toMutableMap()
+            if (existingIds.isEmpty()) {
+                val fallback = checkNotNull(defaultModel)
+                stagedMetadata[stagedPrimary] = fallback.copy(id = stagedPrimary)
+            }
+            val primaryMetadata = stagedMetadata[stagedPrimary]
+                ?: resolveDefaultModelMetadata(selectionProvider, stagedPrimary)
+
+            selectedByProvider[targetScope] = stagedIds
+            primaryByProvider[targetScope] = stagedPrimary
+            if (stagedMetadata.isEmpty()) {
+                metadataByProvider.remove(targetScope)
+            } else {
+                metadataByProvider[targetScope] = stagedMetadata.toMap()
+            }
+            writeOpenAiTransitionModelMaps(
+                prefs = prefs,
+                selectedByProvider = selectedByProvider,
+                primaryByProvider = primaryByProvider,
+                metadataByProvider = metadataByProvider,
+            )
+            prefs[KEY_OPENAI_CONNECTION_MODE] = mode.storageValue
+            prefs[KEY_API_PROVIDER] = "openai"
+            prefs[KEY_SELECTED_MODEL] = stagedPrimary
+            prefs[KEY_SELECTED_MODEL_PROVIDER] = "openai"
+            prefs[KEY_SELECTED_MODEL_REASONING] = primaryMetadata.supportsReasoning
+            prefs[KEY_SELECTED_MODEL_IMAGES] = primaryMetadata.supportsImages
+            prefs[KEY_SELECTED_MODEL_CONTEXT] = primaryMetadata.contextLength.toString()
+            prefs[KEY_SELECTED_MODEL_MAX_OUTPUT] = primaryMetadata.maxOutputTokens.toString()
+
+            transitionSnapshot = OpenAiTransitionPreferencesSnapshot(
+                targetScope = targetScope,
+                previousManaged = previousManaged,
+                stagedManaged = captureOpenAiTransitionManagedPreferences(prefs),
+                previousTargetScope = previousTargetScope,
+                stagedTargetScope = captureOpenAiTransitionModelScopePreferences(
+                    targetScope = targetScope,
+                    selectedByProvider = selectedByProvider,
+                    primaryByProvider = primaryByProvider,
+                    metadataByProvider = metadataByProvider,
+                ),
+            )
+        }
+        return transitionSnapshot
+    }
+
+    internal suspend fun rollbackOpenAiTransitionPreferences(
+        snapshot: OpenAiTransitionPreferencesSnapshot,
+    ): OpenAiTransitionPreferencesRollbackResult {
+        lateinit var rollbackResult: OpenAiTransitionPreferencesRollbackResult
+        context.dataStore.edit { prefs ->
+            val currentManaged = captureOpenAiTransitionManagedPreferences(prefs)
+            val apiProviderRestored =
+                currentManaged.apiProvider == snapshot.stagedManaged.apiProvider
+            if (apiProviderRestored) {
+                restoreOpenAiTransitionPreference(
+                    prefs,
+                    KEY_API_PROVIDER,
+                    snapshot.previousManaged.apiProvider,
+                )
+            }
+            val openAiConnectionModeRestored =
+                currentManaged.openAiConnectionMode == snapshot.stagedManaged.openAiConnectionMode
+            if (openAiConnectionModeRestored) {
+                restoreOpenAiTransitionPreference(
+                    prefs,
+                    KEY_OPENAI_CONNECTION_MODE,
+                    snapshot.previousManaged.openAiConnectionMode,
+                )
+            }
+            val globalModelSelectionRestored =
+                currentManaged.globalModelSelectionMatches(snapshot.stagedManaged)
+            if (globalModelSelectionRestored) {
+                restoreOpenAiTransitionGlobalModelSelection(
+                    prefs,
+                    snapshot.previousManaged,
+                )
+            }
+
+            val selectedByProvider =
+                decodeStringListMap(prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON]).toMutableMap()
+            val primaryByProvider =
+                decodeStringMap(prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON]).toMutableMap()
+            val metadataByProvider =
+                decodeModelMetadataByProvider(prefs[KEY_MODEL_METADATA_BY_PROVIDER_JSON]).toMutableMap()
+            val currentTargetScope = captureOpenAiTransitionModelScopePreferences(
+                targetScope = snapshot.targetScope,
+                selectedByProvider = selectedByProvider,
+                primaryByProvider = primaryByProvider,
+                metadataByProvider = metadataByProvider,
+            )
+            val targetModelScopeRestored = currentTargetScope == snapshot.stagedTargetScope
+            if (targetModelScopeRestored) {
+                restoreOpenAiTransitionModelScope(
+                    targetScope = snapshot.targetScope,
+                    previous = snapshot.previousTargetScope,
+                    selectedByProvider = selectedByProvider,
+                    primaryByProvider = primaryByProvider,
+                    metadataByProvider = metadataByProvider,
+                )
+                writeOpenAiTransitionModelMaps(
+                    prefs = prefs,
+                    selectedByProvider = selectedByProvider,
+                    primaryByProvider = primaryByProvider,
+                    metadataByProvider = metadataByProvider,
+                )
+            }
+
+            val restoredManaged = captureOpenAiTransitionManagedPreferences(prefs)
+            check(!apiProviderRestored || restoredManaged.apiProvider == snapshot.previousManaged.apiProvider) {
+                "OpenAI transition API provider rollback read-back failed."
+            }
+            check(
+                !openAiConnectionModeRestored ||
+                    restoredManaged.openAiConnectionMode == snapshot.previousManaged.openAiConnectionMode,
+            ) {
+                "OpenAI transition mode rollback read-back failed."
+            }
+            check(
+                !globalModelSelectionRestored ||
+                    restoredManaged.globalModelSelectionMatches(snapshot.previousManaged),
+            ) {
+                "OpenAI transition global model rollback read-back failed."
+            }
+            if (targetModelScopeRestored) {
+                val restoredTargetScope = captureOpenAiTransitionModelScopePreferences(
+                    targetScope = snapshot.targetScope,
+                    selectedByProvider = selectedByProvider,
+                    primaryByProvider = primaryByProvider,
+                    metadataByProvider = metadataByProvider,
+                )
+                check(restoredTargetScope == snapshot.previousTargetScope) {
+                    "OpenAI transition target model scope rollback read-back failed."
+                }
+            }
+            rollbackResult = OpenAiTransitionPreferencesRollbackResult(
+                apiProviderRestored = apiProviderRestored,
+                openAiConnectionModeRestored = openAiConnectionModeRestored,
+                globalModelSelectionRestored = globalModelSelectionRestored,
+                targetModelScopeRestored = targetModelScopeRestored,
+            )
+        }
+        return rollbackResult
+    }
+
+    private fun captureOpenAiTransitionManagedPreferences(
+        prefs: Preferences,
+    ): OpenAiTransitionManagedPreferences = OpenAiTransitionManagedPreferences(
+        apiProvider = captureOpenAiTransitionPreference(prefs, KEY_API_PROVIDER),
+        openAiConnectionMode = captureOpenAiTransitionPreference(
+            prefs,
+            KEY_OPENAI_CONNECTION_MODE,
+        ),
+        selectedModel = captureOpenAiTransitionPreference(prefs, KEY_SELECTED_MODEL),
+        selectedModelProvider = captureOpenAiTransitionPreference(
+            prefs,
+            KEY_SELECTED_MODEL_PROVIDER,
+        ),
+        selectedModelReasoning = captureOpenAiTransitionPreference(
+            prefs,
+            KEY_SELECTED_MODEL_REASONING,
+        ),
+        selectedModelImages = captureOpenAiTransitionPreference(
+            prefs,
+            KEY_SELECTED_MODEL_IMAGES,
+        ),
+        selectedModelContext = captureOpenAiTransitionPreference(
+            prefs,
+            KEY_SELECTED_MODEL_CONTEXT,
+        ),
+        selectedModelMaxOutput = captureOpenAiTransitionPreference(
+            prefs,
+            KEY_SELECTED_MODEL_MAX_OUTPUT,
+        ),
+    )
+
+    private fun captureOpenAiTransitionModelScopePreferences(
+        targetScope: String,
+        selectedByProvider: Map<String, List<String>>,
+        primaryByProvider: Map<String, String>,
+        metadataByProvider: Map<String, Map<String, SelectedModelConfigEntry>>,
+    ): OpenAiTransitionModelScopePreferences = OpenAiTransitionModelScopePreferences(
+        selectedModelIds = OpenAiTransitionPreferenceValue(
+            present = selectedByProvider.containsKey(targetScope),
+            value = selectedByProvider[targetScope],
+        ),
+        primaryModelId = OpenAiTransitionPreferenceValue(
+            present = primaryByProvider.containsKey(targetScope),
+            value = primaryByProvider[targetScope],
+        ),
+        metadataById = OpenAiTransitionPreferenceValue(
+            present = metadataByProvider.containsKey(targetScope),
+            value = metadataByProvider[targetScope],
+        ),
+    )
+
+    private fun OpenAiTransitionManagedPreferences.globalModelSelectionMatches(
+        other: OpenAiTransitionManagedPreferences,
+    ): Boolean =
+        selectedModel == other.selectedModel &&
+            selectedModelProvider == other.selectedModelProvider &&
+            selectedModelReasoning == other.selectedModelReasoning &&
+            selectedModelImages == other.selectedModelImages &&
+            selectedModelContext == other.selectedModelContext &&
+            selectedModelMaxOutput == other.selectedModelMaxOutput
+
+    private fun restoreOpenAiTransitionGlobalModelSelection(
+        prefs: MutablePreferences,
+        previous: OpenAiTransitionManagedPreferences,
+    ) {
+        restoreOpenAiTransitionPreference(prefs, KEY_SELECTED_MODEL, previous.selectedModel)
+        restoreOpenAiTransitionPreference(
+            prefs,
+            KEY_SELECTED_MODEL_PROVIDER,
+            previous.selectedModelProvider,
+        )
+        restoreOpenAiTransitionPreference(
+            prefs,
+            KEY_SELECTED_MODEL_REASONING,
+            previous.selectedModelReasoning,
+        )
+        restoreOpenAiTransitionPreference(
+            prefs,
+            KEY_SELECTED_MODEL_IMAGES,
+            previous.selectedModelImages,
+        )
+        restoreOpenAiTransitionPreference(
+            prefs,
+            KEY_SELECTED_MODEL_CONTEXT,
+            previous.selectedModelContext,
+        )
+        restoreOpenAiTransitionPreference(
+            prefs,
+            KEY_SELECTED_MODEL_MAX_OUTPUT,
+            previous.selectedModelMaxOutput,
+        )
+    }
+
+    private fun restoreOpenAiTransitionModelScope(
+        targetScope: String,
+        previous: OpenAiTransitionModelScopePreferences,
+        selectedByProvider: MutableMap<String, List<String>>,
+        primaryByProvider: MutableMap<String, String>,
+        metadataByProvider: MutableMap<String, Map<String, SelectedModelConfigEntry>>,
+    ) {
+        if (previous.selectedModelIds.present) {
+            selectedByProvider[targetScope] = checkNotNull(previous.selectedModelIds.value)
+        } else {
+            selectedByProvider.remove(targetScope)
+        }
+        if (previous.primaryModelId.present) {
+            primaryByProvider[targetScope] = checkNotNull(previous.primaryModelId.value)
+        } else {
+            primaryByProvider.remove(targetScope)
+        }
+        if (previous.metadataById.present) {
+            metadataByProvider[targetScope] = checkNotNull(previous.metadataById.value)
+        } else {
+            metadataByProvider.remove(targetScope)
+        }
+    }
+
+    private fun writeOpenAiTransitionModelMaps(
+        prefs: MutablePreferences,
+        selectedByProvider: Map<String, List<String>>,
+        primaryByProvider: Map<String, String>,
+        metadataByProvider: Map<String, Map<String, SelectedModelConfigEntry>>,
+    ) {
+        if (selectedByProvider.isEmpty()) {
+            prefs.remove(KEY_SELECTED_MODELS_BY_PROVIDER_JSON)
+        } else {
+            prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON] = encodeStringListMap(selectedByProvider)
+        }
+        if (primaryByProvider.isEmpty()) {
+            prefs.remove(KEY_PRIMARY_MODEL_BY_PROVIDER_JSON)
+        } else {
+            prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON] = encodeStringMap(primaryByProvider)
+        }
+        if (metadataByProvider.isEmpty()) {
+            prefs.remove(KEY_MODEL_METADATA_BY_PROVIDER_JSON)
+        } else {
+            prefs[KEY_MODEL_METADATA_BY_PROVIDER_JSON] =
+                encodeModelMetadataByProvider(metadataByProvider)
+        }
+    }
+
+    private fun <T> captureOpenAiTransitionPreference(
+        prefs: Preferences,
+        key: Preferences.Key<T>,
+    ): OpenAiTransitionPreferenceValue<T> = OpenAiTransitionPreferenceValue(
+        present = prefs.contains(key),
+        value = prefs[key],
+    )
+
+    private fun <T> restoreOpenAiTransitionPreference(
+        prefs: MutablePreferences,
+        key: Preferences.Key<T>,
+        previous: OpenAiTransitionPreferenceValue<T>,
+    ) {
+        if (previous.present) {
+            prefs[key] = checkNotNull(previous.value)
+        } else {
+            prefs.remove(key)
+        }
+    }
+
+    suspend fun setOpenAiConnectionMode(mode: OpenAiConnectionMode) {
+        context.dataStore.edit { prefs ->
+            val selectedByProvider =
+                decodeStringListMap(prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON]).toMutableMap()
+            val metadataByProvider =
+                decodeModelMetadataByProvider(prefs[KEY_MODEL_METADATA_BY_PROVIDER_JSON]).toMutableMap()
+            val primaryByProvider =
+                decodeStringMap(prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON]).toMutableMap()
+            migrateLegacyOpenAiModelScopes(
+                selectedByProvider = selectedByProvider,
+                metadataByProvider = metadataByProvider,
+                primaryByProvider = primaryByProvider,
+                legacyGlobalPrimary = prefs[KEY_SELECTED_MODEL].orEmpty(),
+                legacyGlobalProvider = prefs[KEY_SELECTED_MODEL_PROVIDER].orEmpty(),
+            )
+            selectedByProvider.remove("openai-codex")
+            selectedByProvider.remove("openai")
+            metadataByProvider.remove("openai-codex")
+            metadataByProvider.remove("openai")
+            primaryByProvider.remove("openai-codex")
+            primaryByProvider.remove("openai")
+
+            prefs[KEY_OPENAI_CONNECTION_MODE] = mode.storageValue
+            prefs[KEY_API_PROVIDER] = "openai"
+            val scope = mode.selectionScope
+            val selectedIds = selectedByProvider[scope].orEmpty()
+            val primary = primaryByProvider[scope]
+                .orEmpty()
+                .takeIf(selectedIds::contains)
+                .orEmpty()
+                .ifBlank { selectedIds.firstOrNull().orEmpty() }
+            if (primary.isNotBlank()) {
+                primaryByProvider[scope] = primary
+                val metadata = metadataByProvider[scope]?.get(primary)
+                    ?: resolveDefaultModelMetadata(
+                        if (mode == OpenAiConnectionMode.CODEX_SUBSCRIPTION) "openai-codex" else "openai",
+                        primary,
+                    )
+                prefs[KEY_SELECTED_MODEL] = primary
+                prefs[KEY_SELECTED_MODEL_PROVIDER] = "openai"
+                prefs[KEY_SELECTED_MODEL_REASONING] = metadata.supportsReasoning
+                prefs[KEY_SELECTED_MODEL_IMAGES] = metadata.supportsImages
+                prefs[KEY_SELECTED_MODEL_CONTEXT] = metadata.contextLength.toString()
+                prefs[KEY_SELECTED_MODEL_MAX_OUTPUT] = metadata.maxOutputTokens.toString()
+            }
+            if (selectedByProvider.isEmpty()) {
+                prefs.remove(KEY_SELECTED_MODELS_BY_PROVIDER_JSON)
+            } else {
+                prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON] = encodeStringListMap(selectedByProvider)
+            }
+            if (metadataByProvider.isEmpty()) {
+                prefs.remove(KEY_MODEL_METADATA_BY_PROVIDER_JSON)
+            } else {
+                prefs[KEY_MODEL_METADATA_BY_PROVIDER_JSON] = encodeModelMetadataByProvider(metadataByProvider)
+            }
+            if (primaryByProvider.isEmpty()) {
+                prefs.remove(KEY_PRIMARY_MODEL_BY_PROVIDER_JSON)
+            } else {
+                prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON] = encodeStringMap(primaryByProvider)
+            }
+        }
+    }
+
     suspend fun setApiProvider(provider: String) {
+        val requestedOpenAiMode = legacyOpenAiModeForProvider(provider)
+        if (requestedOpenAiMode != null) {
+            setOpenAiConnectionMode(requestedOpenAiMode)
+            return
+        }
         val normalizedProvider = if (provider == "nvidia") "openrouter" else provider
         context.dataStore.edit { prefs ->
             val selectedModelProvider = normalizeProvider(prefs[KEY_SELECTED_MODEL_PROVIDER].orEmpty())
@@ -1401,7 +2287,6 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             } else {
                 prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON] = encodeStringListMap(selectedByProvider)
             }
-            prefs.remove(KEY_PRIMARY_MODEL_BY_PROVIDER_JSON)
             if (metadataByProvider.isEmpty()) {
                 prefs.remove(KEY_MODEL_METADATA_BY_PROVIDER_JSON)
             } else {
@@ -1559,7 +2444,8 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             )
         }
         val shouldWarn = when (launchConfig.apiProvider) {
-            "openai-codex" -> false
+            "openai" -> launchConfig.openAiConnectionMode != OpenAiConnectionMode.CODEX_SUBSCRIPTION &&
+                launchConfig.apiKey.isBlank()
             "openai-compatible" -> {
                 launchConfig.apiKey.isBlank() &&
                     !isKnownKeylessOpenAiCompatibleBaseUrl(launchConfig.openAiCompatibleBaseUrl)
@@ -1665,7 +2551,16 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
 
     suspend fun setSelectedModel(model: OpenRouterModel) {
         val provider = apiProvider.first()
-        val normalizedModelId = canonicalizeModelIdForProvider(provider, model.id)
+        val mode = openAiConnectionMode.first()
+        val modelProvider = if (
+            provider == "openai" &&
+            mode == OpenAiConnectionMode.CODEX_SUBSCRIPTION
+        ) {
+            "openai-codex"
+        } else {
+            provider
+        }
+        val normalizedModelId = canonicalizeModelIdForProvider(modelProvider, model.id)
         context.dataStore.edit {
             it[KEY_SELECTED_MODEL] = normalizedModelId
             it[KEY_SELECTED_MODEL_PROVIDER] = normalizeProvider(provider)
@@ -1679,7 +2574,16 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
 
     suspend fun setSelectedModelId(modelId: String) = withContext(Dispatchers.IO) {
         val provider = apiProvider.first()
-        val normalizedModelId = canonicalizeModelIdForProvider(provider, modelId)
+        val mode = openAiConnectionMode.first()
+        val modelProvider = if (
+            provider == "openai" &&
+            mode == OpenAiConnectionMode.CODEX_SUBSCRIPTION
+        ) {
+            "openai-codex"
+        } else {
+            provider
+        }
+        val normalizedModelId = canonicalizeModelIdForProvider(modelProvider, modelId)
         context.dataStore.edit {
             it[KEY_SELECTED_MODEL] = normalizedModelId
             if (normalizedModelId.isBlank()) {
@@ -1692,7 +2596,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             clearSelectedModels(provider)
             return@withContext
         }
-        val fallbackMetadata = resolveDefaultModelMetadata(provider, normalizedModelId)
+        val fallbackMetadata = resolveDefaultModelMetadata(modelProvider, normalizedModelId)
         setSelectedModelIds(
             provider = provider,
             modelIds = listOf(normalizedModelId),
@@ -1783,17 +2687,34 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
         metadataById: Map<String, SelectedModelConfigEntry> = emptyMap(),
         activateProvider: Boolean,
     ) {
-        val normalizedProvider = normalizeProvider(provider)
+        val modelProvider = normalizeProvider(provider)
+        val normalizedProvider = canonicalizeApiProvider(provider)
         val normalizedIds = modelIds
-            .map { canonicalizeModelIdForProvider(normalizedProvider, it) }
+            .map { canonicalizeModelIdForProvider(modelProvider, it) }
             .filter { it.isNotBlank() }
             .distinct()
         context.dataStore.edit { prefs ->
+            val openAiMode = if (modelProvider in setOf("openai-codex", "codex")) {
+                OpenAiConnectionMode.CODEX_SUBSCRIPTION
+            } else {
+                storedOpenAiMode(prefs)
+            }
+            val selectionKey = modelSelectionStorageKey(normalizedProvider, openAiMode)
             val selectedByProvider = decodeStringListMap(prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON]).toMutableMap()
             val metadataByProvider = decodeModelMetadataByProvider(prefs[KEY_MODEL_METADATA_BY_PROVIDER_JSON]).toMutableMap()
-            val globalPrimaryProvider = resolveSelectedModelProvider(
-                snapshot = prefs,
-                selectedByProviderInput = selectedByProvider,
+            val primaryByProvider = decodeStringMap(prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON]).toMutableMap()
+            migrateLegacyOpenAiModelScopes(
+                selectedByProvider = selectedByProvider,
+                metadataByProvider = metadataByProvider,
+                primaryByProvider = primaryByProvider,
+                legacyGlobalPrimary = prefs[KEY_SELECTED_MODEL].orEmpty(),
+                legacyGlobalProvider = prefs[KEY_SELECTED_MODEL_PROVIDER].orEmpty(),
+            )
+            val globalPrimaryProvider = canonicalizeApiProvider(
+                resolveSelectedModelProvider(
+                    snapshot = prefs,
+                    selectedByProviderInput = selectedByProvider,
+                ),
             )
 
             fun syncOpenAiCompatibleProfileSelection(
@@ -1831,8 +2752,9 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             }
 
             if (normalizedIds.isEmpty()) {
-                selectedByProvider.remove(normalizedProvider)
-                metadataByProvider.remove(normalizedProvider)
+                selectedByProvider.remove(selectionKey)
+                metadataByProvider.remove(selectionKey)
+                primaryByProvider.remove(selectionKey)
                 syncOpenAiCompatibleProfileSelection(emptyList(), null)
                 if (normalizedProvider == "openai-compatible") {
                     prefs.remove(KEY_OPENAI_COMPATIBLE_MODEL_ID)
@@ -1846,9 +2768,9 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                     prefs.remove(KEY_SELECTED_MODEL_MAX_OUTPUT)
                 }
             } else {
-                selectedByProvider[normalizedProvider] = normalizedIds
+                selectedByProvider[selectionKey] = normalizedIds
                 val hasExplicitPrimaryDirective = primary != null
-                val requestedPrimary = canonicalizeModelIdForProvider(normalizedProvider, primary.orEmpty())
+                val requestedPrimary = canonicalizeModelIdForProvider(modelProvider, primary.orEmpty())
                 val explicitPrimary = requestedPrimary
                     .takeIf { it.isNotBlank() && normalizedIds.contains(it) }
                     .orEmpty()
@@ -1873,11 +2795,11 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                 syncOpenAiCompatibleProfileSelection(normalizedIds, effectiveProfilePrimary.ifBlank { null })
 
                 val providerMetadata = canonicalizeMetadataByIdForProvider(
-                    normalizedProvider,
-                    metadataByProvider[normalizedProvider].orEmpty(),
+                    modelProvider,
+                    metadataByProvider[selectionKey].orEmpty(),
                 ).toMutableMap()
                 metadataById.forEach { (modelId, metadata) ->
-                    val normalizedModelId = canonicalizeModelIdForProvider(normalizedProvider, modelId)
+                    val normalizedModelId = canonicalizeModelIdForProvider(modelProvider, modelId)
                     if (normalizedModelId.isBlank()) return@forEach
                     providerMetadata[normalizedModelId] = metadata.copy(id = normalizedModelId)
                 }
@@ -1885,14 +2807,15 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                     .filterNot { normalizedIds.contains(it) }
                     .forEach(providerMetadata::remove)
                 if (providerMetadata.isNotEmpty()) {
-                    metadataByProvider[normalizedProvider] = providerMetadata
+                    metadataByProvider[selectionKey] = providerMetadata
                 } else {
-                    metadataByProvider.remove(normalizedProvider)
+                    metadataByProvider.remove(selectionKey)
                 }
 
                 if (explicitPrimary.isNotBlank()) {
+                    primaryByProvider[selectionKey] = explicitPrimary
                     val metadataForLegacy = providerMetadata[explicitPrimary]
-                        ?: resolveDefaultModelMetadata(normalizedProvider, explicitPrimary)
+                        ?: resolveDefaultModelMetadata(modelProvider, explicitPrimary)
                     if (activateProvider || globalPrimaryProvider == normalizedProvider) {
                         prefs[KEY_SELECTED_MODEL] = explicitPrimary
                         prefs[KEY_SELECTED_MODEL_PROVIDER] = normalizedProvider
@@ -1903,6 +2826,9 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                     }
                     if (activateProvider) {
                         prefs[KEY_API_PROVIDER] = normalizedProvider
+                        if (normalizedProvider == "openai") {
+                            prefs[KEY_OPENAI_CONNECTION_MODE] = openAiMode.storageValue
+                        }
                     }
                     if (normalizedProvider == "openai-compatible") {
                         prefs[KEY_OPENAI_COMPATIBLE_MODEL_ID] = explicitPrimary
@@ -1912,6 +2838,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                         prefs[KEY_OLLAMA_CLOUD_MODEL_ID] = explicitPrimary
                     }
                 } else if (hasExplicitPrimaryDirective) {
+                    primaryByProvider.remove(selectionKey)
                     if (globalPrimaryProvider == normalizedProvider) {
                         prefs[KEY_SELECTED_MODEL] = ""
                         if (normalizedIds.isEmpty()) {
@@ -1939,7 +2866,11 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             } else {
                 prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON] = encodeStringListMap(selectedByProvider)
             }
-            prefs.remove(KEY_PRIMARY_MODEL_BY_PROVIDER_JSON)
+            if (primaryByProvider.isEmpty()) {
+                prefs.remove(KEY_PRIMARY_MODEL_BY_PROVIDER_JSON)
+            } else {
+                prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON] = encodeStringMap(primaryByProvider)
+            }
             if (metadataByProvider.isEmpty()) {
                 prefs.remove(KEY_MODEL_METADATA_BY_PROVIDER_JSON)
             } else {
@@ -1953,18 +2884,29 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
     }
 
     suspend fun setGlobalPrimaryModel(provider: String, modelId: String) {
-        val normalizedProvider = normalizeProvider(provider)
-        val normalizedModelId = canonicalizeModelIdForProvider(normalizedProvider, modelId)
-        if (normalizedProvider.isBlank() || normalizedModelId.isBlank()) return
+        val normalizedProvider = canonicalizeApiProvider(provider)
+        if (normalizedProvider.isBlank() || modelId.isBlank()) return
 
         context.dataStore.edit { prefs ->
+            val openAiMode = storedOpenAiMode(prefs)
+            val modelProvider = if (
+                normalizedProvider == "openai" &&
+                openAiMode == OpenAiConnectionMode.CODEX_SUBSCRIPTION
+            ) {
+                "openai-codex"
+            } else {
+                normalizedProvider
+            }
+            val selectionKey = modelSelectionStorageKey(normalizedProvider, openAiMode)
+            val normalizedModelId = canonicalizeModelIdForProvider(modelProvider, modelId)
+            if (normalizedModelId.isBlank()) return@edit
             val selectedByProvider = decodeStringListMap(prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON])
             val profiles = decodeOpenAiCompatibleProfiles(prefs[KEY_OPENAI_COMPATIBLE_PROFILES_JSON]).toMutableList()
             val activeProfileId = prefs[KEY_ACTIVE_OPENAI_COMPATIBLE_PROFILE_ID].orEmpty().trim()
             val activeProfile = profiles.firstOrNull { it.id == activeProfileId } ?: profiles.firstOrNull()
             val selectedIds = resolveStoredSelectedIdsForProvider(
                 snapshot = prefs,
-                provider = normalizedProvider,
+                provider = modelProvider,
                 selectedByProviderInput = selectedByProvider,
                 activeProfileInput = activeProfile,
                 includeLegacyGlobalFallback = true,
@@ -1973,9 +2915,17 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
 
             val metadataByProvider = decodeModelMetadataByProvider(prefs[KEY_MODEL_METADATA_BY_PROVIDER_JSON])
             val metadata = canonicalizeMetadataByIdForProvider(
-                normalizedProvider,
-                metadataByProvider[normalizedProvider].orEmpty(),
-            )[normalizedModelId] ?: resolveDefaultModelMetadata(normalizedProvider, normalizedModelId)
+                modelProvider,
+                metadataByProvider[selectionKey].orEmpty()
+                    .ifEmpty { metadataByProvider[modelProvider].orEmpty() },
+            )[normalizedModelId] ?: resolveDefaultModelMetadata(modelProvider, normalizedModelId)
+
+            if (normalizedProvider == "openai") {
+                val primaryByProvider =
+                    decodeStringMap(prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON]).toMutableMap()
+                primaryByProvider[selectionKey] = normalizedModelId
+                prefs[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON] = encodeStringMap(primaryByProvider)
+            }
 
             prefs[KEY_SELECTED_MODEL] = normalizedModelId
             prefs[KEY_SELECTED_MODEL_PROVIDER] = normalizedProvider
@@ -2026,8 +2976,19 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
     suspend fun ensureCurrentProviderModelSelection(): Boolean {
         var changed = false
         context.dataStore.edit { prefs ->
-            val provider = normalizeProvider(prefs[KEY_API_PROVIDER] ?: "openrouter")
-            val originalSelectedModelProvider = normalizeProvider(prefs[KEY_SELECTED_MODEL_PROVIDER].orEmpty())
+            val provider = canonicalizeApiProvider(prefs[KEY_API_PROVIDER] ?: "openrouter")
+            val originalSelectedModelProvider =
+                canonicalizeApiProvider(prefs[KEY_SELECTED_MODEL_PROVIDER].orEmpty())
+            val openAiMode = storedOpenAiMode(prefs)
+            val selectionKey = modelSelectionStorageKey(provider, openAiMode)
+            val modelProvider = if (
+                provider == "openai" &&
+                openAiMode == OpenAiConnectionMode.CODEX_SUBSCRIPTION
+            ) {
+                "openai-codex"
+            } else {
+                provider
+            }
             val selectedByProviderOriginal = decodeStringListMap(prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON])
             val metadataByProviderOriginal = decodeModelMetadataByProvider(prefs[KEY_MODEL_METADATA_BY_PROVIDER_JSON])
             val activeProfile = resolveActiveOpenAiCompatibleProfile(prefs)
@@ -2042,7 +3003,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                     selectedByProviderInput = selectedByProvider,
                 )
                 if (stableSelectedModelProvider.isNotBlank()) {
-                    prefs[KEY_SELECTED_MODEL_PROVIDER] = stableSelectedModelProvider
+                    prefs[KEY_SELECTED_MODEL_PROVIDER] = canonicalizeApiProvider(stableSelectedModelProvider)
                     legacyProviderBackfilled = true
                 }
             }
@@ -2055,19 +3016,19 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             )
 
             if (effectiveSelectedIds.isEmpty()) {
-                selectedByProvider.remove(provider)
-                metadataByProvider.remove(provider)
+                selectedByProvider.remove(selectionKey)
+                metadataByProvider.remove(selectionKey)
             } else {
-                selectedByProvider[provider] = effectiveSelectedIds
+                selectedByProvider[selectionKey] = effectiveSelectedIds
 
                 val sanitizedMetadata = canonicalizeMetadataByIdForProvider(
-                    provider,
-                    metadataByProvider[provider].orEmpty(),
+                    modelProvider,
+                    metadataByProvider[selectionKey].orEmpty(),
                 ).filterKeys(effectiveSelectedIds::contains)
                 if (sanitizedMetadata.isNotEmpty()) {
-                    metadataByProvider[provider] = sanitizedMetadata
+                    metadataByProvider[selectionKey] = sanitizedMetadata
                 } else {
-                    metadataByProvider.remove(provider)
+                    metadataByProvider.remove(selectionKey)
                 }
             }
 
@@ -2084,7 +3045,6 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             } else {
                 prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON] = encodeStringListMap(selectedByProvider)
             }
-            prefs.remove(KEY_PRIMARY_MODEL_BY_PROVIDER_JSON)
             if (metadataByProvider.isEmpty()) {
                 prefs.remove(KEY_MODEL_METADATA_BY_PROVIDER_JSON)
             } else {
@@ -2098,7 +3058,8 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
     suspend fun getGatewayLaunchConfigSnapshot(): GatewayLaunchConfigSnapshot {
         backfillSelectedModelProviderIfMissing()
         val snapshot = context.dataStore.data.first()
-        val configuredProvider = normalizeProvider(snapshot[KEY_API_PROVIDER] ?: "openrouter")
+        val configuredProvider = canonicalizeApiProvider(snapshot[KEY_API_PROVIDER] ?: "openrouter")
+        val openAiMode = storedOpenAiMode(snapshot)
 
         val profiles = decodeOpenAiCompatibleProfiles(snapshot[KEY_OPENAI_COMPATIBLE_PROFILES_JSON])
         val activeProfileId = snapshot[KEY_ACTIVE_OPENAI_COMPATIBLE_PROFILE_ID].orEmpty().trim()
@@ -2106,6 +3067,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
 
         val selectedByProvider = decodeStringListMap(snapshot[KEY_SELECTED_MODELS_BY_PROVIDER_JSON])
         val metadataByProvider = decodeModelMetadataByProvider(snapshot[KEY_MODEL_METADATA_BY_PROVIDER_JSON])
+        val primaryByProvider = decodeStringMap(snapshot[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON])
         val globalPrimaryProvider = resolveSelectedModelProvider(
             snapshot = snapshot,
             selectedByProviderInput = selectedByProvider,
@@ -2124,7 +3086,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
 
         var provider = configuredProvider
         var selectedModelIds = resolveSelectedModelIds(provider)
-        val normalizedGlobalPrimaryProvider = normalizeProvider(globalPrimaryProvider)
+        val normalizedGlobalPrimaryProvider = canonicalizeApiProvider(globalPrimaryProvider)
         if (normalizedGlobalPrimaryProvider.isNotBlank()) {
             val globalSelectedModelIds = resolveSelectedModelIds(normalizedGlobalPrimaryProvider)
             if (globalSelectedModelIds.isNotEmpty()) {
@@ -2136,12 +3098,13 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
         }
         if (selectedModelIds.isEmpty()) {
             val fallbackProviders = buildList {
-                val explicitSelectedModelProvider = normalizeProvider(
+                val explicitSelectedModelProvider = canonicalizeApiProvider(
                     snapshot[KEY_SELECTED_MODEL_PROVIDER].orEmpty(),
                 )
                 if (explicitSelectedModelProvider.isNotBlank()) add(explicitSelectedModelProvider)
                 selectedByProvider.keys
-                    .map(::normalizeProvider)
+                    .filterNot { it.contains("|") }
+                    .map(::canonicalizeApiProvider)
                     .filter { it.isNotBlank() && it !in this }
                     .forEach(::add)
                 if (activeProfile?.selectedModels.orEmpty().isNotEmpty() && "openai-compatible" !in this) {
@@ -2157,11 +3120,16 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             }
         }
 
+        provider = canonicalizeApiProvider(provider)
         val legacyApiKey = snapshot[KEY_API_KEY].orEmpty()
         val apiKey = when (provider) {
             "openrouter" -> snapshot[KEY_API_KEY_OPENROUTER] ?: legacyApiKey
             "anthropic" -> snapshot[KEY_API_KEY_ANTHROPIC].orEmpty()
-            "openai", "openai-codex" -> snapshot[KEY_API_KEY_OPENAI].orEmpty()
+            "openai" -> if (openAiMode == OpenAiConnectionMode.CODEX_SUBSCRIPTION) {
+                ""
+            } else {
+                snapshot[KEY_API_KEY_OPENAI].orEmpty()
+            }
             "github-copilot" -> if (hasGitHubCopilotAuthProfile(snapshot)) "__github_copilot_auth__" else ""
             "zai" -> snapshot[KEY_API_KEY_ZAI].orEmpty()
             "kimi-coding" -> snapshot[KEY_API_KEY_KIMI_CODING].orEmpty()
@@ -2178,17 +3146,31 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             ?: (snapshot[KEY_OPENAI_COMPATIBLE_BASE_URL] ?: "https://api.openai.com/v1")
         val ollamaBaseUrl = snapshot[KEY_OLLAMA_BASE_URL] ?: "http://127.0.0.1:11434"
 
+        val modelProvider = if (
+            provider == "openai" &&
+            openAiMode == OpenAiConnectionMode.CODEX_SUBSCRIPTION
+        ) {
+            "openai-codex"
+        } else {
+            provider
+        }
+        val selectionKey = modelSelectionStorageKey(provider, openAiMode)
         val legacySelectedModel = canonicalizeModelIdForProvider(
-            provider,
+            modelProvider,
             legacySelectedModelRaw,
         )
 
         val globalPrimary = legacySelectedModel
             .takeIf {
-                it.isNotBlank() &&
-                    globalPrimaryProvider == provider &&
+                provider != "openai" &&
+                    it.isNotBlank() &&
+                    canonicalizeApiProvider(globalPrimaryProvider) == provider &&
                     selectedModelIds.contains(it)
             }
+            .orEmpty()
+        val scopedPrimary = primaryByProvider[selectionKey]
+            .orEmpty()
+            .takeIf { it.isNotBlank() && selectedModelIds.contains(it) }
             .orEmpty()
         val profilePrimary = if (provider == "openai-compatible") {
             activeProfile?.primaryModel
@@ -2222,7 +3204,9 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                 .orEmpty()
             else -> ""
         }
-        val effectivePrimary = globalPrimary.ifBlank { profilePrimary.ifBlank { ollamaPrimary } }
+        val effectivePrimary = scopedPrimary.ifBlank {
+            globalPrimary.ifBlank { profilePrimary.ifBlank { ollamaPrimary } }
+        }
 
         val legacyEntry = legacySelectedModel
             .takeIf { it.isNotBlank() }
@@ -2236,14 +3220,21 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                 )
             }
 
+        val metadataFromProvider = if (provider == "openai") {
+            metadataByProvider[selectionKey].orEmpty()
+        } else {
+            metadataByProvider[selectionKey]
+                .orEmpty()
+                .ifEmpty { metadataByProvider[modelProvider].orEmpty() }
+        }
         val providerMetadataById = canonicalizeMetadataByIdForProvider(
-            provider,
-            metadataByProvider[provider].orEmpty(),
+            modelProvider,
+            metadataFromProvider,
         )
         val selectedEntries = selectedModelIds.map { modelId ->
             providerMetadataById[modelId]
-                ?: legacyEntry?.takeIf { it.id == modelId }
-                ?: resolveDefaultModelMetadata(provider, modelId)
+                ?: legacyEntry?.takeIf { provider != "openai" && it.id == modelId }
+                ?: resolveDefaultModelMetadata(modelProvider, modelId)
         }
 
         val selectedModelForRuntime = when {
@@ -2263,6 +3254,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
 
         return GatewayLaunchConfigSnapshot(
             apiProvider = provider,
+            openAiConnectionMode = openAiMode,
             apiKey = apiKey,
             selectedModel = selectedModelForRuntime,
             selectedModelEntries = selectedEntries,
@@ -2298,14 +3290,28 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
     }
 
     suspend fun getEffectivePrimary(provider: String): String? {
-        val normalizedProvider = normalizeProvider(provider)
         val snapshot = context.dataStore.data.first()
+        val normalizedProvider = canonicalizeApiProvider(provider)
+        val openAiMode = if (normalizeProvider(provider) in setOf("openai-codex", "codex")) {
+            OpenAiConnectionMode.CODEX_SUBSCRIPTION
+        } else {
+            storedOpenAiMode(snapshot)
+        }
+        val modelProvider = if (
+            normalizedProvider == "openai" &&
+            openAiMode == OpenAiConnectionMode.CODEX_SUBSCRIPTION
+        ) {
+            "openai-codex"
+        } else {
+            normalizedProvider
+        }
+        val selectionKey = modelSelectionStorageKey(normalizedProvider, openAiMode)
         val selectedByProvider = decodeStringListMap(snapshot[KEY_SELECTED_MODELS_BY_PROVIDER_JSON])
-        val selectedIds = selectedByProvider[normalizedProvider]
-            .orEmpty()
-            .map { canonicalizeModelIdForProvider(normalizedProvider, it) }
-            .filter { it.isNotBlank() }
-            .distinct()
+        val selectedIds = resolveStoredSelectedIdsForProvider(
+            snapshot = snapshot,
+            provider = modelProvider,
+            selectedByProviderInput = selectedByProvider,
+        )
         if (selectedIds.isEmpty()) {
             if (normalizedProvider == "openai-compatible") {
                 val profiles = decodeOpenAiCompatibleProfiles(snapshot[KEY_OPENAI_COMPATIBLE_PROFILES_JSON])
@@ -2327,16 +3333,17 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
                     return profileSelectedIds.first()
                 }
             }
+            if (normalizedProvider == "openai") return null
             val globalPrimaryProvider = resolveSelectedModelProvider(
                 snapshot = snapshot,
                 selectedByProviderInput = selectedByProvider,
             )
             return if (
-                normalizeProvider(snapshot[KEY_API_PROVIDER] ?: "openrouter") == normalizedProvider &&
-                globalPrimaryProvider == normalizedProvider
+                canonicalizeApiProvider(snapshot[KEY_API_PROVIDER] ?: "openrouter") == normalizedProvider &&
+                canonicalizeApiProvider(globalPrimaryProvider) == normalizedProvider
             ) {
                 snapshot[KEY_SELECTED_MODEL]
-                    ?.let { canonicalizeModelIdForProvider(normalizedProvider, it) }
+                    ?.let { canonicalizeModelIdForProvider(modelProvider, it) }
                     ?.takeIf { it.isNotBlank() }
             } else {
                 null
@@ -2346,12 +3353,19 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             snapshot = snapshot,
             selectedByProviderInput = selectedByProvider,
         )
-        val requestedPrimary = if (
-            globalPrimaryProvider == normalizedProvider &&
-            normalizeProvider(snapshot[KEY_SELECTED_MODEL_PROVIDER].orEmpty()) == normalizedProvider
+        val scopedPrimary = decodeStringMap(snapshot[KEY_PRIMARY_MODEL_BY_PROVIDER_JSON])[selectionKey]
+            .orEmpty()
+            .takeIf(selectedIds::contains)
+            .orEmpty()
+        val requestedPrimary = if (scopedPrimary.isNotBlank()) {
+            scopedPrimary
+        } else if (
+            normalizedProvider != "openai" &&
+                canonicalizeApiProvider(globalPrimaryProvider) == normalizedProvider &&
+                canonicalizeApiProvider(snapshot[KEY_SELECTED_MODEL_PROVIDER].orEmpty()) == normalizedProvider
         ) {
             snapshot[KEY_SELECTED_MODEL]
-                ?.let { canonicalizeModelIdForProvider(normalizedProvider, it) }
+                ?.let { canonicalizeModelIdForProvider(modelProvider, it) }
                 .orEmpty()
         } else if (normalizedProvider == "openai-compatible") {
             val profiles = decodeOpenAiCompatibleProfiles(snapshot[KEY_OPENAI_COMPATIBLE_PROFILES_JSON])
@@ -2488,7 +3502,6 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             } else {
                 prefs[KEY_SELECTED_MODELS_BY_PROVIDER_JSON] = encodeStringListMap(selectedByProvider)
             }
-            prefs.remove(KEY_PRIMARY_MODEL_BY_PROVIDER_JSON)
 
             val metadataByProvider =
                 decodeModelMetadataByProvider(prefs[KEY_MODEL_METADATA_BY_PROVIDER_JSON]).toMutableMap()
@@ -2698,12 +3711,14 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             ?.takeIf { it in 0..nowEpochMs }
             ?: return null
         val startupAttemptActive = snapshot[KEY_GATEWAY_SURVIVOR_STARTUP_ATTEMPT_ACTIVE] ?: false
+        val runtime = parseGatewaySurvivorRuntime(snapshot[KEY_GATEWAY_SURVIVOR_RUNTIME])
         return GatewaySurvivorMetadata(
             pid = pid,
             launchedAtEpochMs = launchedAtEpochMs,
             wsEndpoint = endpoint,
             startupAttemptActive = startupAttemptActive,
             updatedAtEpochMs = updatedAtEpochMs,
+            runtime = runtime,
         )
     }
 
@@ -2726,6 +3741,9 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             }
             prefs[KEY_GATEWAY_SURVIVOR_WS_ENDPOINT] = normalizedEndpoint
             prefs[KEY_GATEWAY_SURVIVOR_STARTUP_ATTEMPT_ACTIVE] = metadata.startupAttemptActive
+            metadata.runtime?.let { runtime ->
+                prefs[KEY_GATEWAY_SURVIVOR_RUNTIME] = runtime.storageValue
+            } ?: prefs.remove(KEY_GATEWAY_SURVIVOR_RUNTIME)
             if (metadata.updatedAtEpochMs >= 0L) {
                 prefs[KEY_GATEWAY_SURVIVOR_UPDATED_AT] = metadata.updatedAtEpochMs
             } else {
@@ -2741,6 +3759,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             prefs.remove(KEY_GATEWAY_SURVIVOR_WS_ENDPOINT)
             prefs.remove(KEY_GATEWAY_SURVIVOR_STARTUP_ATTEMPT_ACTIVE)
             prefs.remove(KEY_GATEWAY_SURVIVOR_UPDATED_AT)
+            prefs.remove(KEY_GATEWAY_SURVIVOR_RUNTIME)
         }
     }
 
@@ -2993,6 +4012,7 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             snapshot.forEach { (key, rawValue) ->
                 when (key) {
                     "api_provider" -> prefs[KEY_API_PROVIDER] = rawValue
+                    "openai_connection_mode" -> prefs[KEY_OPENAI_CONNECTION_MODE] = rawValue
                     "api_key" -> prefs[KEY_API_KEY] = rawValue
                     "api_key_openrouter" -> prefs[KEY_API_KEY_OPENROUTER] = rawValue
                     "api_key_anthropic" -> prefs[KEY_API_KEY_ANTHROPIC] = rawValue
@@ -3105,6 +4125,7 @@ data class GlobalDefaultModelOption(
 
 data class GatewayLaunchConfigSnapshot(
     val apiProvider: String,
+    val openAiConnectionMode: OpenAiConnectionMode,
     val apiKey: String,
     val selectedModel: String,
     val selectedModelEntries: List<SelectedModelConfigEntry>,
@@ -3146,4 +4167,5 @@ data class GatewaySurvivorMetadata(
     val wsEndpoint: String,
     val startupAttemptActive: Boolean,
     val updatedAtEpochMs: Long,
+    val runtime: ExecutionRuntime? = null,
 )

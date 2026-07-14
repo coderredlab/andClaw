@@ -32,6 +32,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Cable
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.History
@@ -216,12 +217,14 @@ fun DashboardScreen(
             // ── Hero Section — full bleed, colored background ──
             StatusHero(
                 status = gatewayUiState.status,
-                errorMessage = gatewayUiState.errorMessage,
+                error = gatewayUiState.error,
+                onErrorAcknowledged = viewModel::acknowledgeError,
                 onStart = requestStartGateway,
                 onStop = { viewModel.stopGateway() },
                 onRestart = { viewModel.restartGateway() },
                 onOpenDashboard = { viewModel.openDashboard(context) },
                 dashboardReady = gatewayUiState.dashboardReady,
+                actionsEnabled = gatewayUiState.actionsEnabled,
             )
 
             // ── Content below hero ──
@@ -500,12 +503,14 @@ private fun BundleUpdateFailureBanner(
 @Composable
 private fun StatusHero(
     status: GatewayStatus,
-    errorMessage: String?,
+    error: DashboardErrorUiState?,
+    onErrorAcknowledged: (DashboardErrorUiState) -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
     onRestart: () -> Unit,
     onOpenDashboard: () -> Unit,
     dashboardReady: Boolean,
+    actionsEnabled: Boolean,
 ) {
     val statusColor by animateColorAsState(
         targetValue = when (status) {
@@ -592,7 +597,7 @@ private fun StatusHero(
             )
 
             // Error chip
-            if (errorMessage != null) {
+            error?.let { visibleError ->
                 Spacer(modifier = Modifier.height(8.dp))
                 val noticeContainerColor =
                     if (status == GatewayStatus.ERROR) {
@@ -610,14 +615,39 @@ private fun StatusHero(
                     shape = RoundedCornerShape(12.dp),
                     color = noticeContainerColor,
                 ) {
-                    Text(
-                        text = errorMessage,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = noticeContentColor,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                    )
+                    if (visibleError.source == DashboardErrorSource.OPEN_AI_TRANSITION) {
+                        Row(
+                            modifier = Modifier.padding(start = 16.dp, end = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                text = visibleError.message,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = noticeContentColor,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(vertical = 8.dp),
+                            )
+                            IconButton(onClick = { onErrorAcknowledged(visibleError) }) {
+                                Icon(
+                                    imageVector = Icons.Default.Close,
+                                    contentDescription = stringResource(R.string.settings_model_close),
+                                    tint = noticeContentColor,
+                                )
+                            }
+                        }
+                    } else {
+                        Text(
+                            text = visibleError.message,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = noticeContentColor,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                        )
+                    }
                 }
             }
 
@@ -628,6 +658,7 @@ private fun StatusHero(
                 GatewayStatus.STOPPED, GatewayStatus.ERROR -> {
                     Button(
                         onClick = onStart,
+                        enabled = actionsEnabled,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(56.dp),
@@ -644,7 +675,7 @@ private fun StatusHero(
                 GatewayStatus.RUNNING -> {
                     Button(
                         onClick = onOpenDashboard,
-                        enabled = dashboardReady,
+                        enabled = dashboardReady && actionsEnabled,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(56.dp),
@@ -664,6 +695,7 @@ private fun StatusHero(
                     ) {
                         FilledTonalButton(
                             onClick = onStop,
+                            enabled = actionsEnabled,
                             modifier = Modifier
                                 .weight(1f)
                                 .height(48.dp),
@@ -675,6 +707,7 @@ private fun StatusHero(
                         }
                         OutlinedButton(
                             onClick = onRestart,
+                            enabled = actionsEnabled,
                             modifier = Modifier
                                 .weight(1f)
                                 .height(48.dp),
@@ -689,6 +722,7 @@ private fun StatusHero(
                 GatewayStatus.STARTING -> {
                     OutlinedButton(
                         onClick = onStop,
+                        enabled = actionsEnabled,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(48.dp),

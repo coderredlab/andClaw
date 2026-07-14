@@ -4,14 +4,18 @@ import java.io.File
 import org.json.JSONObject
 
 object OpenClawCodexModelScope {
+    const val OPENAI_PROVIDER = "openai"
     const val LEGACY_PROVIDER = "openai-codex"
-    const val CODEX_PROVIDER = "codex"
+    const val LEGACY_CODEX_PROVIDER = "codex"
+    const val CODEX_PROVIDER = OPENAI_PROVIDER
 
-    private const val PROVIDER_SWITCH_VERSION = "2026.6.1"
     private const val CODEX_APP_SERVER_OPENAI_AUTH_VERSION = "2026.6.1"
-    private const val LEGACY_DEFAULT_MODEL = "gpt-5.3-codex"
-    private const val CODEX_DEFAULT_MODEL = "gpt-5.5"
-    private val CODEX_PROVIDER_MODEL_IDS = setOf("gpt-5.5", "gpt-5.4-mini")
+    private const val DEFAULT_MODEL = "gpt-5.6-sol"
+    private val LEGACY_OPENAI_PROVIDERS = setOf(
+        OPENAI_PROVIDER,
+        LEGACY_PROVIDER,
+        LEGACY_CODEX_PROVIDER,
+    )
 
     fun readInstalledOpenClawVersion(rootfsDir: File?): String? {
         val packageJson = rootfsDir
@@ -23,9 +27,7 @@ object OpenClawCodexModelScope {
         }.getOrNull()
     }
 
-    fun providerForInstalledVersion(version: String?): String {
-        return if (isAtLeast(version, PROVIDER_SWITCH_VERSION)) CODEX_PROVIDER else LEGACY_PROVIDER
-    }
+    fun providerForInstalledVersion(version: String?): String = OPENAI_PROVIDER
 
     fun usesOpenAiAppServerAuth(version: String?): Boolean {
         return isAtLeast(version, CODEX_APP_SERVER_OPENAI_AUTH_VERSION)
@@ -35,19 +37,18 @@ object OpenClawCodexModelScope {
         return providerForInstalledVersion(readInstalledOpenClawVersion(rootfsDir))
     }
 
-    fun defaultBareModelId(version: String?): String {
-        return when (providerForInstalledVersion(version)) {
-            CODEX_PROVIDER -> CODEX_DEFAULT_MODEL
-            else -> LEGACY_DEFAULT_MODEL
-        }
-    }
+    fun defaultBareModelId(version: String?): String = DEFAULT_MODEL
 
     fun bareModelId(modelId: String): String {
-        return modelId.trim()
-            .removePrefix("$LEGACY_PROVIDER/")
-            .removePrefix("$CODEX_PROVIDER/")
-            .removePrefix("openai/")
-            .trim()
+        val trimmed = modelId.trim()
+        val slashIndex = trimmed.indexOf('/')
+        if (slashIndex <= 0) return trimmed
+        val provider = trimmed.substring(0, slashIndex).lowercase()
+        return if (provider in LEGACY_OPENAI_PROVIDERS) {
+            trimmed.substring(slashIndex + 1).trim()
+        } else {
+            trimmed
+        }
     }
 
     fun normalizedBareModelId(modelId: String): String {
@@ -59,27 +60,38 @@ object OpenClawCodexModelScope {
         modelId: String,
         availableBareModelIds: Set<String> = emptySet(),
     ): String {
-        val provider = providerForInstalledVersion(version)
         val bareModelId = resolveBareModelId(version, modelId, availableBareModelIds)
-        return "$provider/$bareModelId"
+        return "$OPENAI_PROVIDER/$bareModelId"
+    }
+
+    fun preferredBareModelId(
+        availableModels: List<OpenClawModelCatalogReader.ModelEntry>,
+    ): String {
+        val availableByNormalizedId = availableModels
+            .asSequence()
+            .filter { it.id.isNotBlank() }
+            .associateBy { normalizedBareModelId(it.id) }
+        return availableModels
+            .firstOrNull { it.isDefault && it.id.isNotBlank() }
+            ?.id
+            ?.let(::bareModelId)
+            ?: availableByNormalizedId["gpt-5.6-sol"]?.id?.let(::bareModelId)
+            ?: availableByNormalizedId["gpt-5.5"]?.id?.let(::bareModelId)
+            ?: availableModels.firstOrNull { it.id.isNotBlank() }?.id?.let(::bareModelId)
+            ?: DEFAULT_MODEL
     }
 
     fun preferredBareModelId(version: String?, availableBareModelIds: Set<String>): String {
-        val provider = providerForInstalledVersion(version)
         val availableByNormalizedId = availableBareModelIds
-            .mapNotNull { bareModelId ->
-                val normalized = normalizedBareModelId(bareModelId)
-                bareModelId.trim().takeIf { it.isNotBlank() }?.let { normalized to it }
+            .mapNotNull { availableModelId ->
+                val bareModelId = bareModelId(availableModelId)
+                bareModelId.takeIf { it.isNotBlank() }?.let { normalizedBareModelId(it) to it }
             }
             .toMap()
-        val preferredOrder = when (provider) {
-            CODEX_PROVIDER -> listOf(CODEX_DEFAULT_MODEL, "gpt-5.4-mini")
-            else -> listOf("gpt-5.4", LEGACY_DEFAULT_MODEL)
-        }
-        return preferredOrder
-            .firstNotNullOfOrNull { availableByNormalizedId[it] }
-            ?: availableBareModelIds.firstOrNull { it.isNotBlank() }?.trim()
-            ?: defaultBareModelId(version)
+        return availableByNormalizedId["gpt-5.6-sol"]
+            ?: availableByNormalizedId["gpt-5.5"]
+            ?: availableBareModelIds.firstOrNull { it.isNotBlank() }?.let(::bareModelId)
+            ?: DEFAULT_MODEL
     }
 
     fun resolveBareModelId(
@@ -87,40 +99,28 @@ object OpenClawCodexModelScope {
         modelId: String,
         availableBareModelIds: Set<String>,
     ): String {
-        val provider = providerForInstalledVersion(version)
         val requestedBareModelId = bareModelId(modelId)
             .takeUnless { it.isBlank() || it.contains("/") }
             ?: return preferredBareModelId(version, availableBareModelIds)
 
         val availableByNormalizedId = availableBareModelIds
-            .mapNotNull { bareModelId ->
-                val normalized = normalizedBareModelId(bareModelId)
-                bareModelId.trim().takeIf { it.isNotBlank() }?.let { normalized to it }
+            .mapNotNull { availableModelId ->
+                val bareModelId = bareModelId(availableModelId)
+                bareModelId.takeIf { it.isNotBlank() }?.let { normalizedBareModelId(it) to it }
             }
             .toMap()
-        if (availableByNormalizedId.isNotEmpty()) {
-            return availableByNormalizedId[normalizedBareModelId(requestedBareModelId)]
-                ?: preferredBareModelId(version, availableBareModelIds)
-        }
-
-        val normalizedRequested = normalizedBareModelId(requestedBareModelId)
-        return when {
-            provider == LEGACY_PROVIDER && normalizedRequested in CODEX_PROVIDER_MODEL_IDS ->
-                defaultBareModelId(version)
-            provider == CODEX_PROVIDER && normalizedRequested !in CODEX_PROVIDER_MODEL_IDS ->
-                defaultBareModelId(version)
-            else -> requestedBareModelId
-        }
+        if (availableByNormalizedId.isEmpty()) return requestedBareModelId
+        return availableByNormalizedId[normalizedBareModelId(requestedBareModelId)]
+            ?: preferredBareModelId(version, availableBareModelIds)
     }
 
     fun scopedModelIdForProvider(provider: String, modelId: String): String {
-        val normalizedProvider = provider.trim().lowercase().ifBlank { LEGACY_PROVIDER }
+        val normalizedProvider = provider.trim().lowercase()
+            .takeUnless { it in LEGACY_OPENAI_PROVIDERS || it.isBlank() }
+            ?: OPENAI_PROVIDER
         val bareModelId = bareModelId(modelId)
             .takeUnless { it.isBlank() || it.contains("/") }
-            ?: when (normalizedProvider) {
-                CODEX_PROVIDER -> CODEX_DEFAULT_MODEL
-                else -> LEGACY_DEFAULT_MODEL
-            }
+            ?: DEFAULT_MODEL
         return "$normalizedProvider/$bareModelId"
     }
 

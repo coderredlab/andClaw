@@ -10,6 +10,8 @@ import android.os.SystemClock
 import android.util.Log
 import com.coderred.andclaw.data.GatewayStatus
 import com.coderred.andclaw.data.PreferencesManager
+import com.coderred.andclaw.data.resolveGatewaySurvivorRuntime
+import com.coderred.andclaw.data.resolveGatewaySurvivorStartupAttemptAgeSeconds
 import com.coderred.andclaw.proroot.ExecutionRuntime
 import com.coderred.andclaw.service.GatewayService
 import kotlinx.coroutines.CoroutineScope
@@ -212,10 +214,22 @@ class GatewayWatchdogReceiver : BroadcastReceiver() {
                 var gatewayState = processManager?.gatewayState?.value
                 var status = gatewayState?.status
                 val serviceActive = GatewayService.isInstanceActive
-                val startupAttemptAgeSeconds = processManager?.startupAttemptAgeSeconds()
-                val startupAttemptActive = startupAttemptAgeSeconds != null ||
-                    (processManager == null && prefs.getGatewaySurvivorMetadata()?.startupAttemptActive == true)
-                val runtime = ExecutionRuntime.fromStorageValue(prefs.executionRuntime.first())
+                val survivorMetadata = prefs.getGatewaySurvivorMetadata()
+                val startupAttemptAgeSeconds = resolveGatewaySurvivorStartupAttemptAgeSeconds(
+                    liveStartupAttemptAgeSeconds = processManager?.startupAttemptAgeSeconds(),
+                    processManagerAvailable = processManager != null,
+                    survivorMetadata = survivorMetadata,
+                    nowEpochMs = System.currentTimeMillis(),
+                )
+                val startupAttemptActive = startupAttemptAgeSeconds != null
+                val selectedRuntime = ExecutionRuntime.fromStorageValue(prefs.executionRuntime.first())
+                val runtime = resolveGatewaySurvivorRuntime(
+                    startupAttemptActive = startupAttemptActive,
+                    runningRuntime = processManager?.runningExecutionRuntime,
+                    startingRuntime = processManager?.startingExecutionRuntime,
+                    survivorMetadata = survivorMetadata,
+                    selectedRuntime = selectedRuntime,
+                )
                 val startupGracePeriodSeconds = resolveStartingRecoveryGracePeriodSeconds(runtime)
                 val previousRunningUnhealthyFailures = runningUnhealthyFailures.get()
                 val runningHealthy = if (status == GatewayStatus.RUNNING) {

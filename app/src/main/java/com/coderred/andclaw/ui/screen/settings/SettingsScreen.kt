@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.OpenableColumns
 import android.widget.Toast
+import androidx.annotation.StringRes
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
@@ -92,15 +93,19 @@ import com.coderred.andclaw.data.BugReportEmailIntentBuilder
 import com.coderred.andclaw.data.SetupStep
 import com.coderred.andclaw.data.BugReportEmailMetadata
 import com.coderred.andclaw.data.BugReportEmailSummary
+import com.coderred.andclaw.data.OpenAiConnectionMode
 import com.coderred.andclaw.data.PreferencesManager
 import com.coderred.andclaw.data.transfer.TransferSizeLimits
 import com.coderred.andclaw.proroot.ExecutionRuntime
+import com.coderred.andclaw.proroot.OpenClawModelCatalogReader
 import com.coderred.andclaw.ui.component.DefaultModelDialogOption
 import com.coderred.andclaw.ui.component.DefaultModelSelectionDialog
 import com.coderred.andclaw.ui.component.KeepScreenOnEffect
 import com.coderred.andclaw.ui.component.ModelSelectionDialog
 import com.coderred.andclaw.ui.component.WhatsAppQrDialog
 import com.coderred.andclaw.ui.screen.dashboard.WhatsAppQrState
+import com.coderred.andclaw.service.OpenAiConnectionTransitionFailure
+import com.coderred.andclaw.service.OpenAiConnectionTransitionPhase
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
@@ -112,11 +117,130 @@ internal const val SETTINGS_SECTION_TOOLS = "tools"
 private const val CODEX_AUTH_DEBUG_DIALOG_AUTO_OPEN_THRESHOLD = 180
 private const val SHOW_CODEX_AUTH_MAINTENANCE_ACTIONS = false
 
+internal val SETTINGS_PROVIDER_IDS = listOf(
+    "openrouter",
+    "anthropic",
+    "openai",
+    "github-copilot",
+    "google",
+    "zai",
+    "kimi-coding",
+    "minimax",
+    "ollama",
+    "ollama-cloud",
+    "openai-compatible",
+)
+
+internal enum class ProviderSelectionUiAction {
+    OPEN_OPENAI_CONNECTION_MODE_CHOOSER,
+    APPLY_PROVIDER,
+}
+
+internal enum class OpenAiCredentialUiStatus {
+    CONFIGURED,
+    NOT_CONFIGURED,
+    IN_PROGRESS,
+}
+
+internal data class OpenAiConnectionModeUiItem(
+    val mode: OpenAiConnectionMode,
+    val credentialStatus: OpenAiCredentialUiStatus,
+    val isCurrent: Boolean,
+)
+
+internal enum class OpenAiModeSelectionUiEffect {
+    NONE,
+    SHOW_RESTART_CONFIRMATION,
+    START_CODEX_LOGIN,
+    SHOW_API_KEY_DIALOG,
+}
+
 internal fun resolveInitialSettingsTabIndex(initialSection: String?): Int {
     return when (initialSection) {
         SETTINGS_SECTION_TOOLS -> 3
         else -> 0
     }
+}
+
+internal fun canonicalSettingsProviderId(provider: String): String =
+    OpenClawModelCatalogReader.canonicalProvider(provider)
+
+internal fun resolveProviderSelectionUiAction(provider: String): ProviderSelectionUiAction =
+    if (canonicalSettingsProviderId(provider) == "openai") {
+        ProviderSelectionUiAction.OPEN_OPENAI_CONNECTION_MODE_CHOOSER
+    } else {
+        ProviderSelectionUiAction.APPLY_PROVIDER
+    }
+
+internal fun buildOpenAiConnectionModeUiItems(
+    activeMode: OpenAiConnectionMode,
+    isCodexAuthenticated: Boolean,
+    isCodexAuthInProgress: Boolean,
+    isApiKeyConfigured: Boolean,
+): List<OpenAiConnectionModeUiItem> = listOf(
+    OpenAiConnectionModeUiItem(
+        mode = OpenAiConnectionMode.CODEX_SUBSCRIPTION,
+        credentialStatus = when {
+            isCodexAuthInProgress -> OpenAiCredentialUiStatus.IN_PROGRESS
+            isCodexAuthenticated -> OpenAiCredentialUiStatus.CONFIGURED
+            else -> OpenAiCredentialUiStatus.NOT_CONFIGURED
+        },
+        isCurrent = activeMode == OpenAiConnectionMode.CODEX_SUBSCRIPTION,
+    ),
+    OpenAiConnectionModeUiItem(
+        mode = OpenAiConnectionMode.PLATFORM_API_KEY,
+        credentialStatus = if (isApiKeyConfigured) {
+            OpenAiCredentialUiStatus.CONFIGURED
+        } else {
+            OpenAiCredentialUiStatus.NOT_CONFIGURED
+        },
+        isCurrent = activeMode == OpenAiConnectionMode.PLATFORM_API_KEY,
+    ),
+)
+
+internal fun resolveOpenAiModeSelectionUiEffect(
+    result: SettingsViewModel.OpenAiModeSelectionResult,
+): OpenAiModeSelectionUiEffect = when (result) {
+    SettingsViewModel.OpenAiModeSelectionResult.NoChange,
+    SettingsViewModel.OpenAiModeSelectionResult.TransitionRequested,
+    -> OpenAiModeSelectionUiEffect.NONE
+
+    SettingsViewModel.OpenAiModeSelectionResult.AwaitingRestartConfirmation ->
+        OpenAiModeSelectionUiEffect.SHOW_RESTART_CONFIRMATION
+    SettingsViewModel.OpenAiModeSelectionResult.RequiresCodexLogin ->
+        OpenAiModeSelectionUiEffect.START_CODEX_LOGIN
+    SettingsViewModel.OpenAiModeSelectionResult.RequiresApiKey ->
+        OpenAiModeSelectionUiEffect.SHOW_API_KEY_DIALOG
+}
+
+internal fun isProviderConfigurationEditingEnabled(
+    isOpenAiTransitionPending: Boolean,
+): Boolean = !isOpenAiTransitionPending
+
+internal sealed interface SettingsErrorUiState {
+    val message: String
+
+    data class ChannelDisconnect(
+        override val message: String,
+    ) : SettingsErrorUiState
+
+    data class OpenAiTransition(
+        val failure: OpenAiConnectionTransitionFailure,
+    ) : SettingsErrorUiState {
+        override val message: String
+            get() = failure.message
+    }
+}
+
+internal fun resolveSettingsError(
+    channelDisconnectError: String?,
+    openAiConnectionTransitionFailure: OpenAiConnectionTransitionFailure?,
+): SettingsErrorUiState? = when {
+    channelDisconnectError != null ->
+        SettingsErrorUiState.ChannelDisconnect(channelDisconnectError)
+    openAiConnectionTransitionFailure != null ->
+        SettingsErrorUiState.OpenAiTransition(openAiConnectionTransitionFailure)
+    else -> null
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -134,6 +258,11 @@ fun SettingsScreen(
     val chargeOnlyMode by viewModel.chargeOnlyMode.collectAsState()
     val executionRuntime by viewModel.executionRuntime.collectAsState()
     val apiProvider by viewModel.apiProvider.collectAsState()
+    val openAiConnectionMode by viewModel.openAiConnectionMode.collectAsState()
+    val openAiConnectionTransition by viewModel.openAiConnectionTransition.collectAsState()
+    val canonicalApiProvider = canonicalSettingsProviderId(apiProvider)
+    val providerConfigurationEditingEnabled =
+        isProviderConfigurationEditingEnabled(openAiConnectionTransition.isPending)
     val apiKey by viewModel.apiKey.collectAsState()
     val openAiCompatibleBaseUrl by viewModel.openAiCompatibleBaseUrl.collectAsState()
     val openAiCompatibleModelId by viewModel.openAiCompatibleModelId.collectAsState()
@@ -196,11 +325,10 @@ fun SettingsScreen(
     val clipboardManager = LocalClipboardManager.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val providerLabelFor: (String) -> String = { provider ->
-        when (provider) {
+        when (canonicalSettingsProviderId(provider)) {
             "openrouter" -> context.getString(R.string.onboarding_provider_openrouter)
             "anthropic" -> context.getString(R.string.onboarding_provider_anthropic)
-            "openai" -> context.getString(R.string.settings_provider_openai_api)
-            "openai-codex" -> context.getString(R.string.settings_provider_openai_codex)
+            "openai" -> context.getString(R.string.settings_memory_search_provider_openai)
             "github-copilot" -> context.getString(R.string.onboarding_provider_github_copilot)
             "zai" -> context.getString(R.string.onboarding_provider_zai)
             "kimi-coding" -> context.getString(R.string.onboarding_provider_kimi_coding)
@@ -213,16 +341,21 @@ fun SettingsScreen(
         }
     }
     val defaultModelOptionsUi = globalDefaultModelOptions.map { option ->
+        val provider = canonicalSettingsProviderId(option.provider)
         DefaultModelDialogOption(
-            provider = option.provider,
-            providerLabel = providerLabelFor(option.provider),
+            provider = provider,
+            providerLabel = providerLabelFor(provider),
             modelId = option.modelId,
-            displayModelId = formatSelectedModelLabel(option.provider, option.modelId),
+            displayModelId = formatSelectedModelLabel(provider, option.modelId),
         )
     }
+    val canonicalSelectedModelProvider = canonicalSettingsProviderId(selectedModelProvider)
     val defaultModelDisplay = when {
-        selectedModel.isBlank() || selectedModelProvider.isBlank() -> stringResource(R.string.settings_default_model_none)
-        else -> "${providerLabelFor(selectedModelProvider)} · ${formatSelectedModelLabel(selectedModelProvider, selectedModel)}"
+        selectedModel.isBlank() || canonicalSelectedModelProvider.isBlank() ->
+            stringResource(R.string.settings_default_model_none)
+        else ->
+            "${providerLabelFor(canonicalSelectedModelProvider)} · " +
+                formatSelectedModelLabel(canonicalSelectedModelProvider, selectedModel)
     }
     val memorySearchProviderDisplay = when (memorySearchProvider) {
         "openai" -> stringResource(R.string.settings_memory_search_provider_openai)
@@ -248,6 +381,7 @@ fun SettingsScreen(
     var showModelDialog by remember { mutableStateOf(false) }
     var showDefaultModelDialog by remember { mutableStateOf(false) }
     var showProviderDialog by remember { mutableStateOf(false) }
+    var showOpenAiConnectionModeDialog by remember { mutableStateOf(false) }
     var showApiKeyDialog by remember { mutableStateOf(false) }
     var showRestartHint by remember { mutableStateOf(false) }
     var showBotRestartNotice by remember { mutableStateOf(false) }
@@ -273,8 +407,31 @@ fun SettingsScreen(
     }
     var apiKeyDialogProviderOverride by remember { mutableStateOf<String?>(null) }
     var apiKeyDialogCurrentKeyOverride by remember { mutableStateOf<String?>(null) }
+    var openAiApiKeyConfigured by remember { mutableStateOf(false) }
     var selectedSettingsTabIndex by remember(initialSection) {
         mutableStateOf(resolveInitialSettingsTabIndex(initialSection))
+    }
+    val handleOpenAiModeSelectionResult: (SettingsViewModel.OpenAiModeSelectionResult) -> Unit = { result ->
+        when (resolveOpenAiModeSelectionUiEffect(result)) {
+            OpenAiModeSelectionUiEffect.NONE -> Unit
+            OpenAiModeSelectionUiEffect.SHOW_RESTART_CONFIRMATION -> {
+                showRestartHint = true
+            }
+            OpenAiModeSelectionUiEffect.START_CODEX_LOGIN -> {
+                viewModel.loginOpenAiCodexOAuth()
+            }
+            OpenAiModeSelectionUiEffect.SHOW_API_KEY_DIALOG -> {
+                apiKeyDialogProviderOverride = "openai"
+                apiKeyDialogCurrentKeyOverride = ""
+                showApiKeyDialog = true
+            }
+        }
+    }
+    val openOpenAiConnectionModeDialog = {
+        viewModel.getApiKeyForProvider("openai") { currentKey ->
+            openAiApiKeyConfigured = currentKey.isNotBlank()
+            showOpenAiConnectionModeDialog = true
+        }
     }
     val isMaintenanceBusy =
         isDoctorFixRunning ||
@@ -384,9 +541,39 @@ fun SettingsScreen(
         }
     }
 
+    LaunchedEffect(canonicalApiProvider, apiKey) {
+        if (canonicalApiProvider == "openai") {
+            openAiApiKeyConfigured = apiKey.isNotBlank()
+        }
+    }
+
+    LaunchedEffect(providerConfigurationEditingEnabled) {
+        if (!providerConfigurationEditingEnabled) {
+            showProviderDialog = false
+            showOpenAiConnectionModeDialog = false
+            showApiKeyDialog = false
+            showModelDialog = false
+            showDefaultModelDialog = false
+        }
+    }
+
+    LaunchedEffect(openAiConnectionTransition.phase) {
+        if (openAiConnectionTransition.phase == OpenAiConnectionTransitionPhase.AWAITING_CONFIRMATION) {
+            showRestartHint = true
+        }
+    }
+
     LaunchedEffect(pendingApiKeyProvider) {
         val targetProvider = pendingApiKeyProvider ?: return@LaunchedEffect
         selectedSettingsTabIndex = 0
+        if (canonicalSettingsProviderId(targetProvider) == "openai") {
+            pendingApiKeyProvider = null
+            viewModel.setOpenAiConnectionMode(
+                targetMode = OpenAiConnectionMode.PLATFORM_API_KEY,
+                onResult = handleOpenAiModeSelectionResult,
+            )
+            return@LaunchedEffect
+        }
         viewModel.setApiProvider(targetProvider) { appliedProvider, _ ->
             if (appliedProvider == "github-copilot") {
                 pendingApiKeyProvider = null
@@ -556,21 +743,8 @@ fun SettingsScreen(
                     Column {
                         SettingClickableRow(
                             title = stringResource(R.string.settings_current_provider),
-                            value = when (apiProvider) {
-                                "openrouter" -> stringResource(R.string.onboarding_provider_openrouter)
-                                "anthropic" -> stringResource(R.string.onboarding_provider_anthropic)
-                                "openai" -> stringResource(R.string.settings_provider_openai_api)
-                                "openai-codex" -> stringResource(R.string.settings_provider_openai_codex)
-                                "github-copilot" -> stringResource(R.string.onboarding_provider_github_copilot)
-                                "zai" -> stringResource(R.string.onboarding_provider_zai)
-                                "kimi-coding" -> stringResource(R.string.onboarding_provider_kimi_coding)
-                                "minimax" -> stringResource(R.string.onboarding_provider_minimax)
-                                "ollama" -> stringResource(R.string.onboarding_provider_ollama)
-                                "ollama-cloud" -> stringResource(R.string.onboarding_provider_ollama_cloud)
-                                "openai-compatible" -> stringResource(R.string.onboarding_provider_openai_compatible)
-                                "google" -> stringResource(R.string.onboarding_provider_google)
-                                else -> apiProvider.replaceFirstChar { it.uppercase() }
-                            },
+                            value = providerLabelFor(canonicalApiProvider),
+                            enabled = providerConfigurationEditingEnabled,
                             onClick = { showProviderDialog = true },
                         )
 
@@ -579,142 +753,256 @@ fun SettingsScreen(
                             color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
                         )
 
-                        if (shouldUseApiKeyDialog(apiProvider)) {
-                            val customProviderBaseUrlValue = customProviderBaseUrl(
-                                provider = apiProvider,
-                                openAiCompatibleBaseUrl = openAiCompatibleBaseUrl,
-                                ollamaBaseUrl = ollamaBaseUrl,
-                            )
-                            val apiKeyRowState = resolveApiKeyRowState(
-                                provider = apiProvider,
-                                apiKey = apiKey,
-                                baseUrl = customProviderBaseUrlValue,
-                                configuredLabel = stringResource(R.string.settings_api_key_configured),
-                                notConfiguredLabel = stringResource(R.string.settings_api_key_not_configured),
-                                notRequiredLabel = stringResource(R.string.settings_api_key_not_required),
-                            )
-                            SettingClickableRow(
-                                title = if (apiProvider == "ollama") {
-                                    stringResource(R.string.settings_ollama_host_address)
-                                } else {
-                                    stringResource(R.string.settings_api_key)
-                                },
-                                value = if (apiProvider == "ollama") {
-                                    customProviderBaseUrlValue.ifBlank {
-                                        stringResource(R.string.settings_api_key_not_configured)
+                        when {
+                            canonicalApiProvider == "openai" -> {
+                                SettingClickableRow(
+                                    title = stringResource(R.string.settings_openai_connection_method),
+                                    value = stringResource(openAiConnectionModeTitle(openAiConnectionMode)),
+                                    enabled = providerConfigurationEditingEnabled,
+                                    onClick = openOpenAiConnectionModeDialog,
+                                )
+
+                                HorizontalDivider(
+                                    modifier = Modifier.padding(horizontal = 20.dp),
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+                                )
+
+                                if (openAiConnectionMode == OpenAiConnectionMode.CODEX_SUBSCRIPTION) {
+                                    SettingClickableRow(
+                                        title = stringResource(R.string.settings_codex_oauth_title),
+                                        value = when {
+                                            isCodexAuthInProgress ->
+                                                stringResource(R.string.settings_codex_oauth_signing_in)
+                                            isCodexAuthenticated ->
+                                                stringResource(R.string.settings_connection_status_connected)
+                                            else ->
+                                                stringResource(R.string.settings_connection_status_not_connected)
+                                        },
+                                        valueColor = if (!isCodexAuthenticated && !isCodexAuthInProgress) {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            null
+                                        },
+                                        enabled = providerConfigurationEditingEnabled,
+                                        onClick = {
+                                            if (isCodexAuthenticated) {
+                                                viewModel.loginOpenAiCodexOAuth()
+                                            } else {
+                                                viewModel.setOpenAiConnectionMode(
+                                                    targetMode = OpenAiConnectionMode.CODEX_SUBSCRIPTION,
+                                                    onResult = handleOpenAiModeSelectionResult,
+                                                )
+                                            }
+                                        },
+                                    )
+                                    if (SHOW_CODEX_AUTH_MAINTENANCE_ACTIONS) {
+                                        SettingClickableRow(
+                                            title = stringResource(R.string.settings_codex_oauth_reset_title),
+                                            value = if (isCodexAuthResetInProgress) {
+                                                stringResource(R.string.settings_codex_oauth_reset_running)
+                                            } else {
+                                                stringResource(R.string.settings_codex_oauth_reset_desc)
+                                            },
+                                            enabled = providerConfigurationEditingEnabled &&
+                                                !isCodexAuthInProgress &&
+                                                !isCodexAuthResetInProgress &&
+                                                !isCodexAuthDiagnosticsInProgress,
+                                            onClick = { showCodexAuthResetConfirmDialog = true },
+                                        )
+                                        SettingClickableRow(
+                                            title = stringResource(R.string.settings_codex_oauth_diagnostics_title),
+                                            value = if (isCodexAuthDiagnosticsInProgress) {
+                                                stringResource(R.string.settings_codex_oauth_diagnostics_running)
+                                            } else {
+                                                stringResource(R.string.settings_codex_oauth_diagnostics_desc)
+                                            },
+                                            enabled = providerConfigurationEditingEnabled &&
+                                                !isCodexAuthInProgress &&
+                                                !isCodexAuthResetInProgress &&
+                                                !isCodexAuthDiagnosticsInProgress,
+                                            onClick = { viewModel.diagnoseOpenAiCodexOAuth() },
+                                        )
+                                        if (codexAuthDebugLine != null) {
+                                            Text(
+                                                text = codexAuthDebugLine ?: "",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.padding(start = 20.dp, end = 20.dp),
+                                                maxLines = 2,
+                                                overflow = TextOverflow.Ellipsis,
+                                            )
+                                            TextButton(
+                                                modifier = Modifier.padding(
+                                                    start = 12.dp,
+                                                    end = 12.dp,
+                                                    bottom = 8.dp,
+                                                ),
+                                                onClick = { showCodexAuthDiagnosticsDialog = true },
+                                            ) {
+                                                Text(
+                                                    stringResource(
+                                                        R.string.settings_codex_oauth_diagnostics_view_full,
+                                                    ),
+                                                )
+                                            }
+                                        }
                                     }
                                 } else {
-                                    apiKeyRowState.value
-                                },
-                                valueColor = if (apiProvider == "ollama") {
-                                    if (customProviderBaseUrlValue.isBlank()) MaterialTheme.colorScheme.error else null
-                                } else if (apiKeyRowState.isError) {
-                                    MaterialTheme.colorScheme.error
-                                } else {
-                                    null
-                                },
-                                onClick = { showApiKeyDialog = true },
-                            )
-                        } else if (apiProvider == "openai-codex") {
-                            SettingClickableRow(
-                                title = stringResource(R.string.settings_codex_oauth_title),
-                                value = when {
-                                    isCodexAuthInProgress -> stringResource(R.string.settings_codex_oauth_signing_in)
-                                    isCodexAuthenticated -> stringResource(R.string.settings_api_key_configured)
-                                    else -> stringResource(R.string.settings_api_key_not_configured)
-                                },
-                                valueColor = if (!isCodexAuthenticated && !isCodexAuthInProgress) MaterialTheme.colorScheme.error else null,
-                                onClick = { viewModel.loginOpenAiCodexOAuth() },
-                            )
-                            if (SHOW_CODEX_AUTH_MAINTENANCE_ACTIONS) {
-                                SettingClickableRow(
-                                    title = stringResource(R.string.settings_codex_oauth_reset_title),
-                                    value = if (isCodexAuthResetInProgress) {
-                                        stringResource(R.string.settings_codex_oauth_reset_running)
-                                    } else {
-                                        stringResource(R.string.settings_codex_oauth_reset_desc)
-                                    },
-                                    enabled = !isCodexAuthInProgress && !isCodexAuthResetInProgress && !isCodexAuthDiagnosticsInProgress,
-                                    onClick = { showCodexAuthResetConfirmDialog = true },
+                                    val openAiApiKeyRowState = resolveApiKeyRowState(
+                                        provider = "openai",
+                                        apiKey = apiKey,
+                                        baseUrl = "",
+                                        configuredLabel = stringResource(R.string.settings_connection_status_connected),
+                                        notConfiguredLabel = stringResource(R.string.settings_connection_status_not_connected),
+                                        notRequiredLabel = stringResource(R.string.settings_api_key_not_required),
+                                    )
+                                    SettingClickableRow(
+                                        title = stringResource(R.string.settings_api_key),
+                                        value = openAiApiKeyRowState.value,
+                                        valueColor = if (openAiApiKeyRowState.isError) {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            null
+                                        },
+                                        enabled = providerConfigurationEditingEnabled,
+                                        onClick = {
+                                            viewModel.getApiKeyForProvider("openai") { currentKey ->
+                                                apiKeyDialogProviderOverride = "openai"
+                                                apiKeyDialogCurrentKeyOverride = currentKey
+                                                showApiKeyDialog = true
+                                            }
+                                        },
+                                    )
+                                }
+                            }
+
+                            shouldUseApiKeyDialog(canonicalApiProvider) -> {
+                                val customProviderBaseUrlValue = customProviderBaseUrl(
+                                    provider = canonicalApiProvider,
+                                    openAiCompatibleBaseUrl = openAiCompatibleBaseUrl,
+                                    ollamaBaseUrl = ollamaBaseUrl,
+                                )
+                                val apiKeyRowState = resolveApiKeyRowState(
+                                    provider = canonicalApiProvider,
+                                    apiKey = apiKey,
+                                    baseUrl = customProviderBaseUrlValue,
+                                    configuredLabel = stringResource(R.string.settings_api_key_configured),
+                                    notConfiguredLabel = stringResource(R.string.settings_api_key_not_configured),
+                                    notRequiredLabel = stringResource(R.string.settings_api_key_not_required),
                                 )
                                 SettingClickableRow(
-                                    title = stringResource(R.string.settings_codex_oauth_diagnostics_title),
-                                    value = if (isCodexAuthDiagnosticsInProgress) {
-                                        stringResource(R.string.settings_codex_oauth_diagnostics_running)
+                                    title = if (canonicalApiProvider == "ollama") {
+                                        stringResource(R.string.settings_ollama_host_address)
                                     } else {
-                                        stringResource(R.string.settings_codex_oauth_diagnostics_desc)
+                                        stringResource(R.string.settings_api_key)
                                     },
-                                    enabled = !isCodexAuthInProgress && !isCodexAuthResetInProgress && !isCodexAuthDiagnosticsInProgress,
-                                    onClick = { viewModel.diagnoseOpenAiCodexOAuth() },
+                                    value = if (canonicalApiProvider == "ollama") {
+                                        customProviderBaseUrlValue.ifBlank {
+                                            stringResource(R.string.settings_api_key_not_configured)
+                                        }
+                                    } else {
+                                        apiKeyRowState.value
+                                    },
+                                    valueColor = if (canonicalApiProvider == "ollama") {
+                                        if (customProviderBaseUrlValue.isBlank()) {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            null
+                                        }
+                                    } else if (apiKeyRowState.isError) {
+                                        MaterialTheme.colorScheme.error
+                                    } else {
+                                        null
+                                    },
+                                    enabled = providerConfigurationEditingEnabled,
+                                    onClick = { showApiKeyDialog = true },
                                 )
-                                if (codexAuthDebugLine != null) {
+                            }
+
+                            else -> {
+                                SettingClickableRow(
+                                    title = stringResource(R.string.settings_github_copilot_login_title),
+                                    value = when {
+                                        isGitHubCopilotAuthInProgress ->
+                                            stringResource(R.string.settings_github_copilot_login_signing_in)
+                                        isGitHubCopilotAuthenticated ->
+                                            stringResource(R.string.settings_api_key_configured)
+                                        else ->
+                                            stringResource(R.string.settings_api_key_not_configured)
+                                    },
+                                    valueColor = if (
+                                        !isGitHubCopilotAuthenticated &&
+                                        !isGitHubCopilotAuthInProgress
+                                    ) {
+                                        MaterialTheme.colorScheme.error
+                                    } else {
+                                        null
+                                    },
+                                    enabled = providerConfigurationEditingEnabled,
+                                    onClick = {
+                                        val existingUrl = gitHubCopilotVerificationUrl
+                                        if (isGitHubCopilotAuthInProgress && !existingUrl.isNullOrBlank()) {
+                                            try {
+                                                context.startActivity(
+                                                    Intent(Intent.ACTION_VIEW, Uri.parse(existingUrl)),
+                                                )
+                                            } catch (_: Exception) {
+                                                Toast.makeText(
+                                                    context,
+                                                    context.getString(R.string.settings_cannot_open),
+                                                    Toast.LENGTH_SHORT,
+                                                ).show()
+                                            }
+                                        } else {
+                                            viewModel.loginGitHubCopilot()
+                                        }
+                                    },
+                                )
+                                if (!gitHubCopilotAuthCode.isNullOrBlank()) {
                                     Text(
-                                        text = codexAuthDebugLine ?: "",
+                                        text = stringResource(
+                                            R.string.settings_github_copilot_login_code,
+                                            gitHubCopilotAuthCode.orEmpty(),
+                                        ),
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        modifier = Modifier.padding(start = 20.dp, end = 20.dp),
+                                        modifier = Modifier.padding(
+                                            start = 20.dp,
+                                            end = 20.dp,
+                                            bottom = 12.dp,
+                                        ),
                                         maxLines = 2,
                                         overflow = TextOverflow.Ellipsis,
                                     )
-                                    TextButton(
-                                        modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 8.dp),
-                                        onClick = { showCodexAuthDiagnosticsDialog = true },
-                                    ) {
-                                        Text(stringResource(R.string.settings_codex_oauth_diagnostics_view_full))
-                                    }
                                 }
-                            }
-                        } else {
-                            SettingClickableRow(
-                                title = stringResource(R.string.settings_github_copilot_login_title),
-                                value = when {
-                                    isGitHubCopilotAuthInProgress -> stringResource(R.string.settings_github_copilot_login_signing_in)
-                                    isGitHubCopilotAuthenticated -> stringResource(R.string.settings_api_key_configured)
-                                    else -> stringResource(R.string.settings_api_key_not_configured)
-                                },
-                                valueColor = if (!isGitHubCopilotAuthenticated && !isGitHubCopilotAuthInProgress) MaterialTheme.colorScheme.error else null,
-                                onClick = {
-                                    val existingUrl = gitHubCopilotVerificationUrl
-                                    if (isGitHubCopilotAuthInProgress && !existingUrl.isNullOrBlank()) {
-                                        try {
-                                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(existingUrl)))
-                                        } catch (_: Exception) {
-                                            Toast.makeText(context, context.getString(R.string.settings_cannot_open), Toast.LENGTH_SHORT).show()
-                                        }
-                                    } else {
-                                        viewModel.loginGitHubCopilot()
-                                    }
-                                },
-                            )
-                            if (!gitHubCopilotAuthCode.isNullOrBlank()) {
-                                Text(
-                                    text = stringResource(R.string.settings_github_copilot_login_code, gitHubCopilotAuthCode.orEmpty()),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                            if (!gitHubCopilotVerificationUrl.isNullOrBlank()) {
-                                Text(
-                                    text = gitHubCopilotVerificationUrl.orEmpty(),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                            if (gitHubCopilotAuthDebugLine != null) {
-                                Text(
-                                    text = gitHubCopilotAuthDebugLine ?: "",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
+                                if (!gitHubCopilotVerificationUrl.isNullOrBlank()) {
+                                    Text(
+                                        text = gitHubCopilotVerificationUrl.orEmpty(),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(
+                                            start = 20.dp,
+                                            end = 20.dp,
+                                            bottom = 12.dp,
+                                        ),
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                if (gitHubCopilotAuthDebugLine != null) {
+                                    Text(
+                                        text = gitHubCopilotAuthDebugLine ?: "",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(
+                                            start = 20.dp,
+                                            end = 20.dp,
+                                            bottom = 12.dp,
+                                        ),
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
                             }
                         }
 
@@ -734,9 +1022,10 @@ fun SettingsScreen(
                             selectedModelIds.isEmpty() && !hasLoadedModels -> ""
                             selectedModelIds.isEmpty() -> stringResource(R.string.settings_model_none_found)
                             else -> selectedModelIds.joinToString(", ") {
-                                formatSelectedModelLabel(apiProvider, it)
+                                formatSelectedModelLabel(canonicalApiProvider, it)
                             }
                         },
+                        enabled = providerConfigurationEditingEnabled,
                         onClick = {
                             showModelDialog = true
                             viewModel.fetchModelsForCurrentProvider()
@@ -760,7 +1049,8 @@ fun SettingsScreen(
                         title = stringResource(R.string.settings_default_model_label),
                         value = defaultModelDisplay,
                         onClick = { showDefaultModelDialog = true },
-                        enabled = defaultModelOptionsUi.isNotEmpty(),
+                        enabled = providerConfigurationEditingEnabled &&
+                            defaultModelOptionsUi.isNotEmpty(),
                     )
                 }
             }
@@ -1189,8 +1479,8 @@ fun SettingsScreen(
     if (showDefaultModelDialog) {
         DefaultModelSelectionDialog(
             options = defaultModelOptionsUi,
-            selectedProvider = selectedModelProvider,
-            selectedModelId = formatCanonicalSelectedModelId(selectedModelProvider, selectedModel),
+            selectedProvider = canonicalSelectedModelProvider,
+            selectedModelId = formatCanonicalSelectedModelId(canonicalSelectedModelProvider, selectedModel),
             onApplySelection = { option ->
                 viewModel.setGlobalDefaultModel(option.provider, option.modelId) { changed ->
                     showDefaultModelDialog = false
@@ -1204,22 +1494,49 @@ fun SettingsScreen(
     // ── Provider Selection Dialog ──
     if (showProviderDialog) {
         ProviderSelectionDialog(
-            currentProvider = apiProvider,
+            currentProvider = canonicalApiProvider,
             onSelectProvider = { provider ->
-                viewModel.setApiProvider(provider) { _, changed ->
-                    showRestartHint = changed && viewModel.isGatewayActive
-                }
                 showProviderDialog = false
+                when (resolveProviderSelectionUiAction(provider)) {
+                    ProviderSelectionUiAction.OPEN_OPENAI_CONNECTION_MODE_CHOOSER ->
+                        openOpenAiConnectionModeDialog()
+                    ProviderSelectionUiAction.APPLY_PROVIDER -> {
+                        viewModel.setApiProvider(provider) { _, changed ->
+                            showRestartHint = changed && viewModel.isGatewayActive
+                        }
+                    }
+                }
             },
             onDismiss = { showProviderDialog = false },
         )
     }
 
+    if (showOpenAiConnectionModeDialog) {
+        OpenAiConnectionModeDialog(
+            items = buildOpenAiConnectionModeUiItems(
+                activeMode = openAiConnectionMode,
+                isCodexAuthenticated = isCodexAuthenticated,
+                isCodexAuthInProgress = isCodexAuthInProgress,
+                isApiKeyConfigured = openAiApiKeyConfigured,
+            ),
+            isTransitionPending = openAiConnectionTransition.isPending,
+            onSelectMode = { targetMode ->
+                showOpenAiConnectionModeDialog = false
+                viewModel.setOpenAiConnectionMode(
+                    targetMode = targetMode,
+                    onResult = handleOpenAiModeSelectionResult,
+                )
+            },
+            onDismiss = { showOpenAiConnectionModeDialog = false },
+        )
+    }
+
     // ── API Key Input Dialog ──
     if (showApiKeyDialog) {
-        val dialogProvider = apiKeyDialogProviderOverride ?: apiProvider
+        val dialogProvider = apiKeyDialogProviderOverride ?: canonicalApiProvider
         ApiKeyInputDialog(
-            currentKey = apiKeyDialogCurrentKeyOverride ?: if (dialogProvider == apiProvider) apiKey else "",
+            currentKey = apiKeyDialogCurrentKeyOverride
+                ?: if (dialogProvider == canonicalApiProvider) apiKey else "",
             provider = dialogProvider,
             currentBaseUrl = customProviderBaseUrl(
                 provider = dialogProvider,
@@ -1233,12 +1550,28 @@ fun SettingsScreen(
                 selectedModel = selectedModel,
             ),
             onSave = { key ->
-                if (dialogProvider == apiProvider) {
-                    viewModel.setApiKey(key) { _, changed ->
+                if (dialogProvider == "openai" && dialogProvider != canonicalApiProvider) {
+                    viewModel.setApiKeyForProvider(
+                        provider = dialogProvider,
+                        key = key,
+                        onError = viewModel::reportOpenAiConnectionTransitionError,
+                    ) { _, _ ->
+                        viewModel.retryRequestedOpenAiConnectionMode(handleOpenAiModeSelectionResult)
+                    }
+                } else if (dialogProvider == canonicalApiProvider) {
+                    viewModel.setApiKey(
+                        key = key,
+                        onError = viewModel::reportOpenAiConnectionTransitionError,
+                    ) { _, changed ->
                         showRestartHint = changed && viewModel.isGatewayActive
+                        viewModel.retryRequestedOpenAiConnectionMode(handleOpenAiModeSelectionResult)
                     }
                 } else {
-                    viewModel.setApiKeyForProvider(dialogProvider, key) { _, changed ->
+                    viewModel.setApiKeyForProvider(
+                        provider = dialogProvider,
+                        key = key,
+                        onError = viewModel::reportOpenAiConnectionTransitionError,
+                    ) { _, changed ->
                         showRestartHint = changed && viewModel.isGatewayActive
                     }
                 }
@@ -1572,7 +1905,12 @@ fun SettingsScreen(
 
     if (showRestartHint) {
         AlertDialog(
-            onDismissRequest = { showRestartHint = false },
+            onDismissRequest = {
+                showRestartHint = false
+                if (openAiConnectionTransition.isPending) {
+                    viewModel.cancelPendingOpenAiConnectionMode()
+                }
+            },
             shape = RoundedCornerShape(24.dp),
             text = { Text(stringResource(R.string.settings_restart_confirm_message)) },
             confirmButton = {
@@ -1586,7 +1924,14 @@ fun SettingsScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showRestartHint = false }) {
+                TextButton(
+                    onClick = {
+                        showRestartHint = false
+                        if (openAiConnectionTransition.isPending) {
+                            viewModel.cancelPendingOpenAiConnectionMode()
+                        }
+                    },
+                ) {
                     Text(stringResource(R.string.settings_restart_confirm_no))
                 }
             },
@@ -2164,14 +2509,25 @@ fun SettingsScreen(
         )
     }
 
-    channelDisconnectError?.let { error ->
+    resolveSettingsError(
+        channelDisconnectError = channelDisconnectError,
+        openAiConnectionTransitionFailure = openAiConnectionTransition.failure,
+    )?.let { observedError ->
+        val consumeError = {
+            when (observedError) {
+                is SettingsErrorUiState.ChannelDisconnect ->
+                    viewModel.consumeChannelDisconnectError()
+                is SettingsErrorUiState.OpenAiTransition ->
+                    viewModel.consumeOpenAiConnectionTransitionError(observedError.failure)
+            }
+        }
         AlertDialog(
-            onDismissRequest = { viewModel.consumeChannelDisconnectError() },
+            onDismissRequest = consumeError,
             shape = RoundedCornerShape(24.dp),
             title = { Text(stringResource(R.string.dashboard_status_error)) },
-            text = { Text(error, style = MaterialTheme.typography.bodyMedium) },
+            text = { Text(observedError.message, style = MaterialTheme.typography.bodyMedium) },
             confirmButton = {
-                TextButton(onClick = { viewModel.consumeChannelDisconnectError() }) {
+                TextButton(onClick = consumeError) {
                     Text(stringResource(android.R.string.ok))
                 }
             },
@@ -2418,12 +2774,14 @@ internal fun formatCanonicalSelectedModelId(
     provider: String,
     modelId: String,
 ): String {
-    val trimmedProvider = provider.trim().lowercase(Locale.US)
+    val canonicalProvider = canonicalSettingsProviderId(provider)
     val trimmedModelId = modelId.trim()
     if (trimmedModelId.isBlank()) return ""
-    return when (trimmedProvider) {
+    return when (canonicalProvider) {
+        "openai" -> PreferencesManager.canonicalizeModelId("openai", trimmedModelId)
         "openai-compatible" -> trimmedModelId.removePrefix("openai-compatible/").trim()
-        "ollama", "ollama-cloud" -> trimmedModelId.removePrefix("ollama/").removePrefix("ollama-cloud/").trim()
+        "ollama", "ollama-cloud" ->
+            trimmedModelId.removePrefix("ollama/").removePrefix("ollama-cloud/").trim()
         else -> trimmedModelId
     }
 }
@@ -2432,18 +2790,19 @@ internal fun formatSelectedModelLabel(
     provider: String,
     modelId: String,
 ): String {
-    val canonicalModelId = formatCanonicalSelectedModelId(provider, modelId)
-    return when (provider.trim().lowercase(Locale.US)) {
+    val canonicalProvider = canonicalSettingsProviderId(provider)
+    val canonicalModelId = formatCanonicalSelectedModelId(canonicalProvider, modelId)
+    return when (canonicalProvider) {
         "openrouter" -> canonicalModelId.removePrefix("openrouter/")
         "anthropic" -> canonicalModelId.removePrefix("anthropic/")
-        "openai" -> canonicalModelId.removePrefix("openai/")
-        "openai-codex" -> canonicalModelId.removePrefix("openai-codex/")
+        "openai" -> canonicalModelId
         "github-copilot" -> canonicalModelId.removePrefix("github-copilot/")
         "google" -> canonicalModelId.removePrefix("google/")
         "zai" -> canonicalModelId.removePrefix("zai/")
         "kimi-coding" -> canonicalModelId.removePrefix("kimi-coding/")
         "minimax" -> canonicalModelId.removePrefix("minimax/")
-        "ollama", "ollama-cloud" -> canonicalModelId.removePrefix("ollama/").removePrefix("ollama-cloud/")
+        "ollama", "ollama-cloud" ->
+            canonicalModelId.removePrefix("ollama/").removePrefix("ollama-cloud/")
         else -> canonicalModelId
     }
 }
@@ -2755,28 +3114,28 @@ private fun ProviderSelectionDialog(
     onSelectProvider: (String) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val providers = listOf(
-        "openrouter" to stringResource(R.string.onboarding_provider_openrouter),
-        "anthropic" to stringResource(R.string.onboarding_provider_anthropic),
-        "openai" to stringResource(R.string.settings_provider_openai_api),
-        "openai-codex" to stringResource(R.string.settings_provider_openai_codex),
-        "github-copilot" to stringResource(R.string.onboarding_provider_github_copilot),
-        "google" to stringResource(R.string.onboarding_provider_google),
-        "zai" to stringResource(R.string.onboarding_provider_zai),
-        "kimi-coding" to stringResource(R.string.onboarding_provider_kimi_coding),
-        "minimax" to stringResource(R.string.onboarding_provider_minimax),
-        "ollama" to stringResource(R.string.onboarding_provider_ollama),
-        "ollama-cloud" to stringResource(R.string.onboarding_provider_ollama_cloud),
-        "openai-compatible" to stringResource(R.string.onboarding_provider_openai_compatible),
-    )
-
     AlertDialog(
         onDismissRequest = onDismiss,
         shape = RoundedCornerShape(24.dp),
         title = { Text(stringResource(R.string.settings_change_provider)) },
         text = {
             Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
-                providers.forEach { (id, label) ->
+                SETTINGS_PROVIDER_IDS.forEach { id ->
+                    val label = when (id) {
+                        "openrouter" -> stringResource(R.string.onboarding_provider_openrouter)
+                        "anthropic" -> stringResource(R.string.onboarding_provider_anthropic)
+                        "openai" -> stringResource(R.string.settings_memory_search_provider_openai)
+                        "github-copilot" -> stringResource(R.string.onboarding_provider_github_copilot)
+                        "google" -> stringResource(R.string.onboarding_provider_google)
+                        "zai" -> stringResource(R.string.onboarding_provider_zai)
+                        "kimi-coding" -> stringResource(R.string.onboarding_provider_kimi_coding)
+                        "minimax" -> stringResource(R.string.onboarding_provider_minimax)
+                        "ollama" -> stringResource(R.string.onboarding_provider_ollama)
+                        "ollama-cloud" -> stringResource(R.string.onboarding_provider_ollama_cloud)
+                        "openai-compatible" ->
+                            stringResource(R.string.onboarding_provider_openai_compatible)
+                        else -> id
+                    }
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -2793,6 +3152,94 @@ private fun ProviderSelectionDialog(
                         Text(
                             text = label,
                             style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.settings_api_key_cancel))
+            }
+        },
+    )
+}
+
+@StringRes
+internal fun openAiConnectionModeTitle(mode: OpenAiConnectionMode): Int = when (mode) {
+    OpenAiConnectionMode.CODEX_SUBSCRIPTION -> R.string.settings_openai_codex_subscription
+    OpenAiConnectionMode.PLATFORM_API_KEY -> R.string.settings_openai_platform_api_key
+}
+
+@StringRes
+internal fun openAiConnectionModeDescription(mode: OpenAiConnectionMode): Int = when (mode) {
+    OpenAiConnectionMode.CODEX_SUBSCRIPTION -> R.string.settings_openai_codex_subscription_desc
+    OpenAiConnectionMode.PLATFORM_API_KEY -> R.string.settings_openai_platform_api_key_desc
+}
+
+@Composable
+private fun OpenAiConnectionModeDialog(
+    items: List<OpenAiConnectionModeUiItem>,
+    isTransitionPending: Boolean,
+    onSelectMode: (OpenAiConnectionMode) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        shape = RoundedCornerShape(24.dp),
+        title = { Text(stringResource(R.string.settings_openai_connection_method)) },
+        text = {
+            Column {
+                items.forEachIndexed { index, item ->
+                    val enabled = !isTransitionPending
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = enabled) { onSelectMode(item.mode) }
+                            .heightIn(min = 72.dp)
+                            .padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(
+                            selected = item.isCurrent,
+                            enabled = enabled,
+                            onClick = { onSelectMode(item.mode) },
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = stringResource(openAiConnectionModeTitle(item.mode)),
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                text = stringResource(openAiConnectionModeDescription(item.mode)),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Text(
+                                text = when (item.credentialStatus) {
+                                    OpenAiCredentialUiStatus.CONFIGURED ->
+                                        stringResource(R.string.settings_connection_status_connected)
+                                    OpenAiCredentialUiStatus.NOT_CONFIGURED ->
+                                        stringResource(R.string.settings_connection_status_not_connected)
+                                    OpenAiCredentialUiStatus.IN_PROGRESS ->
+                                        stringResource(R.string.settings_codex_oauth_signing_in)
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = when (item.credentialStatus) {
+                                    OpenAiCredentialUiStatus.CONFIGURED ->
+                                        MaterialTheme.colorScheme.primary
+                                    OpenAiCredentialUiStatus.NOT_CONFIGURED ->
+                                        MaterialTheme.colorScheme.error
+                                    OpenAiCredentialUiStatus.IN_PROGRESS ->
+                                        MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                            )
+                        }
+                    }
+                    if (index < items.lastIndex) {
+                        HorizontalDivider(
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
                         )
                     }
                 }
@@ -2855,7 +3302,7 @@ private fun MemorySearchProviderDialog(
 }
 
 internal fun shouldUseApiKeyDialog(provider: String): Boolean {
-    return provider != "openai-codex" && provider != "github-copilot"
+    return canonicalSettingsProviderId(provider) != "github-copilot"
 }
 
 @Composable
@@ -2878,11 +3325,10 @@ private fun ApiKeyInputDialog(
     val isOllama = provider == "ollama"
     val isCustomProvider = isOpenAiCompatible || isOllama
     val needsModelIdInput = isOpenAiCompatible
-    val providerDisplayName = when (provider) {
+    val providerDisplayName = when (canonicalSettingsProviderId(provider)) {
         "openrouter" -> stringResource(R.string.onboarding_provider_openrouter)
         "anthropic" -> stringResource(R.string.onboarding_provider_anthropic)
-        "openai" -> stringResource(R.string.settings_provider_openai_api)
-        "openai-codex" -> stringResource(R.string.settings_provider_openai_codex)
+        "openai" -> stringResource(R.string.settings_memory_search_provider_openai)
         "github-copilot" -> stringResource(R.string.onboarding_provider_github_copilot)
         "google" -> stringResource(R.string.onboarding_provider_google)
         "zai" -> stringResource(R.string.onboarding_provider_zai)

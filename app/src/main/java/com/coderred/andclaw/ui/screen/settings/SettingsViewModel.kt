@@ -22,12 +22,14 @@ import com.coderred.andclaw.data.BugReportZipArtifact
 import com.coderred.andclaw.data.BugReportZipWriter
 import com.coderred.andclaw.data.GatewayStatus
 import com.coderred.andclaw.data.OpenRouterModel
+import com.coderred.andclaw.data.OpenAiConnectionMode
 import com.coderred.andclaw.data.PreferencesManager
 import com.coderred.andclaw.data.SelectedModelConfigEntry
 import com.coderred.andclaw.data.SessionLogEntry
 import com.coderred.andclaw.data.SetupState
 import com.coderred.andclaw.data.GlobalDefaultModelOption
 import com.coderred.andclaw.data.transfer.DefaultSettingsTransferManager
+import com.coderred.andclaw.data.transfer.OpenAiCanonicalTransferMigrationAdapter
 import com.coderred.andclaw.data.transfer.SettingsTransferExportRequest
 import com.coderred.andclaw.data.transfer.SettingsTransferExportResult
 import com.coderred.andclaw.data.transfer.SettingsTransferFailureReason
@@ -54,7 +56,13 @@ import com.coderred.andclaw.proroot.ProcessManager
 import com.coderred.andclaw.proroot.ProrootManager
 import com.coderred.andclaw.proroot.WhatsAppLoginCoordinator
 import com.coderred.andclaw.service.GatewayService
+import com.coderred.andclaw.service.OpenAiConnectionTransitionPhase
+import com.coderred.andclaw.service.OpenAiConnectionTransitionFailure
+import com.coderred.andclaw.service.OpenAiConnectionTransitionState
+import com.coderred.andclaw.service.OpenAiConnectionTransitionUiState
+import com.coderred.andclaw.service.isGatewayActiveForOpenAiTransition
 import com.coderred.andclaw.ui.screen.dashboard.WhatsAppQrState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -70,6 +78,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
@@ -96,6 +106,17 @@ class SettingsViewModel(
     private val openClawConfigEditorManagerFactory: (File) -> OpenClawConfigEditorManager =
         { rootfsDir -> OpenClawConfigEditorManager(rootfsDir) },
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val openAiApiKeyWriter: (File, String) -> Unit = { rootfsDir, apiKey ->
+        if (apiKey.isBlank()) {
+            OpenClawAuthProfileStore.removeOpenAiApiKey(rootfsDir)
+        } else {
+            OpenClawAuthProfileStore.writeOpenAiApiKey(rootfsDir, apiKey)
+        }
+    },
+    private val openAiModeTransitionRequester:
+        (Context, OpenAiConnectionMode, String) -> Unit = { context, targetMode, source ->
+            GatewayService.setOpenAiConnectionMode(context, targetMode, source)
+        },
 ) : AndroidViewModel(application) {
 
     constructor(application: Application) : this(application, DefaultSettingsTransferManager())
@@ -109,6 +130,14 @@ class SettingsViewModel(
         val success: Boolean,
         val output: String,
     )
+
+    sealed interface OpenAiModeSelectionResult {
+        data object NoChange : OpenAiModeSelectionResult
+        data object AwaitingRestartConfirmation : OpenAiModeSelectionResult
+        data object TransitionRequested : OpenAiModeSelectionResult
+        data object RequiresCodexLogin : OpenAiModeSelectionResult
+        data object RequiresApiKey : OpenAiModeSelectionResult
+    }
 
     data class OpenClawUpdateResult(
         val success: Boolean,
@@ -594,6 +623,7 @@ class SettingsViewModel(
 
     }
     private val prefs = (application as AndClawApp).preferencesManager
+    private val openAiApiKeyMutex = Mutex()
     private val prorootManager = (application as AndClawApp).prorootManager
     private val processManager = (application as AndClawApp).processManager
     private val setupManager = (application as AndClawApp).setupManager
@@ -612,6 +642,16 @@ class SettingsViewModel(
 
     val apiProvider: StateFlow<String> = prefs.apiProvider
         .stateIn(viewModelScope, SharingStarted.Eagerly, "openrouter")
+
+    val openAiConnectionMode: StateFlow<OpenAiConnectionMode> = prefs.openAiConnectionMode
+        .stateIn(
+            viewModelScope,
+            SharingStarted.Eagerly,
+            OpenAiConnectionMode.CODEX_SUBSCRIPTION,
+        )
+
+    internal val openAiConnectionTransition: StateFlow<OpenAiConnectionTransitionUiState> =
+        OpenAiConnectionTransitionState.state
 
     val apiKey: StateFlow<String> = prefs.apiKey
         .stateIn(viewModelScope, SharingStarted.Eagerly, "")
@@ -803,12 +843,17 @@ class SettingsViewModel(
     private var logUnlockTapCount: Int = 0
     private var lastLogUnlockTapAtMs: Long = 0L
     private var pendingTransferImportArtifact: File? = null
+    private var requestedOpenAiModeAfterCredential: OpenAiConnectionMode? = null
 
     init {
         viewModelScope.launch(ioDispatcher) {
             prefs.backfillSelectedModelProviderIfMissing()
             val provider = prefs.apiProvider.first()
-            if (provider == "openai-codex") {
+            val openAiMode = prefs.openAiConnectionMode.first()
+            if (
+                provider == "openai" &&
+                openAiMode == OpenAiConnectionMode.CODEX_SUBSCRIPTION
+            ) {
                 _isCodexAuthenticated.value = detectCodexAuth()
             } else if (provider == "github-copilot") {
                 refreshGitHubCopilotAuthStatusInternal()
@@ -1035,6 +1080,9 @@ class SettingsViewModel(
         provider: String,
         onApplied: ((appliedProvider: String, changed: Boolean) -> Unit)? = null,
     ) {
+        require(provider !in setOf("openai", "openai-codex", "codex")) {
+            "OpenAI provider changes must use setOpenAiConnectionMode()."
+        }
         viewModelScope.launch(Dispatchers.IO) {
             val previousLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
             val previousProvider = prefs.apiProvider.first()
@@ -1052,9 +1100,7 @@ class SettingsViewModel(
                 previous = previousLaunchConfig,
                 current = appliedLaunchConfig,
             )
-            if (appliedProvider == "openai-codex") {
-                refreshCodexAuthStatus()
-            } else if (appliedProvider == "github-copilot") {
+            if (appliedProvider == "github-copilot") {
                 refreshGitHubCopilotAuthStatus()
             }
             if (onApplied != null) {
@@ -1067,23 +1113,36 @@ class SettingsViewModel(
 
     fun setApiKey(
         key: String,
+        onError: ((Throwable) -> Unit)? = null,
         onApplied: ((appliedProvider: String, runtimeChanged: Boolean) -> Unit)? = null,
     ) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val previousLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
-            val provider = prefs.apiProvider.first()
-            prefs.setApiKey(key)
-            syncApiKeyAuthProfile(provider = provider, apiKey = key)
-            val appliedLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
-            persistLaunchConfigIfRunnable(appliedLaunchConfig)
-            val runtimeChanged = hasRuntimeLaunchConfigChanged(
-                previous = previousLaunchConfig,
-                current = appliedLaunchConfig,
-            )
-            if (onApplied != null) {
-                withContext(Dispatchers.Main) {
-                    onApplied(provider, runtimeChanged)
+        viewModelScope.launch(ioDispatcher) {
+            try {
+                val previousLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
+                val provider = prefs.apiProvider.first()
+                if (provider.normalizedApiKeyProvider() == "openai") {
+                    updateOpenAiApiKeyAtomically(
+                        apiKey = key,
+                        restoreLegacyPreference = true,
+                    ) { prefs.setApiKey(key) }
+                } else {
+                    prefs.setApiKey(key)
+                    syncApiKeyAuthProfile(provider = provider, apiKey = key)
                 }
+                val appliedLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
+                persistLaunchConfigIfRunnable(appliedLaunchConfig)
+                val runtimeChanged = hasRuntimeLaunchConfigChanged(
+                    previous = previousLaunchConfig,
+                    current = appliedLaunchConfig,
+                )
+                if (onApplied != null) {
+                    withContext(Dispatchers.Main) {
+                        onApplied(provider, runtimeChanged)
+                    }
+                }
+            } catch (failure: Throwable) {
+                if (onError == null) throw failure
+                withContext(Dispatchers.Main) { onError(failure) }
             }
         }
     }
@@ -1091,22 +1150,37 @@ class SettingsViewModel(
     fun setApiKeyForProvider(
         provider: String,
         key: String,
+        onError: ((Throwable) -> Unit)? = null,
         onApplied: ((appliedProvider: String, runtimeChanged: Boolean) -> Unit)? = null,
     ) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val previousLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
-            prefs.setApiKeyForProvider(provider = provider, key = key)
-            syncApiKeyAuthProfile(provider = provider, apiKey = key)
-            val appliedLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
-            persistLaunchConfigIfRunnable(appliedLaunchConfig)
-            val runtimeChanged = hasRuntimeLaunchConfigChanged(
-                previous = previousLaunchConfig,
-                current = appliedLaunchConfig,
-            )
-            if (onApplied != null) {
-                withContext(Dispatchers.Main) {
-                    onApplied(provider, runtimeChanged)
+        viewModelScope.launch(ioDispatcher) {
+            try {
+                val previousLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
+                if (provider.normalizedApiKeyProvider() == "openai") {
+                    updateOpenAiApiKeyAtomically(
+                        apiKey = key,
+                        restoreLegacyPreference = false,
+                    ) {
+                        prefs.setApiKeyForProvider(provider = provider, key = key)
+                    }
+                } else {
+                    prefs.setApiKeyForProvider(provider = provider, key = key)
+                    syncApiKeyAuthProfile(provider = provider, apiKey = key)
                 }
+                val appliedLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
+                persistLaunchConfigIfRunnable(appliedLaunchConfig)
+                val runtimeChanged = hasRuntimeLaunchConfigChanged(
+                    previous = previousLaunchConfig,
+                    current = appliedLaunchConfig,
+                )
+                if (onApplied != null) {
+                    withContext(Dispatchers.Main) {
+                        onApplied(provider, runtimeChanged)
+                    }
+                }
+            } catch (failure: Throwable) {
+                if (onError == null) throw failure
+                withContext(Dispatchers.Main) { onError(failure) }
             }
         }
     }
@@ -1235,7 +1309,7 @@ class SettingsViewModel(
         activateProvider: Boolean = true,
         onApplied: ((runtimeChanged: Boolean) -> Unit)? = null,
     ) {
-        viewModelScope.launch(Dispatchers.IO) {
+        viewModelScope.launch(ioDispatcher) {
             val previousLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
             prefs.setOpenAiCompatibleBaseUrl(baseUrl)
             if (activateProvider) {
@@ -1409,36 +1483,111 @@ class SettingsViewModel(
         }
     }
 
-    fun setGptSubscription(
-        useCodexOAuth: Boolean,
-        onApplied: ((appliedProvider: String, changed: Boolean) -> Unit)? = null,
+    fun setOpenAiConnectionMode(
+        targetMode: OpenAiConnectionMode,
+        onResult: ((OpenAiModeSelectionResult) -> Unit)? = null,
     ) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val provider = if (useCodexOAuth) "openai-codex" else "openai"
-            val previousLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
-
-            prefs.setApiProvider(provider)
-            promoteGptSubscriptionModelSelection(provider)
-            val appliedProvider = prefs.apiProvider.first()
-            val appliedLaunchConfig = prefs.getGatewayLaunchConfigSnapshot()
-            persistLaunchConfigIfRunnable(appliedLaunchConfig)
-            val runtimeChanged = hasRuntimeLaunchConfigChanged(
-                previous = previousLaunchConfig,
-                current = appliedLaunchConfig,
+        viewModelScope.launch(ioDispatcher) {
+            val currentMode = prefs.openAiConnectionMode.first()
+            val currentProvider = prefs.apiProvider.first()
+            val inventory = OpenClawAuthProfileStore.inspectCredentialInventory(
+                rootfsDir = prorootManager.rootfsDir,
+                preferenceApiKey = prefs.getApiKeyForProvider("openai"),
             )
-
-            if (useCodexOAuth) {
-                _isCodexAuthenticated.value = detectCodexAuth()
-            } else {
-                val openAiApiKey = prefs.apiKey.first()
-                syncApiKeyAuthProfile(provider = "openai", apiKey = openAiApiKey)
+            val missingCredentialResult = when (targetMode) {
+                OpenAiConnectionMode.CODEX_SUBSCRIPTION ->
+                    if (inventory.hasUsableCodexOAuth) null else OpenAiModeSelectionResult.RequiresCodexLogin
+                OpenAiConnectionMode.PLATFORM_API_KEY ->
+                    if (inventory.hasUsableOpenAiApiKey) null else OpenAiModeSelectionResult.RequiresApiKey
             }
-            if (onApplied != null) {
-                withContext(Dispatchers.Main) {
-                    onApplied(appliedProvider, runtimeChanged)
+            if (missingCredentialResult != null) {
+                requestedOpenAiModeAfterCredential = targetMode
+                onResult?.let { callback ->
+                    withContext(Dispatchers.Main) { callback(missingCredentialResult) }
                 }
+                return@launch
+            }
+            if (
+                currentProvider == "openai" &&
+                currentMode == targetMode &&
+                !OpenAiConnectionTransitionState.state.value.isPending
+            ) {
+                requestedOpenAiModeAfterCredential = null
+                onResult?.let { callback ->
+                    withContext(Dispatchers.Main) { callback(OpenAiModeSelectionResult.NoChange) }
+                }
+                return@launch
+            }
+
+            requestedOpenAiModeAfterCredential = null
+            val gatewayActive = isGatewayActiveForOpenAiTransition(
+                processManager.gatewayState.value.status,
+            )
+            val result = if (gatewayActive) {
+                OpenAiConnectionTransitionState.awaitConfirmation(targetMode)
+                OpenAiModeSelectionResult.AwaitingRestartConfirmation
+            } else {
+                val attemptId = OpenAiConnectionTransitionState.update(
+                    targetMode,
+                    OpenAiConnectionTransitionPhase.STAGING_TARGET,
+                )
+                requestOpenAiModeTransition(
+                    attemptId = attemptId,
+                    targetMode = targetMode,
+                    source = "settings:openai_mode_inactive_apply",
+                )
+                OpenAiModeSelectionResult.TransitionRequested
+            }
+            onResult?.let { callback ->
+                withContext(Dispatchers.Main) { callback(result) }
             }
         }
+    }
+
+    private fun requestOpenAiModeTransition(
+        attemptId: Long,
+        targetMode: OpenAiConnectionMode,
+        source: String,
+    ) {
+        try {
+            openAiModeTransitionRequester(
+                getApplication<Application>(),
+                targetMode,
+                source,
+            )
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (failure: Exception) {
+            val errorMessage = failure.message?.takeIf { it.isNotBlank() } ?: failure.toString()
+            OpenAiConnectionTransitionState.fail(attemptId, errorMessage)
+        }
+    }
+
+    fun retryRequestedOpenAiConnectionMode(
+        onResult: ((OpenAiModeSelectionResult) -> Unit)? = null,
+    ) {
+        val targetMode = requestedOpenAiModeAfterCredential ?: return
+        setOpenAiConnectionMode(targetMode, onResult)
+    }
+
+    fun cancelPendingOpenAiConnectionMode() {
+        if (
+            OpenAiConnectionTransitionState.state.value.phase ==
+            OpenAiConnectionTransitionPhase.AWAITING_CONFIRMATION
+        ) {
+            OpenAiConnectionTransitionState.complete()
+        }
+    }
+
+    internal fun consumeOpenAiConnectionTransitionError(
+        observedFailure: OpenAiConnectionTransitionFailure,
+    ) {
+        OpenAiConnectionTransitionState.acknowledgeFailure(observedFailure.failureId)
+    }
+
+    fun reportOpenAiConnectionTransitionError(failure: Throwable) {
+        val errorMessage = failure.message?.takeIf { it.isNotBlank() } ?: failure.toString()
+        OpenAiConnectionTransitionState.fail(errorMessage)
     }
 
     private fun hasRuntimeLaunchConfigChanged(
@@ -1454,72 +1603,6 @@ class SettingsViewModel(
             previous.selectedModelEntries != current.selectedModelEntries
     }
 
-    private suspend fun promoteGptSubscriptionModelSelection(provider: String) {
-        if (provider != "openai" && provider != "openai-codex") return
-
-        val currentSelectedModelIds = prefs.currentProviderSelectedModelIds.first()
-        val savedPrimary = prefs.getEffectivePrimary(provider)?.takeIf { it.isNotBlank() }
-        val (selectedModelIds, targetPrimary, metadataById) = when (provider) {
-            "openai-codex" -> {
-                val installedCodexModels = resolveCodexModelsFromInstalledBundle()
-                val installedCodexModelsByNormalizedId = installedCodexModels.associateBy {
-                    normalizeCodexModelIdForComparison(it.id)
-                }
-                val targetPrimary = savedPrimary
-                    ?: OpenClawCodexModelScope.bareModelId(
-                        resolvePreferredCodexPrimaryModelFromInstalledBundle(installedCodexModels),
-                    )
-                val selectedModelIds = currentSelectedModelIds
-                    .ifEmpty { listOf(targetPrimary) }
-                    .let { modelIds ->
-                        if (modelIds.contains(targetPrimary)) {
-                            modelIds
-                        } else {
-                            listOf(targetPrimary) + modelIds
-                        }
-                    }
-                    .distinct()
-                val metadataById = selectedModelIds.mapNotNull { modelId ->
-                    val installedModel = installedCodexModelsByNormalizedId[normalizeCodexModelIdForComparison(modelId)]
-                        ?: return@mapNotNull null
-                    modelId to SelectedModelConfigEntry(
-                        id = modelId,
-                        supportsReasoning = installedModel.supportsReasoning,
-                        supportsImages = installedModel.supportsImages,
-                        contextLength = installedModel.contextLength,
-                        maxOutputTokens = installedModel.maxOutputTokens,
-                    )
-                }.toMap()
-                Triple(selectedModelIds, targetPrimary, metadataById)
-            }
-
-            else -> {
-                val targetPrimary = savedPrimary
-                    ?: defaultBuiltInModels(provider)
-                        .firstOrNull()
-                    ?.id
-                    ?: return
-                val selectedModelIds = currentSelectedModelIds
-                    .ifEmpty { listOf(targetPrimary) }
-                    .let { modelIds ->
-                        if (modelIds.contains(targetPrimary)) {
-                            modelIds
-                        } else {
-                            listOf(targetPrimary) + modelIds
-                        }
-                    }
-                    .distinct()
-                Triple(selectedModelIds, targetPrimary, emptyMap())
-            }
-        }
-
-        prefs.setSelectedModelIds(
-            provider = provider,
-            modelIds = selectedModelIds,
-            primary = targetPrimary,
-            metadataById = metadataById,
-        )
-    }
 
     private fun normalizeCodexModelIdForComparison(modelId: String): String {
         return OpenClawCodexModelScope.bareModelId(modelId)
@@ -1541,6 +1624,7 @@ class SettingsViewModel(
             modelImages = launchConfig.modelImages,
             modelContext = launchConfig.modelContext,
             modelMaxOutput = launchConfig.modelMaxOutput,
+            openAiConnectionMode = launchConfig.openAiConnectionMode,
         )
     }
 
@@ -1551,11 +1635,13 @@ class SettingsViewModel(
                 status == GatewayStatus.STARTING ||
                 status == GatewayStatus.ERROR
 
+            val openAiMode = prefs.openAiConnectionMode.first()
             val shouldShow = when {
                 !isGatewayActive -> false
                 provider == "openai-compatible" -> true
                 provider == "ollama" -> true
-                provider == "openai-codex" -> detectCodexAuth()
+                provider in setOf("openai", "openai-codex") &&
+                    openAiMode == OpenAiConnectionMode.CODEX_SUBSCRIPTION -> detectCodexAuth()
                 provider == "github-copilot" -> detectGitHubCopilotAuth()
                 else -> prefs.hasApiKeyForProvider(provider)
             }
@@ -2131,6 +2217,7 @@ class SettingsViewModel(
                 rootfsDir = rootfsDir,
                 preferencesRestorer = createTransferPreferencesRestorer(),
                 gatewayController = createTransferGatewayController(app),
+                canonicalMigration = OpenAiCanonicalTransferMigrationAdapter(prefs, rootfsDir),
                 allowVersionMismatch = allowVersionMismatch,
             )
             val result = transferManager.import(SettingsTransferImportRequest(request = importRequest))
@@ -2570,6 +2657,7 @@ class SettingsViewModel(
                 memorySearchEnabled = launchConfig.memorySearchEnabled,
                 memorySearchProvider = launchConfig.memorySearchProvider,
                 memorySearchApiKey = launchConfig.memorySearchApiKey,
+                openAiConnectionMode = launchConfig.openAiConnectionMode,
             )
         }
         val shouldRestartForMemoryRuntime =
@@ -2606,6 +2694,22 @@ class SettingsViewModel(
     }
 
     fun applyRuntimeLaunchConfigNow() {
+        val pendingTransition = OpenAiConnectionTransitionState.state.value
+        val pendingMode = pendingTransition.pendingMode
+        val attemptId = pendingTransition.attemptId
+        if (pendingMode != null && attemptId != null) {
+            OpenAiConnectionTransitionState.update(
+                attemptId,
+                pendingMode,
+                OpenAiConnectionTransitionPhase.STOPPING_OLD_GATEWAY,
+            )
+            requestOpenAiModeTransition(
+                attemptId = attemptId,
+                targetMode = pendingMode,
+                source = "settings:openai_mode_confirmed",
+            )
+            return
+        }
         viewModelScope.launch(Dispatchers.IO) {
             val launchConfig = prefs.getGatewayLaunchConfigSnapshot()
             val context = getApplication<Application>()
@@ -3078,6 +3182,12 @@ class SettingsViewModel(
                 Log.i(TAG, "Auth flow finished. authenticated=${_isCodexAuthenticated.value}")
                 _isCodexAuthInProgress.value = false
                 codexAuthRunning.set(false)
+                if (
+                    _isCodexAuthenticated.value &&
+                    requestedOpenAiModeAfterCredential == OpenAiConnectionMode.CODEX_SUBSCRIPTION
+                ) {
+                    setOpenAiConnectionMode(OpenAiConnectionMode.CODEX_SUBSCRIPTION)
+                }
             }
         }
     }
@@ -3615,30 +3725,16 @@ class SettingsViewModel(
     }
 
     private fun writeGitHubCopilotCredentials(accessToken: String, profileId: String = "github-copilot:github") {
-        val authFile = File(prorootManager.rootfsDir, "root/.openclaw/agents/main/agent/auth-profiles.json")
-        authFile.parentFile?.mkdirs()
-
-        val root = if (authFile.exists()) {
-            runCatching { JSONObject(authFile.readText()) }.getOrElse { JSONObject() }
-        } else JSONObject()
-
-        if (!root.has("version")) {
-            root.put("version", 1)
-        }
-        val profiles = root.optJSONObject("profiles") ?: JSONObject().also { root.put("profiles", it) }
-        profiles.put(
-            profileId,
-            JSONObject().apply {
+        OpenClawAuthProfileStore.upsertNonOpenAiProfile(
+            rootfsDir = prorootManager.rootfsDir,
+            profileId = profileId,
+            credential = JSONObject().apply {
                 put("type", "token")
                 put("provider", "github-copilot")
                 put("token", accessToken)
             },
+            makeLastGood = true,
         )
-
-        val lastGood = root.optJSONObject("lastGood") ?: JSONObject().also { root.put("lastGood", it) }
-        lastGood.put("github-copilot", profileId)
-
-        authFile.writeText(root.toString(2))
         updateGitHubCopilotProfilePreference(profileId)
     }
 
@@ -3723,36 +3819,19 @@ class SettingsViewModel(
 
     private fun detectCodexAuth(): Boolean {
         return try {
-            // OpenClaw auth profiles
-            val openClawAuthFile = File(prorootManager.rootfsDir, "root/.openclaw/agents/main/agent/auth-profiles.json")
-            if (openClawAuthFile.exists()) {
-                runCatching {
-                    val root = JSONObject(openClawAuthFile.readText())
-                    val profiles = root.optJSONObject("profiles")
-                    val profile = profiles?.optJSONObject("openai-codex:default")
-                        ?: profiles?.optJSONObject("openai:default")
-                    if (profile != null) {
-                        val access = profile.optString("access", "")
-                        val expires = profile.optLong("expires", 0L)
-                        val hasValidExpiry = expires <= 0L || expires > System.currentTimeMillis()
-                        if (access.isNotBlank() && hasValidExpiry) {
-                            return true
-                        }
-                    }
-                }
+            if (OpenClawAuthProfileStore.hasUsableCanonicalCodexOAuth(prorootManager.rootfsDir)) {
+                return true
             }
 
-            // Codex CLI auth file fallback
             val codexAuthFile = File(prorootManager.rootfsDir, "root/.codex/auth.json")
             if (codexAuthFile.exists() && codexAuthFile.readText().contains("chatgpt.com")) {
                 return true
             }
 
-            // CLI 상태 조회 (느린 편이라 마지막 fallback)
             val authStatusCommand = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
                 "openclaw models status --json 2>&1"
             val authStatusOutput = prorootManager.executeAndCapture(authStatusCommand)
-            hasOpenClawModelsStatusAuth(authStatusOutput, "openai-codex")
+            hasOpenClawModelsStatusAuth(authStatusOutput, "openai")
         } catch (_: Exception) {
             false
         }
@@ -3879,62 +3958,95 @@ class SettingsViewModel(
         )
     }
 
-    private fun syncApiKeyAuthProfile(provider: String, apiKey: String) {
-        val normalizedProvider = when (provider.lowercase()) {
+    private fun String.normalizedApiKeyProvider(): String {
+        return when (lowercase()) {
             "openai-codex" -> "openai"
             "ollama-cloud" -> "ollama"
-            else -> provider.lowercase()
+            else -> lowercase()
         }
-        if (normalizedProvider !in setOf("google", "openai", "anthropic", "openrouter", "openai-compatible", "zai", "kimi-coding", "minimax", "ollama")) return
+    }
 
-        runCatching {
-            val profileId = "$normalizedProvider:default"
-            val authFile = File(prorootManager.rootfsDir, "root/.openclaw/agents/main/agent/auth-profiles.json")
-            authFile.parentFile?.mkdirs()
-
-            val root = if (authFile.exists()) {
-                runCatching { JSONObject(authFile.readText()) }.getOrElse { JSONObject() }
-            } else {
-                JSONObject()
-            }
-
-            if (!root.has("version")) {
-                root.put("version", 1)
-            }
-
-            val profiles = root.optJSONObject("profiles") ?: JSONObject().also { root.put("profiles", it) }
-
-            val normalizedKey = if (normalizedProvider == "ollama") {
-                apiKey.ifBlank { "ollama-local" }
-            } else {
-                apiKey
-            }
-
-            if (normalizedKey.isBlank()) {
-                profiles.remove(profileId)
-                root.optJSONObject("lastGood")?.let { lastGood ->
-                    if (lastGood.optString(normalizedProvider) == profileId) {
-                        lastGood.remove(normalizedProvider)
+    private suspend fun updateOpenAiApiKeyAtomically(
+        apiKey: String,
+        restoreLegacyPreference: Boolean,
+        preferenceWrite: suspend () -> Unit,
+    ) {
+        openAiApiKeyMutex.withLock {
+            val oldProviderApiKey = prefs.getApiKeyForProvider("openai")
+            val oldLegacyApiKey = if (restoreLegacyPreference) prefs.apiKey.first() else null
+            val oldAuthSnapshot =
+                OpenClawAuthProfileStore.captureOpenAiApiKeySnapshot(prorootManager.rootfsDir)
+            try {
+                preferenceWrite()
+                openAiApiKeyWriter(prorootManager.rootfsDir, apiKey)
+            } catch (failure: Throwable) {
+                withContext(NonCancellable) {
+                    try {
+                        OpenClawAuthProfileStore.restoreOpenAiApiKeySnapshot(
+                            prorootManager.rootfsDir,
+                            oldAuthSnapshot,
+                        )
+                    } catch (rollbackFailure: Throwable) {
+                        failure.addSuppressed(rollbackFailure)
                     }
-                    if (lastGood.length() == 0) {
-                        root.remove("lastGood")
+                    if (oldLegacyApiKey != null) {
+                        try {
+                            prefs.setApiKeyForProvider(
+                                provider = "openai",
+                                key = oldLegacyApiKey,
+                                updateLegacyKey = true,
+                            )
+                        } catch (rollbackFailure: Throwable) {
+                            failure.addSuppressed(rollbackFailure)
+                        }
+                    }
+                    try {
+                        prefs.setApiKeyForProvider("openai", oldProviderApiKey)
+                    } catch (rollbackFailure: Throwable) {
+                        failure.addSuppressed(rollbackFailure)
                     }
                 }
-            } else {
-                val apiKeyCredential = JSONObject().apply {
+                throw failure
+            }
+        }
+    }
+
+    private fun syncApiKeyAuthProfile(provider: String, apiKey: String) {
+        val normalizedProvider = provider.normalizedApiKeyProvider()
+        if (normalizedProvider !in setOf("google", "openai", "anthropic", "openrouter", "openai-compatible", "zai", "kimi-coding", "minimax", "ollama")) return
+
+        if (normalizedProvider == "openai") {
+            openAiApiKeyWriter(prorootManager.rootfsDir, apiKey)
+            return
+        }
+
+        syncNonOpenAiApiKeyAuthProfile(normalizedProvider, apiKey)
+    }
+
+    private fun syncNonOpenAiApiKeyAuthProfile(normalizedProvider: String, apiKey: String) {
+        val profileId = "$normalizedProvider:default"
+        val normalizedKey = if (normalizedProvider == "ollama") {
+            apiKey.ifBlank { "ollama-local" }
+        } else {
+            apiKey
+        }
+
+        if (normalizedKey.isBlank()) {
+            OpenClawAuthProfileStore.removeNonOpenAiProfile(
+                rootfsDir = prorootManager.rootfsDir,
+                profileId = profileId,
+            )
+        } else {
+            OpenClawAuthProfileStore.upsertNonOpenAiProfile(
+                rootfsDir = prorootManager.rootfsDir,
+                profileId = profileId,
+                credential = JSONObject().apply {
                     put("type", "api_key")
                     put("provider", normalizedProvider)
                     put("key", normalizedKey)
-                }
-                profiles.put(profileId, apiKeyCredential)
-
-                val lastGood = root.optJSONObject("lastGood") ?: JSONObject().also { root.put("lastGood", it) }
-                lastGood.put(normalizedProvider, profileId)
-            }
-
-            authFile.writeText(root.toString(2))
-        }.onFailure { throwable ->
-            Log.w(TAG, "Failed to sync auth profile for provider $normalizedProvider", throwable)
+                },
+                makeLastGood = true,
+            )
         }
     }
 
@@ -4912,7 +5024,8 @@ internal fun canRestartGatewayForRuntimeLaunch(
                 PreferencesManager.isKnownKeylessOpenAiCompatibleBaseUrl(
                     launchConfig.openAiCompatibleBaseUrl,
                 )
-        launchConfig.apiProvider == "openai-codex" -> hasCodexAuth
+        launchConfig.apiProvider == "openai" &&
+            launchConfig.openAiConnectionMode == OpenAiConnectionMode.CODEX_SUBSCRIPTION -> hasCodexAuth
         else -> launchConfig.apiKey.isNotBlank()
     }
 }

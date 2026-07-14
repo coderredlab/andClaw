@@ -234,6 +234,13 @@
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">Войти в Codex</string>
     <string name="settings_codex_oauth_signing_in">Выполняется вход…</string>
+    <string name="settings_openai_connection_method">Способ подключения к OpenAI</string>
+    <string name="settings_openai_codex_subscription">Подписка ChatGPT/Codex (OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">Использует лимит вашей подписки ChatGPT.</string>
+    <string name="settings_openai_platform_api_key">Ключ API OpenAI Platform</string>
+    <string name="settings_openai_platform_api_key_desc">Использование оплачивается через API OpenAI Platform.</string>
+    <string name="settings_connection_status_connected">Подключено</string>
+    <string name="settings_connection_status_not_connected">Не подключено</string>
     <string name="settings_codex_oauth_reset_title">Сбросить вход в Codex</string>
     <string name="settings_codex_oauth_reset_desc">Удалить сохранённое состояние Codex</string>
     <string name="settings_codex_oauth_reset_confirm_message">Сохранённое состояние входа в Codex будет удалено, чтобы можно было войти снова. Другие поставщики не изменятся.</string>

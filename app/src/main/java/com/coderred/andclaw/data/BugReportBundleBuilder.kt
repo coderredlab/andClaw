@@ -7,6 +7,9 @@ import android.os.Build
 import com.coderred.andclaw.BuildConfig
 import com.coderred.andclaw.proroot.OpenClawPluginInstallStateStore
 import java.io.File
+import java.io.RandomAccessFile
+import java.nio.charset.StandardCharsets
+import java.util.ArrayDeque
 import java.util.Locale
 
 data class BugReportBundle(
@@ -71,15 +74,17 @@ object BugReportBundleBuilder {
             if (!file.isFile) return@forEach
 
             lines += "[andClaw][RuntimeFile] ${spec.displayPath}"
-            file.useLines { sequence ->
-                sanitizeSupplementalRuntimeLines(
-                    sequence.map { it.trimEnd() }.toList(),
-                    spec,
-                ).asSequence()
-                    .filter { it.isNotBlank() }
-                    .take(MAX_SUPPLEMENTAL_RUNTIME_LOG_LINES_PER_FILE)
-                    .forEach(lines::add)
-            }
+            sanitizeSupplementalRuntimeLines(
+                readTextFileLinesBounded(
+                    file = file,
+                    maxBytes = MAX_SUPPLEMENTAL_RUNTIME_FILE_BYTES,
+                    maxLines = MAX_SUPPLEMENTAL_RUNTIME_LOG_LINES_PER_FILE,
+                    fromEnd = spec.sanitizeMode == SupplementalRuntimeSanitizeMode.OPENCLAW_LOG_TAIL,
+                ),
+                spec,
+            ).asSequence()
+                .filter { it.isNotBlank() }
+                .forEach(lines::add)
         }
 
         OpenClawPluginInstallStateStore.readDiagnostic(rootfsDir)?.let { diagnostic ->
@@ -179,6 +184,62 @@ private const val MAX_GATEWAY_LOG_LINE_LENGTH = 500
 private const val MAX_SUPPLEMENTAL_RUNTIME_LOG_LINES_PER_FILE = 200
 private const val MAX_OPENCLAW_RUNTIME_LOG_FILES = 2
 private const val PROROOT_PRESERVE_KEYWORD = "proroot"
+private const val MAX_SUPPLEMENTAL_RUNTIME_FILE_BYTES = 1024 * 1024
+
+internal fun readTextFileLinesBounded(
+    file: File,
+    maxBytes: Int,
+    maxLines: Int,
+    fromEnd: Boolean,
+): List<String> {
+    require(maxBytes > 0)
+    require(maxLines > 0)
+    if (!file.isFile) return emptyList()
+
+    val fileLength = file.length()
+    if (fileLength <= 0L) return emptyList()
+
+    val bytesToRead = minOf(fileLength, maxBytes.toLong()).toInt()
+    val startOffset = if (fromEnd) fileLength - bytesToRead else 0L
+    val bytes = ByteArray(bytesToRead)
+    var dropsLeadingPartialLine = false
+
+    RandomAccessFile(file, "r").use { input ->
+        if (fromEnd && startOffset > 0L) {
+            input.seek(startOffset - 1L)
+            val previousByte = input.read()
+            dropsLeadingPartialLine = previousByte != '\n'.code && previousByte != '\r'.code
+        }
+        input.seek(startOffset)
+        input.readFully(bytes)
+    }
+
+    val lines = String(bytes, StandardCharsets.UTF_8).lineSequence().iterator()
+    val endsWithLineBreak = bytes.last() == '\n'.code.toByte() || bytes.last() == '\r'.code.toByte()
+    if (!fromEnd) {
+        val head = ArrayList<String>(maxLines)
+        while (lines.hasNext() && head.size < maxLines) {
+            val line = lines.next()
+            if (endsWithLineBreak && line.isEmpty() && !lines.hasNext()) break
+            head += line
+        }
+        return head
+    }
+
+    if (dropsLeadingPartialLine && lines.hasNext()) {
+        lines.next()
+    }
+    val tail = ArrayDeque<String>(maxLines)
+    while (lines.hasNext()) {
+        val line = lines.next()
+        if (endsWithLineBreak && line.isEmpty() && !lines.hasNext()) break
+        if (tail.size == maxLines) {
+            tail.removeFirst()
+        }
+        tail.addLast(line)
+    }
+    return tail.toList()
+}
 
 private enum class SupplementalRuntimeBase { ROOTFS, ROOTFS_PARENT }
 
@@ -277,15 +338,28 @@ private fun sanitizeSupplementalRuntimeFileContent(
     file: File,
     spec: SupplementalRuntimeLogSpec,
 ): String {
-    return when (spec.sanitizeMode) {
-        SupplementalRuntimeSanitizeMode.NONE -> file.readText()
-        SupplementalRuntimeSanitizeMode.LAUNCHER_POSTMORTEM -> file.useLines { sequence ->
-            sanitizeSupplementalRuntimeLines(sequence.toList(), spec).joinToString("\n")
-        }
-        SupplementalRuntimeSanitizeMode.OPENCLAW_LOG_TAIL -> file.useLines { sequence ->
-            sanitizeSupplementalRuntimeLines(sequence.toList(), spec).joinToString("\n", postfix = "\n")
-        }
+    val lines = sanitizeSupplementalRuntimeLines(
+        readTextFileLinesBounded(
+            file = file,
+            maxBytes = MAX_SUPPLEMENTAL_RUNTIME_FILE_BYTES,
+            maxLines = MAX_SUPPLEMENTAL_RUNTIME_LOG_LINES_PER_FILE,
+            fromEnd = spec.sanitizeMode == SupplementalRuntimeSanitizeMode.OPENCLAW_LOG_TAIL,
+        ),
+        spec,
+    )
+    val postfix = when {
+        spec.sanitizeMode == SupplementalRuntimeSanitizeMode.OPENCLAW_LOG_TAIL -> "\n"
+        file.inputStream().use { input ->
+            if (file.length() <= 0L) {
+                false
+            } else {
+                input.skip(file.length() - 1L)
+                input.read() in listOf('\n'.code, '\r'.code)
+            }
+        } -> "\n"
+        else -> ""
     }
+    return lines.joinToString("\n", postfix = postfix)
 }
 
 private fun sanitizeSupplementalRuntimeLines(

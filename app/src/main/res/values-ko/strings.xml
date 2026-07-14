@@ -245,6 +245,13 @@
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">Codex 로그인</string>
     <string name="settings_codex_oauth_signing_in">로그인 중…</string>
+    <string name="settings_openai_connection_method">OpenAI 연결 방식</string>
+    <string name="settings_openai_codex_subscription">ChatGPT/Codex 구독(OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">ChatGPT 구독에 포함된 사용량을 이용합니다.</string>
+    <string name="settings_openai_platform_api_key">OpenAI Platform API 키</string>
+    <string name="settings_openai_platform_api_key_desc">OpenAI Platform API 사용량에 따라 요금이 청구됩니다.</string>
+    <string name="settings_connection_status_connected">연결됨</string>
+    <string name="settings_connection_status_not_connected">연결되지 않음</string>
     <string name="settings_codex_oauth_reset_title">Codex 로그인 초기화</string>
     <string name="settings_codex_oauth_reset_desc">저장된 로그인 상태 삭제</string>
     <string name="settings_codex_oauth_reset_confirm_message">저장된 Codex 로그인 상태를 삭제하여 다시 로그인할 수 있도록 합니다. 다른 제공자 설정은 변경되지 않습니다.</string>

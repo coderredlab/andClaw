@@ -234,6 +234,13 @@ Gagal: %2$d</string>
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">Masuk ke Codex</string>
     <string name="settings_codex_oauth_signing_in">Sedang masuk…</string>
+    <string name="settings_openai_connection_method">Metode koneksi OpenAI</string>
+    <string name="settings_openai_codex_subscription">Langganan ChatGPT/Codex (OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">Menggunakan kuota langganan ChatGPT Anda.</string>
+    <string name="settings_openai_platform_api_key">Kunci API OpenAI Platform</string>
+    <string name="settings_openai_platform_api_key_desc">Penggunaan ditagihkan melalui API OpenAI Platform.</string>
+    <string name="settings_connection_status_connected">Terhubung</string>
+    <string name="settings_connection_status_not_connected">Tidak terhubung</string>
     <string name="settings_codex_oauth_reset_title">Reset login Codex</string>
     <string name="settings_codex_oauth_reset_desc">Hapus status Codex tersimpan</string>
     <string name="settings_codex_oauth_reset_confirm_message">Status login Codex yang tersimpan akan dihapus agar login ulang dapat dilakukan. Penyedia lain tidak berubah.</string>

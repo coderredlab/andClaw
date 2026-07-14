@@ -234,6 +234,13 @@
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">Codex में साइन इन करें</string>
     <string name="settings_codex_oauth_signing_in">साइन इन किया जा रहा है…</string>
+    <string name="settings_openai_connection_method">OpenAI कनेक्शन का तरीका</string>
+    <string name="settings_openai_codex_subscription">ChatGPT/Codex सदस्यता (OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">आपकी ChatGPT सदस्यता में उपलब्ध उपयोग सीमा का इस्तेमाल करता है।</string>
+    <string name="settings_openai_platform_api_key">OpenAI Platform API कुंजी</string>
+    <string name="settings_openai_platform_api_key_desc">उपयोग का शुल्क OpenAI Platform API के माध्यम से लिया जाता है।</string>
+    <string name="settings_connection_status_connected">कनेक्टेड</string>
+    <string name="settings_connection_status_not_connected">कनेक्ट नहीं है</string>
     <string name="settings_codex_oauth_reset_title">Codex साइन-इन रीसेट करें</string>
     <string name="settings_codex_oauth_reset_desc">सहेजी गई Codex स्थिति हटाएं</string>
     <string name="settings_codex_oauth_reset_confirm_message">सहेजी गई Codex साइन-इन स्थिति हटाई जाएगी ताकि फिर से साइन इन किया जा सके। अन्य प्रदाता अपरिवर्तित रहेंगे।</string>

@@ -235,6 +235,13 @@
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">Codex にログイン</string>
     <string name="settings_codex_oauth_signing_in">ログイン中…</string>
+    <string name="settings_openai_connection_method">OpenAI の接続方法</string>
+    <string name="settings_openai_codex_subscription">ChatGPT/Codex サブスクリプション（OAuth）</string>
+    <string name="settings_openai_codex_subscription_desc">ChatGPT サブスクリプションの利用枠を使用します。</string>
+    <string name="settings_openai_platform_api_key">OpenAI Platform API キー</string>
+    <string name="settings_openai_platform_api_key_desc">OpenAI Platform API の利用料金が発生します。</string>
+    <string name="settings_connection_status_connected">接続済み</string>
+    <string name="settings_connection_status_not_connected">未接続</string>
     <string name="settings_codex_oauth_reset_title">Codex ログインをリセット</string>
     <string name="settings_codex_oauth_reset_desc">保存済み Codex 状態を削除</string>
     <string name="settings_codex_oauth_reset_confirm_message">保存済みの Codex ログイン状態を削除し、再ログインできるようにします。他のプロバイダー設定は変更されません。</string>

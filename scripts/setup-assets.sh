@@ -32,10 +32,11 @@ ASSETS_DIR="$PROJECT_DIR/install_time_assets/src/main/assets"
 
 # URLs & Versions
 ROOTFS_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.3-base-arm64.tar.gz"
-NODEJS_VERSION="v24.2.0"
+NODEJS_VERSION="v24.18.0"
 NODEJS_URL="https://nodejs.org/dist/$NODEJS_VERSION/node-$NODEJS_VERSION-linux-arm64.tar.gz"
 PLAYWRIGHT_VERSION="1.49.1"
 BUNDLE_FINGERPRINT_NEEDS_UPDATE="false"
+FORCE_OPENCLAW_REBUILD="${FORCE_OPENCLAW_REBUILD:-false}"
 
 echo "============================================"
 echo "  andClaw - 빌드 준비 (assets 번들)"
@@ -352,7 +353,9 @@ OPENCLAW_LATEST_VERSION="$(get_openclaw_latest_version 2>/dev/null || true)"
 OPENCLAW_BUILD_REASON=""
 OPENCLAW_WAS_REBUILT="false"
 
-if [ ! -f "$OPENCLAW_TAR" ]; then
+if [ "$FORCE_OPENCLAW_REBUILD" = "true" ]; then
+    OPENCLAW_BUILD_REASON="강제 재빌드 요청"
+elif [ ! -f "$OPENCLAW_TAR" ]; then
     OPENCLAW_BUILD_REASON="tar.gz.bin 파일 없음"
 elif [ -n "$OPENCLAW_ASSET_VERSION" ] && [ -n "$OPENCLAW_LATEST_VERSION" ] && version_lt "$OPENCLAW_ASSET_VERSION" "$OPENCLAW_LATEST_VERSION"; then
     OPENCLAW_BUILD_REASON="버전 업그레이드 필요 ($OPENCLAW_ASSET_VERSION -> $OPENCLAW_LATEST_VERSION)"
@@ -360,7 +363,7 @@ elif [ -z "$OPENCLAW_LATEST_VERSION" ]; then
     echo "[4/6] WARNING: openclaw 최신 버전 조회 실패, 기존 자산 버전을 유지합니다"
 fi
 
-if [ -n "$OPENCLAW_BUILD_REASON" ] && [ -f "$OPENCLAW_CACHE_ARCHIVE" ]; then
+if [ "$FORCE_OPENCLAW_REBUILD" != "true" ] && [ -n "$OPENCLAW_BUILD_REASON" ] && [ -f "$OPENCLAW_CACHE_ARCHIVE" ]; then
     if restore_openclaw_from_cache; then
         OPENCLAW_ASSET_VERSION="$(extract_openclaw_version_from_tar "$OPENCLAW_TAR" 2>/dev/null || true)"
         rm -rf "$OPENCLAW_TEMP_DIR"/* 2>/dev/null || true
@@ -453,7 +456,7 @@ NODE
 
         echo '--- Installing andClaw-managed external/runtime plugins ---'
         OPENCLAW_ASSET_VERSION=\"\$(node -e 'console.log(require(\"/usr/local/lib/node_modules/openclaw/package.json\").version)')\"
-        ANDCLAW_BUNDLED_PLUGINS=\"@openclaw/whatsapp@\$OPENCLAW_ASSET_VERSION @openclaw/discord@\$OPENCLAW_ASSET_VERSION @openclaw/codex@\$OPENCLAW_ASSET_VERSION\"
+        ANDCLAW_BUNDLED_PLUGINS=\"@openclaw/whatsapp@\$OPENCLAW_ASSET_VERSION @openclaw/discord@\$OPENCLAW_ASSET_VERSION @openclaw/codex@\$OPENCLAW_ASSET_VERSION @openclaw/brave-plugin@\$OPENCLAW_ASSET_VERSION @openclaw/zai-provider@\$OPENCLAW_ASSET_VERSION\"
         ANDCLAW_BUNDLED_PLUGIN_ROOT=/root/.openclaw/andclaw-bundled-plugins
         ANDCLAW_BUNDLED_PLUGIN_NPM_ROOT=/root/.openclaw/andclaw-bundled-plugins/npm
         rm -rf \"\$ANDCLAW_BUNDLED_PLUGIN_ROOT\"
@@ -465,6 +468,12 @@ NODE
             \$ANDCLAW_BUNDLED_PLUGINS
         rm -rf \"\$ANDCLAW_BUNDLED_PLUGIN_NPM_ROOT/node_modules/openclaw\"
         ln -s ../../../../../usr/local/lib/node_modules/openclaw \"\$ANDCLAW_BUNDLED_PLUGIN_NPM_ROOT/node_modules/openclaw\"
+        for plugin_package in whatsapp discord codex brave-plugin zai-provider; do
+          plugin_node_modules=\"\$ANDCLAW_BUNDLED_PLUGIN_NPM_ROOT/node_modules/@openclaw/\$plugin_package/node_modules\"
+          mkdir -p \"\$plugin_node_modules\"
+          rm -rf \"\$plugin_node_modules/openclaw\"
+          ln -s ../../../openclaw \"\$plugin_node_modules/openclaw\"
+        done
 
         cat > /tmp/write-andclaw-plugin-install-records.cjs <<'NODE'
 const fs = require('node:fs');
@@ -481,6 +490,8 @@ const { pathToFileURL } = require('node:url');
     { id: 'whatsapp', packageName: '@openclaw/whatsapp' },
     { id: 'discord', packageName: '@openclaw/discord' },
     { id: 'codex', packageName: '@openclaw/codex' },
+    { id: 'brave', packageName: '@openclaw/brave-plugin' },
+    { id: 'zai', packageName: '@openclaw/zai-provider' },
   ];
   const installRecords = {};
 
@@ -609,6 +620,15 @@ NODE
         [ "$(basename "${pd%/}")" != "linux_arm64" ] && rm -rf "$pd" && echo "   [prune] removing koffi platform: $(basename "${pd%/}")"
       done
     fi
+    # Codex는 Android arm64에서 실행하므로 다른 OS/아키텍처 바이너리는 번들에서 제거
+    CODEX_PLATFORM_DIR="./root/.openclaw/andclaw-bundled-plugins/npm/node_modules/@openclaw/codex/node_modules/@openai"
+    for d in "$CODEX_PLATFORM_DIR"/codex-*; do
+      [ -d "$d" ] || continue
+      b=$(basename "$d")
+      [ "$b" = "codex-linux-arm64" ] && continue
+      echo "   [prune] removing Codex platform package: @openai/$b"
+      rm -rf "$d"
+    done
     # discord extension 내 x64 addon 삭제
     EXT_DIR="./usr/local/lib/node_modules/openclaw/dist/extensions"
     rm -rf "$EXT_DIR/discord/node_modules/@snazzah/davey-linux-x64-gnu" 2>/dev/null || true

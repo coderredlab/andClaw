@@ -1,9 +1,14 @@
 package com.coderred.andclaw.data.transfer
+import com.coderred.andclaw.data.PreferencesManager
+import com.coderred.andclaw.proroot.OpenAiCanonicalMigrationCoordinator
 
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.charset.StandardCharsets
 import java.util.zip.ZipInputStream
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 data class TransferPreferencesRestoreData(
@@ -13,6 +18,22 @@ data class TransferPreferencesRestoreData(
 interface TransferPreferencesRestorer {
     suspend fun snapshotCurrentState(): TransferPreferencesRestoreData
     suspend fun restore(restoreData: TransferPreferencesRestoreData)
+}
+
+fun interface TransferCanonicalMigration {
+    suspend fun migrate()
+}
+
+internal class OpenAiCanonicalTransferMigrationAdapter(
+    private val preferencesManager: PreferencesManager,
+    private val rootfsDir: File,
+) : TransferCanonicalMigration {
+    override suspend fun migrate() {
+        OpenAiCanonicalMigrationCoordinator(
+            preferencesManager = preferencesManager,
+            rootfsDir = rootfsDir,
+        ).migrateIfNeeded(force = true)
+    }
 }
 
 interface TransferGatewayQuiesceController {
@@ -44,6 +65,7 @@ class TransferRestoreRequest(
     val rootfsDir: File,
     val preferencesRestorer: TransferPreferencesRestorer,
     val gatewayController: TransferGatewayQuiesceController,
+    val canonicalMigration: TransferCanonicalMigration,
     val allowVersionMismatch: Boolean = false,
 ) {
     override fun toString(): String = "TransferRestoreRequest(artifactFile=${artifactFile.name}, password=***)"
@@ -124,7 +146,42 @@ object TransferRestoreManager {
                 throw TransferRestoreException("Failed to apply staged restore", cause)
             }
 
-            when (val verification = request.gatewayController.verifyRestoredGatewayStartable(wasGatewayActiveBeforeRestore)) {
+            try {
+                request.canonicalMigration.migrate()
+            } catch (cause: Throwable) {
+                val currentSnapshot = snapshot
+                    ?: throw TransferRestoreException("Restore snapshot is unavailable for rollback", cause)
+                val rollbackFailure = rollbackAppliedState(
+                    rootfsDir = request.rootfsDir,
+                    snapshot = currentSnapshot,
+                    preferencesRestorer = request.preferencesRestorer,
+                    gatewayController = request.gatewayController,
+                    wasGatewayActiveBeforeRestore = wasGatewayActiveBeforeRestore,
+                )
+                preRestoreGatewayStateNeedsRestore = false
+                rollbackFailure?.let(cause::addSuppressed)
+                if (cause is CancellationException) throw cause
+                throw TransferRestoreException("Failed to migrate restored OpenAI state", cause)
+            }
+
+            val verification = try {
+                request.gatewayController.verifyRestoredGatewayStartable(wasGatewayActiveBeforeRestore)
+            } catch (cause: Throwable) {
+                val currentSnapshot = snapshot
+                    ?: throw TransferRestoreException("Restore snapshot is unavailable for rollback", cause)
+                val rollbackFailure = rollbackAppliedState(
+                    rootfsDir = request.rootfsDir,
+                    snapshot = currentSnapshot,
+                    preferencesRestorer = request.preferencesRestorer,
+                    gatewayController = request.gatewayController,
+                    wasGatewayActiveBeforeRestore = wasGatewayActiveBeforeRestore,
+                )
+                preRestoreGatewayStateNeedsRestore = false
+                rollbackFailure?.let(cause::addSuppressed)
+                if (cause is CancellationException) throw cause
+                throw TransferRestoreException("Failed to verify restored gateway startup", cause)
+            }
+            when (verification) {
                 TransferGatewayRestoreVerification.Success -> Unit
                 is TransferGatewayRestoreVerification.StructuralFailure -> {
                     val currentSnapshot = snapshot
@@ -132,17 +189,20 @@ object TransferRestoreManager {
                             "Restore snapshot is unavailable for rollback",
                             verification.cause,
                         )
-                    rollback(
+                    val rollbackFailure = rollbackAppliedState(
                         rootfsDir = request.rootfsDir,
                         snapshot = currentSnapshot,
                         preferencesRestorer = request.preferencesRestorer,
+                        gatewayController = request.gatewayController,
+                        wasGatewayActiveBeforeRestore = wasGatewayActiveBeforeRestore,
                     )
-                    request.gatewayController.restorePreRestoreGatewayState(wasGatewayActiveBeforeRestore)
                     preRestoreGatewayStateNeedsRestore = false
-                    throw TransferRestoreException(
+                    val failure = TransferRestoreException(
                         "Failed to verify restored gateway startup: ${verification.message}",
                         verification.cause,
                     )
+                    rollbackFailure?.let(failure::addSuppressed)
+                    throw failure
                 }
                 is TransferGatewayRestoreVerification.TransientRuntimeFailure -> {
                     if (verification.message.contains("Gateway stop timed out after verification")) {
@@ -492,6 +552,35 @@ object TransferRestoreManager {
         }
 
         preferencesRestorer.restore(snapshot.preferences)
+    }
+
+    private suspend fun rollbackAppliedState(
+        rootfsDir: File,
+        snapshot: LiveStateSnapshot,
+        preferencesRestorer: TransferPreferencesRestorer,
+        gatewayController: TransferGatewayQuiesceController,
+        wasGatewayActiveBeforeRestore: Boolean,
+    ): Throwable? = withContext(NonCancellable) {
+        var failure = runCatching {
+            rollback(
+                rootfsDir = rootfsDir,
+                snapshot = snapshot,
+                preferencesRestorer = preferencesRestorer,
+            )
+        }.exceptionOrNull()
+
+        val gatewayFailure = runCatching {
+            gatewayController.restorePreRestoreGatewayState(wasGatewayActiveBeforeRestore)
+        }.exceptionOrNull()
+        if (gatewayFailure != null) {
+            val priorFailure = failure
+            if (priorFailure == null) {
+                failure = gatewayFailure
+            } else {
+                priorFailure.addSuppressed(gatewayFailure)
+            }
+        }
+        failure
     }
 
     private fun collectCurrentLiveRestorablePaths(rootfsDir: File): List<String> {

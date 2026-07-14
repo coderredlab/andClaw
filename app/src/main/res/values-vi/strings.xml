@@ -234,6 +234,13 @@ Thất bại: %2$d</string>
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">Đăng nhập Codex</string>
     <string name="settings_codex_oauth_signing_in">Đang đăng nhập…</string>
+    <string name="settings_openai_connection_method">Phương thức kết nối OpenAI</string>
+    <string name="settings_openai_codex_subscription">Gói đăng ký ChatGPT/Codex (OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">Sử dụng hạn mức trong gói đăng ký ChatGPT của bạn.</string>
+    <string name="settings_openai_platform_api_key">Khóa API OpenAI Platform</string>
+    <string name="settings_openai_platform_api_key_desc">Mức sử dụng được tính phí qua API OpenAI Platform.</string>
+    <string name="settings_connection_status_connected">Đã kết nối</string>
+    <string name="settings_connection_status_not_connected">Chưa kết nối</string>
     <string name="settings_codex_oauth_reset_title">Đặt lại đăng nhập Codex</string>
     <string name="settings_codex_oauth_reset_desc">Xóa trạng thái Codex đã lưu</string>
     <string name="settings_codex_oauth_reset_confirm_message">Trạng thái đăng nhập Codex đã lưu sẽ bị xóa để có thể đăng nhập lại. Các nhà cung cấp khác không bị thay đổi.</string>

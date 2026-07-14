@@ -19,6 +19,8 @@ import com.coderred.andclaw.data.PairingRequest
 import com.coderred.andclaw.data.SetupState
 import com.coderred.andclaw.data.SessionLogEntry
 import com.coderred.andclaw.service.GatewayService
+import com.coderred.andclaw.service.OpenAiConnectionTransitionState
+import com.coderred.andclaw.service.OpenAiConnectionTransitionUiState
 import com.coderred.andclaw.data.OpenRouterModel
 import com.coderred.andclaw.data.parseOpenRouterModels
 import com.coderred.andclaw.proroot.BundleUpdateFailureState
@@ -32,6 +34,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
@@ -63,14 +66,12 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
     val gatewayState: StateFlow<GatewayState> = app.processManager.gatewayState
         .stateIn(viewModelScope, SharingStarted.Eagerly, GatewayState())
 
-    val gatewayUiState: StateFlow<DashboardGatewayUiState> = gatewayState
-        .map { state ->
-            DashboardGatewayUiState(
-                status = state.status,
-                errorMessage = state.errorMessage,
-                dashboardReady = state.dashboardReady,
-            )
-        }
+    val gatewayUiState: StateFlow<DashboardGatewayUiState> = combine(
+        gatewayState,
+        OpenAiConnectionTransitionState.state,
+    ) { state, transition ->
+        resolveDashboardGatewayUiState(state, transition)
+    }
         .distinctUntilChanged()
         .stateIn(viewModelScope, SharingStarted.Eagerly, DashboardGatewayUiState())
 
@@ -205,6 +206,13 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
         )
     }
 
+    fun acknowledgeError(observedError: DashboardErrorUiState) {
+        acknowledgeDashboardError(
+            observedError = observedError,
+            currentVisibleError = gatewayUiState.value.error,
+        )
+    }
+
     fun openDashboard(context: Context) {
         viewModelScope.launch {
             val configFile = java.io.File(app.prorootManager.rootfsDir, "root/.openclaw/openclaw.json")
@@ -229,6 +237,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
             app.preferencesManager.setSelectedModel(model)
             val provider = app.preferencesManager.apiProvider.first()
             val openAiCompatBaseUrl = app.preferencesManager.openAiCompatibleBaseUrl.first()
+            val openAiConnectionMode = app.preferencesManager.openAiConnectionMode.first()
             app.processManager.ensureOpenClawConfig(
                 apiProvider = provider,
                 selectedModel = model.id,
@@ -237,6 +246,7 @@ class DashboardViewModel(application: Application) : AndroidViewModel(applicatio
                 modelImages = model.supportsImages,
                 modelContext = model.contextLength,
                 modelMaxOutput = model.maxOutputTokens,
+                openAiConnectionMode = openAiConnectionMode,
             )
             restartGatewayIfRunning(source = "dashboard:selected_model_changed")
         }
@@ -806,11 +816,61 @@ enum class BundleActionType {
     RECOVERY,
 }
 
+enum class DashboardErrorSource {
+    GATEWAY,
+    OPEN_AI_TRANSITION,
+}
+
+data class DashboardErrorUiState(
+    val message: String,
+    val source: DashboardErrorSource,
+    val transitionFailureId: Long? = null,
+)
+
 data class DashboardGatewayUiState(
     val status: GatewayStatus = GatewayStatus.STOPPED,
-    val errorMessage: String? = null,
+    val error: DashboardErrorUiState? = null,
     val dashboardReady: Boolean = false,
+    val actionsEnabled: Boolean = true,
 )
+
+internal fun resolveDashboardGatewayUiState(
+    state: GatewayState,
+    transition: OpenAiConnectionTransitionUiState,
+): DashboardGatewayUiState {
+    val error = when {
+        state.errorMessage != null -> DashboardErrorUiState(
+            message = state.errorMessage,
+            source = DashboardErrorSource.GATEWAY,
+        )
+        transition.failure != null -> DashboardErrorUiState(
+            message = transition.failure.message,
+            source = DashboardErrorSource.OPEN_AI_TRANSITION,
+            transitionFailureId = transition.failure.failureId,
+        )
+        else -> null
+    }
+
+    return DashboardGatewayUiState(
+        status = state.status,
+        error = error,
+        dashboardReady = state.dashboardReady && !transition.isPending,
+        actionsEnabled = !transition.isPending,
+    )
+}
+
+internal fun acknowledgeDashboardError(
+    observedError: DashboardErrorUiState,
+    currentVisibleError: DashboardErrorUiState?,
+) {
+    val failureId = observedError.transitionFailureId ?: return
+    if (
+        observedError.source == DashboardErrorSource.OPEN_AI_TRANSITION &&
+        currentVisibleError == observedError
+    ) {
+        OpenAiConnectionTransitionState.acknowledgeFailure(failureId)
+    }
+}
 
 data class RuntimeChangeGuidanceDialogState(
     val errorSignature: String,

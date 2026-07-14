@@ -234,6 +234,13 @@ Başarısız: %2$d</string>
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">Codex’e giriş yap</string>
     <string name="settings_codex_oauth_signing_in">Giriş yapılıyor…</string>
+    <string name="settings_openai_connection_method">OpenAI bağlantı yöntemi</string>
+    <string name="settings_openai_codex_subscription">ChatGPT/Codex aboneliği (OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">ChatGPT aboneliğinizin kullanım kotasını kullanır.</string>
+    <string name="settings_openai_platform_api_key">OpenAI Platform API anahtarı</string>
+    <string name="settings_openai_platform_api_key_desc">Kullanım, OpenAI Platform API üzerinden ücretlendirilir.</string>
+    <string name="settings_connection_status_connected">Bağlı</string>
+    <string name="settings_connection_status_not_connected">Bağlı değil</string>
     <string name="settings_codex_oauth_reset_title">Codex girişini sıfırla</string>
     <string name="settings_codex_oauth_reset_desc">Kayıtlı Codex durumunu temizle</string>
     <string name="settings_codex_oauth_reset_confirm_message">Yeniden giriş yapılabilmesi için kayıtlı Codex giriş durumu silinir. Diğer sağlayıcılar değiştirilmez.</string>

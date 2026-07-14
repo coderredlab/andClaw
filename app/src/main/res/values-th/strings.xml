@@ -234,6 +234,13 @@
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">ลงชื่อเข้าใช้ Codex</string>
     <string name="settings_codex_oauth_signing_in">กำลังลงชื่อเข้าใช้…</string>
+    <string name="settings_openai_connection_method">วิธีเชื่อมต่อ OpenAI</string>
+    <string name="settings_openai_codex_subscription">การสมัครสมาชิก ChatGPT/Codex (OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">ใช้โควตาการใช้งานจากการสมัครสมาชิก ChatGPT ของคุณ</string>
+    <string name="settings_openai_platform_api_key">คีย์ OpenAI Platform API</string>
+    <string name="settings_openai_platform_api_key_desc">มีการเรียกเก็บค่าบริการตามการใช้งาน OpenAI Platform API</string>
+    <string name="settings_connection_status_connected">เชื่อมต่อแล้ว</string>
+    <string name="settings_connection_status_not_connected">ยังไม่ได้เชื่อมต่อ</string>
     <string name="settings_codex_oauth_reset_title">รีเซ็ตการลงชื่อเข้าใช้ Codex</string>
     <string name="settings_codex_oauth_reset_desc">ลบสถานะ Codex ที่บันทึกไว้</string>
     <string name="settings_codex_oauth_reset_confirm_message">ระบบจะลบสถานะการลงชื่อเข้าใช้ Codex ที่บันทึกไว้ เพื่อให้ลงชื่อเข้าใช้ใหม่ได้ ผู้ให้บริการอื่นจะไม่ถูกเปลี่ยนแปลง</string>

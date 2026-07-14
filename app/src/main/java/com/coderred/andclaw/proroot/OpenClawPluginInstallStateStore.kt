@@ -25,7 +25,7 @@ internal object OpenClawPluginInstallStateStore {
         "root/.openclaw/andclaw-bundled-plugins/install-records.json"
     private const val INSTALLED_PLUGIN_INDEX_TABLE = "installed_plugin_index"
     private const val INSTALLED_PLUGIN_INDEX_KEY = "installed-plugin-index"
-    private val managedPluginIds = listOf("whatsapp", "discord", "codex")
+    private val managedPluginIds = listOf("whatsapp", "discord", "codex", "brave", "zai")
 
     fun mergeBundledInstallRecords(
         rootfsDir: File,

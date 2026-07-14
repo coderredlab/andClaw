@@ -246,6 +246,13 @@ Fallidas: %2$d</string>
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">Iniciar sesión en Codex</string>
     <string name="settings_codex_oauth_signing_in">Iniciando sesión…</string>
+    <string name="settings_openai_connection_method">Método de conexión de OpenAI</string>
+    <string name="settings_openai_codex_subscription">Suscripción a ChatGPT/Codex (OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">Usa la cuota de su suscripción a ChatGPT.</string>
+    <string name="settings_openai_platform_api_key">Clave de API de OpenAI Platform</string>
+    <string name="settings_openai_platform_api_key_desc">El uso se factura mediante la API de OpenAI Platform.</string>
+    <string name="settings_connection_status_connected">Conectado</string>
+    <string name="settings_connection_status_not_connected">No conectado</string>
     <string name="settings_codex_oauth_reset_title">Restablecer inicio de sesión de Codex</string>
     <string name="settings_codex_oauth_reset_desc">Borrar estado guardado de Codex</string>
     <string name="settings_codex_oauth_reset_confirm_message">Esto borra el estado de inicio de sesión de Codex guardado para permitir un nuevo inicio de sesión. Los demás proveedores no cambian.</string>

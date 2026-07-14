@@ -271,6 +271,13 @@ Failed: %2$d</string>
     <string name="pairing_notification_text">%1$s: %2$s</string>
     <string name="settings_codex_oauth_title">Codex sign-in</string>
     <string name="settings_codex_oauth_signing_in">Signing in…</string>
+    <string name="settings_openai_connection_method">OpenAI connection method</string>
+    <string name="settings_openai_codex_subscription">ChatGPT/Codex subscription (OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">Uses your ChatGPT subscription allowance.</string>
+    <string name="settings_openai_platform_api_key">OpenAI Platform API key</string>
+    <string name="settings_openai_platform_api_key_desc">Usage is billed through the OpenAI Platform API.</string>
+    <string name="settings_connection_status_connected">Connected</string>
+    <string name="settings_connection_status_not_connected">Not connected</string>
     <string name="settings_codex_oauth_reset_title">Reset Codex sign-in</string>
     <string name="settings_codex_oauth_reset_desc">Clear saved Codex state</string>
     <string name="settings_codex_oauth_reset_confirm_message">This clears saved Codex sign-in state so you can sign in again. Other providers are left unchanged.</string>

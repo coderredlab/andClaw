@@ -235,6 +235,13 @@ Certains éléments n’ont pas pu être supprimés.</string>
     <string name="pairing_notification_text">%1$s : %2$s</string>
     <string name="settings_codex_oauth_title">Connexion à Codex</string>
     <string name="settings_codex_oauth_signing_in">Connexion en cours…</string>
+    <string name="settings_openai_connection_method">Mode de connexion à OpenAI</string>
+    <string name="settings_openai_codex_subscription">Abonnement ChatGPT/Codex (OAuth)</string>
+    <string name="settings_openai_codex_subscription_desc">Utilise le quota de votre abonnement ChatGPT.</string>
+    <string name="settings_openai_platform_api_key">Clé API OpenAI Platform</string>
+    <string name="settings_openai_platform_api_key_desc">L’utilisation est facturée via l’API OpenAI Platform.</string>
+    <string name="settings_connection_status_connected">Connecté</string>
+    <string name="settings_connection_status_not_connected">Non connecté</string>
     <string name="settings_codex_oauth_reset_title">Réinitialiser la connexion Codex</string>
     <string name="settings_codex_oauth_reset_desc">Effacer l’état Codex enregistré</string>
     <string name="settings_codex_oauth_reset_confirm_message">Cela efface l’état de connexion Codex enregistré afin de vous reconnecter. Les autres fournisseurs restent inchangés.</string>
