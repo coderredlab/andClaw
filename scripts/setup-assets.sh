@@ -289,14 +289,20 @@ extract_json_version() {
     sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$json_path" | head -1
 }
 
-get_openclaw_latest_version() {
+get_openclaw_registry_latest_version() {
     curl -fsSL "https://registry.npmjs.org/openclaw/latest" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1
 }
 
-version_lt() {
-    local current="$1"
-    local target="$2"
-    [ "$current" != "$target" ] && [ "$(printf '%s\n%s\n' "$current" "$target" | sort -V | head -1)" = "$current" ]
+get_codex_latest_version() {
+    curl -fsSL "https://registry.npmjs.org/@openclaw%2Fcodex/latest" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1
+}
+
+correction_release_base() {
+    printf '%s\n' "$1" | sed 's/-[0-9][0-9]*$//'
+}
+
+openclaw_version_exists() {
+    curl -fsSL "https://registry.npmjs.org/openclaw/$1" >/dev/null
 }
 
 restore_openclaw_from_cache() {
@@ -349,7 +355,21 @@ if [ -f "$OPENCLAW_TAR" ]; then
     OPENCLAW_ASSET_VERSION="$(extract_openclaw_version_from_tar "$OPENCLAW_TAR" 2>/dev/null || true)"
     rm -rf "$OPENCLAW_TEMP_DIR"/* 2>/dev/null || true
 fi
-OPENCLAW_LATEST_VERSION="$(get_openclaw_latest_version 2>/dev/null || true)"
+OPENCLAW_REGISTRY_LATEST_VERSION="$(get_openclaw_registry_latest_version 2>/dev/null || true)"
+CODEX_LATEST_VERSION="$(get_codex_latest_version 2>/dev/null || true)"
+OPENCLAW_LATEST_VERSION=""
+if [ -n "$OPENCLAW_REGISTRY_LATEST_VERSION" ] && [ -n "$CODEX_LATEST_VERSION" ]; then
+    if [ "$OPENCLAW_REGISTRY_LATEST_VERSION" = "$CODEX_LATEST_VERSION" ]; then
+        OPENCLAW_LATEST_VERSION="$OPENCLAW_REGISTRY_LATEST_VERSION"
+    elif [ "$(correction_release_base "$OPENCLAW_REGISTRY_LATEST_VERSION")" = "$(correction_release_base "$CODEX_LATEST_VERSION")" ] &&
+         openclaw_version_exists "$CODEX_LATEST_VERSION"; then
+        OPENCLAW_LATEST_VERSION="$CODEX_LATEST_VERSION"
+        echo "[4/6] Codex 호환 버전 선택: OpenClaw $OPENCLAW_REGISTRY_LATEST_VERSION 대신 $OPENCLAW_LATEST_VERSION"
+    else
+        echo "[4/6] ERROR: OpenClaw $OPENCLAW_REGISTRY_LATEST_VERSION 과 Codex $CODEX_LATEST_VERSION 의 호환 버전을 찾을 수 없습니다"
+        exit 1
+    fi
+fi
 OPENCLAW_BUILD_REASON=""
 OPENCLAW_WAS_REBUILT="false"
 
@@ -357,8 +377,8 @@ if [ "$FORCE_OPENCLAW_REBUILD" = "true" ]; then
     OPENCLAW_BUILD_REASON="강제 재빌드 요청"
 elif [ ! -f "$OPENCLAW_TAR" ]; then
     OPENCLAW_BUILD_REASON="tar.gz.bin 파일 없음"
-elif [ -n "$OPENCLAW_ASSET_VERSION" ] && [ -n "$OPENCLAW_LATEST_VERSION" ] && version_lt "$OPENCLAW_ASSET_VERSION" "$OPENCLAW_LATEST_VERSION"; then
-    OPENCLAW_BUILD_REASON="버전 업그레이드 필요 ($OPENCLAW_ASSET_VERSION -> $OPENCLAW_LATEST_VERSION)"
+elif [ -n "$OPENCLAW_ASSET_VERSION" ] && [ -n "$OPENCLAW_LATEST_VERSION" ] && [ "$OPENCLAW_ASSET_VERSION" != "$OPENCLAW_LATEST_VERSION" ]; then
+    OPENCLAW_BUILD_REASON="호환 버전 동기화 필요 ($OPENCLAW_ASSET_VERSION -> $OPENCLAW_LATEST_VERSION)"
 elif [ -z "$OPENCLAW_LATEST_VERSION" ]; then
     echo "[4/6] WARNING: openclaw 최신 버전 조회 실패, 기존 자산 버전을 유지합니다"
 fi
@@ -370,8 +390,8 @@ if [ "$FORCE_OPENCLAW_REBUILD" != "true" ] && [ -n "$OPENCLAW_BUILD_REASON" ] &&
         OPENCLAW_BUILD_REASON=""
         BUNDLE_FINGERPRINT_NEEDS_UPDATE="true"
 
-        if [ -n "$OPENCLAW_ASSET_VERSION" ] && [ -n "$OPENCLAW_LATEST_VERSION" ] && version_lt "$OPENCLAW_ASSET_VERSION" "$OPENCLAW_LATEST_VERSION"; then
-            OPENCLAW_BUILD_REASON="캐시 버전 업그레이드 필요 ($OPENCLAW_ASSET_VERSION -> $OPENCLAW_LATEST_VERSION)"
+        if [ -n "$OPENCLAW_ASSET_VERSION" ] && [ -n "$OPENCLAW_LATEST_VERSION" ] && [ "$OPENCLAW_ASSET_VERSION" != "$OPENCLAW_LATEST_VERSION" ]; then
+            OPENCLAW_BUILD_REASON="캐시 호환 버전 동기화 필요 ($OPENCLAW_ASSET_VERSION -> $OPENCLAW_LATEST_VERSION)"
         else
             echo "   OpenClaw 캐시 복원 성공"
         fi
@@ -383,8 +403,11 @@ if [ -z "$OPENCLAW_BUILD_REASON" ]; then
     if [ -n "$OPENCLAW_ASSET_VERSION" ]; then
         echo "   버전: $OPENCLAW_ASSET_VERSION"
     fi
+    if [ -n "$OPENCLAW_REGISTRY_LATEST_VERSION" ]; then
+        echo "   레지스트리 최신: $OPENCLAW_REGISTRY_LATEST_VERSION"
+    fi
     if [ -n "$OPENCLAW_LATEST_VERSION" ]; then
-        echo "   최신: $OPENCLAW_LATEST_VERSION"
+        echo "   Codex 호환 목표: $OPENCLAW_LATEST_VERSION"
     fi
     echo "   크기: $(du -h "$OPENCLAW_TAR" | cut -f1)"
 else
@@ -456,7 +479,47 @@ NODE
 
         echo '--- Installing andClaw-managed external/runtime plugins ---'
         OPENCLAW_ASSET_VERSION=\"\$(node -e 'console.log(require(\"/usr/local/lib/node_modules/openclaw/package.json\").version)')\"
-        ANDCLAW_BUNDLED_PLUGINS=\"@openclaw/whatsapp@\$OPENCLAW_ASSET_VERSION @openclaw/discord@\$OPENCLAW_ASSET_VERSION @openclaw/codex@\$OPENCLAW_ASSET_VERSION @openclaw/brave-plugin@\$OPENCLAW_ASSET_VERSION @openclaw/zai-provider@\$OPENCLAW_ASSET_VERSION\"
+        cat > /tmp/resolve-andclaw-plugin-specs.cjs <<'NODE'
+const { execFileSync } = require('node:child_process');
+
+const openClawVersion = process.env.OPENCLAW_ASSET_VERSION;
+const correctionReleaseBase = (version) => version.replace(/-\d+$/, '');
+const openClawBaseVersion = correctionReleaseBase(openClawVersion);
+const packageNames = [
+  '@openclaw/whatsapp',
+  '@openclaw/discord',
+  '@openclaw/codex',
+  '@openclaw/brave-plugin',
+  '@openclaw/zai-provider',
+];
+
+const specs = packageNames.map((packageName) => {
+  const pluginVersion = execFileSync(
+    'npm',
+    ['view', packageName + '@latest', 'version'],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] },
+  ).trim();
+  const pluginBaseVersion = correctionReleaseBase(pluginVersion);
+  if (packageName === '@openclaw/codex') {
+    if (pluginVersion !== openClawVersion) {
+      throw new Error(
+        packageName + ' latest version ' + pluginVersion +
+          ' must exactly match version-bound OpenClaw host ' + openClawVersion,
+      );
+    }
+  } else if (pluginBaseVersion !== openClawBaseVersion) {
+    throw new Error(
+      packageName + ' latest version ' + pluginVersion +
+        ' does not match OpenClaw base version ' + openClawBaseVersion,
+    );
+  }
+  console.error('--- andClaw plugin resolved: ' + packageName + '@' + pluginVersion + ' ---');
+  return packageName + '@' + pluginVersion;
+});
+
+process.stdout.write(specs.join(' '));
+NODE
+        ANDCLAW_BUNDLED_PLUGINS=\"\$(OPENCLAW_ASSET_VERSION=\"\$OPENCLAW_ASSET_VERSION\" node /tmp/resolve-andclaw-plugin-specs.cjs)\"
         ANDCLAW_BUNDLED_PLUGIN_ROOT=/root/.openclaw/andclaw-bundled-plugins
         ANDCLAW_BUNDLED_PLUGIN_NPM_ROOT=/root/.openclaw/andclaw-bundled-plugins/npm
         rm -rf \"\$ANDCLAW_BUNDLED_PLUGIN_ROOT\"
@@ -481,7 +544,6 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
 (async () => {
-  const version = process.env.OPENCLAW_ASSET_VERSION;
   const openClawDist = '/usr/local/lib/node_modules/openclaw/dist';
   const pluginRoot = '/root/.openclaw/andclaw-bundled-plugins';
   const npmRoot = path.join(pluginRoot, 'npm');
@@ -500,7 +562,7 @@ const { pathToFileURL } = require('node:url');
     const packageJson = JSON.parse(fs.readFileSync(path.join(installPath, 'package.json'), 'utf8'));
     installRecords[plugin.id] = {
       source: 'npm',
-      spec: plugin.packageName + '@' + version,
+      spec: plugin.packageName + '@' + packageJson.version,
       installPath,
       version: packageJson.version,
       resolvedName: plugin.packageName,
@@ -518,13 +580,18 @@ const { pathToFileURL } = require('node:url');
   let refreshPersistedInstalledPluginIndexSync = null;
   for (const candidate of storeModuleCandidates) {
     const mod = await import(pathToFileURL(path.join(openClawDist, candidate)).href);
-    if (typeof mod.o === 'function') {
-      refreshPersistedInstalledPluginIndexSync = mod.o;
+    const exportedRefresh = Object.values(mod).find(
+      (value) =>
+        typeof value === 'function' &&
+        value.name === 'refreshPersistedInstalledPluginIndexSync',
+    );
+    if (exportedRefresh) {
+      refreshPersistedInstalledPluginIndexSync = exportedRefresh;
       break;
     }
   }
   if (!refreshPersistedInstalledPluginIndexSync) {
-    throw new Error(\"No installed-plugin-index-store candidate exposes the 'o' refresh function. Candidates tried: \" + storeModuleCandidates.join(', '));
+    throw new Error('No installed-plugin-index-store candidate exports refreshPersistedInstalledPluginIndexSync. Candidates tried: ' + storeModuleCandidates.join(', '));
   }
   const index = refreshPersistedInstalledPluginIndexSync({
     reason: 'source-changed',
@@ -537,7 +604,7 @@ const { pathToFileURL } = require('node:url');
   fs.writeFileSync(path.join(pluginRoot, 'install-records.json'), JSON.stringify(index, null, 2) + '\\n');
 })();
 NODE
-        OPENCLAW_ASSET_VERSION=\"\$OPENCLAW_ASSET_VERSION\" node /tmp/write-andclaw-plugin-install-records.cjs
+        node /tmp/write-andclaw-plugin-install-records.cjs
         rm -f /root/.openclaw/openclaw.json
         rm -rf /root/.openclaw/plugins
         echo '--- andClaw-managed external/runtime plugins: installed ---'

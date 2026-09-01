@@ -1,5 +1,6 @@
 package com.coderred.andclaw.proroot
 
+import android.database.sqlite.SQLiteDatabase
 import android.os.Build
 import android.os.FileObserver
 import android.os.SystemClock
@@ -410,6 +411,88 @@ console.log(JSON.stringify({
 }));
 """.trimIndent()
 
+internal fun buildOpenClawExecApprovalsMigrationScript(): String = """
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const STATE_DIR = "/root/.openclaw";
+const DIST_DIR = "/usr/local/lib/node_modules/openclaw/dist";
+process.env.OPENCLAW_STATE_DIR = STATE_DIR;
+
+function resolveExportName(source, localName) {
+  const exportIndex = source.lastIndexOf("export {");
+  if (exportIndex < 0) {
+    throw new Error("OpenClaw migration module has no export block");
+  }
+  const exportBlock = source.slice(exportIndex);
+  const aliasMatch = exportBlock.match(
+    new RegExp("\\b" + localName + "\\s+as\\s+([A-Za-z_][A-Za-z0-9_]*)\\b"),
+  );
+  if (aliasMatch) return aliasMatch[1];
+  if (new RegExp("\\b" + localName + "\\b").test(exportBlock)) return localName;
+  throw new Error("OpenClaw migration module does not export " + localName);
+}
+
+try {
+  const moduleFiles = fs.readdirSync(DIST_DIR).filter(
+    (name) => name.startsWith("state-migrations.exec-approvals-") && name.endsWith(".js"),
+  );
+  if (moduleFiles.length !== 1) {
+    throw new Error(
+      "Expected one OpenClaw exec approvals migration module, found " + moduleFiles.length,
+    );
+  }
+
+  const modulePath = path.join(DIST_DIR, moduleFiles[0]);
+  const moduleSource = fs.readFileSync(modulePath, "utf8");
+  const migrationModule = await import(pathToFileURL(modulePath).href);
+  const detect = migrationModule[
+    resolveExportName(moduleSource, "detectLegacyExecApprovals")
+  ];
+  const migrate = migrationModule[
+    resolveExportName(moduleSource, "migrateLegacyExecApprovals")
+  ];
+  if (typeof detect !== "function" || typeof migrate !== "function") {
+    throw new Error("OpenClaw exec approvals migration exports are not callable");
+  }
+
+  const detected = detect({
+    stateDir: STATE_DIR,
+    doctorOnlyStateMigrations: true,
+  });
+  if (!detected?.hasLegacy) {
+    console.log("[andClaw] No pending legacy OpenClaw exec approvals migration.");
+  } else {
+    const result = await migrate({
+      detected,
+      stateDir: STATE_DIR,
+      env: process.env,
+    });
+    const warnings = Array.isArray(result?.warnings) ? result.warnings : [];
+    if (warnings.length > 0) {
+      throw new Error(warnings.join(" | "));
+    }
+    const remaining = detect({
+      stateDir: STATE_DIR,
+      doctorOnlyStateMigrations: true,
+    });
+    if (remaining?.hasLegacy) {
+      throw new Error("OpenClaw exec approvals migration left a legacy source or claim behind");
+    }
+    const changes = Array.isArray(result?.changes) ? result.changes : [];
+    console.log(
+      "[andClaw] Canonical OpenClaw exec approvals migration completed" +
+        (changes.length > 0 ? ": " + changes.join(" ") : "."),
+    );
+  }
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error("[andClaw] Canonical OpenClaw exec approvals migration failed: " + message);
+  process.exitCode = 1;
+}
+""".trimIndent()
+
 /**
  * proot 환경에서 OpenClaw 게이트웨이 프로세스를 관리한다.
  *
@@ -435,6 +518,23 @@ class ProcessManager(
         private const val GATEWAY_PORT = 18789
         private const val DEFAULT_MEMORY_SEARCH_PROVIDER = "auto"
         private const val OPENCLAW_PATCH_VERSION = "openclaw-patch-v12-codex-header-metrics"
+        private const val OPENCLAW_STARTUP_MAINTENANCE_VERSION = "v6"
+        private const val OPENCLAW_STARTUP_MAINTENANCE_MARKER =
+            "root/.openclaw/.andclaw-startup-maintenance"
+        private const val OPENCLAW_STARTUP_MAINTENANCE_TIMEOUT_MS = 300_000L
+        private const val OPENCLAW_EXEC_APPROVALS_LEGACY_PATH =
+            "root/.openclaw/exec-approvals.json"
+        private const val OPENCLAW_EXEC_APPROVALS_CLAIM_PATH =
+            "root/.openclaw/exec-approvals.json.doctor-importing"
+        private const val OPENCLAW_EXEC_APPROVALS_MIGRATION_SCRIPT_PATH =
+            "root/.andclaw-openclaw-exec-approvals-migration.mjs"
+        private const val OPENCLAW_EXEC_APPROVALS_MIGRATION_SCRIPT_GUEST_PATH =
+            "/root/.andclaw-openclaw-exec-approvals-migration.mjs"
+        private const val OPENCLAW_AGENT_DATABASE_PATH =
+            "root/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+        private const val OPENCLAW_AGENT_IDENTITY_SCHEMA_VERSION = 18
+        private const val OPENCLAW_AGENT_PARTICIPANTS_STAGING_TABLE =
+            "andclaw_session_participants_identity_staging"
         private const val CODEX_APP_SERVER_MODE = "yolo"
         private const val CODEX_APP_SERVER_APPROVAL_POLICY = "never"
         private const val CODEX_APP_SERVER_SANDBOX = "danger-full-access"
@@ -451,18 +551,17 @@ class ProcessManager(
             "file-transfer",
             "github-copilot",
             "google",
-            "kimi-coding",
             "memory-core",
             "minimax",
             "ollama",
             "openai",
             "openrouter",
-            "phone-control",
             "talk-voice",
             "telegram",
             "whatsapp",
             "zai",
         )
+        private val ANDCLAW_RETIRED_OPENCLAW_PLUGIN_IDS = setOf("kimi-coding", "phone-control")
         private val REMOTE_MEMORY_SEARCH_PROVIDERS = setOf("auto", "openai", "gemini", "voyage", "mistral")
 
         private fun normalizeMemorySearchProvider(raw: String): String {
@@ -983,6 +1082,8 @@ class ProcessManager(
                 if (osReleaseRepair?.changed == true) {
                     addLog("[andClaw] Rootfs OS release repaired before gateway start: ${osReleaseRepair.diagnosticSummary()}")
                 }
+                ensureStartupAttemptStillValid()
+                runOpenClawStartupMigrationMaintenanceIfNeeded(runtimeSnapshot)
                 ensureStartupAttemptStillValid()
 
                 // proot/proroot 명령어 구성
@@ -1906,8 +2007,10 @@ class ProcessManager(
             val shouldApplyMemorySearchConfig =
                 memorySearchEnabled != null || memorySearchProvider != null || memorySearchApiKey != null
             if (shouldApplyMemorySearchConfig) {
-                val memorySearch = defaults.optJSONObject("memorySearch")
-                    ?: JSONObject().also { defaults.put("memorySearch", it) }
+                val memory = json.optJSONObject("memory")
+                    ?: JSONObject().also { json.put("memory", it) }
+                val memorySearch = memory.optJSONObject("search")
+                    ?: JSONObject().also { memory.put("search", it) }
                 val normalizedProvider = memorySearchProvider?.let(::normalizeMemorySearchProvider)
                 val enabled = memorySearchEnabled ?: memorySearch.optBoolean("enabled", true)
                 val existingProvider = normalizeMemorySearchProvider(
@@ -2164,17 +2267,6 @@ class ProcessManager(
                 controlUi.put("allowedOrigins", org.json.JSONArray().apply { put("*") })
                 changed = true
             }
-            // allowInsecureAuth: loopback token 인증으로 operator 스코프 획득 허용 (3.28+)
-            if (controlUi.optBoolean("allowInsecureAuth", false) != true) {
-                controlUi.put("allowInsecureAuth", true)
-                changed = true
-            }
-            // Android 외부 브라우저로 여는 로컬 Control UI는 token 인증으로만 보호한다.
-            // OpenClaw 2026.5.18부터 allowInsecureAuth만으로는 브라우저 device pairing을 건너뛰지 않는다.
-            if (controlUi.optBoolean("dangerouslyDisableDeviceAuth", false) != true) {
-                controlUi.put("dangerouslyDisableDeviceAuth", true)
-                changed = true
-            }
 
             if (ensureAndroidOpenClawExecutionPolicy(json)) {
                 changed = true
@@ -2380,8 +2472,6 @@ class ProcessManager(
 
     /**
      * 번들/버전 불일치로 주입될 수 있는 known-invalid 키를 정리한다.
-     * - channels.whatsapp.enabled (OpenClaw WhatsApp schema와 충돌)
-     * - agents.defaults.session (현행 schema 미지원)
      */
     private fun sanitizeKnownIncompatibleConfigKeys(root: JSONObject): Boolean {
         var changed = false
@@ -2394,12 +2484,53 @@ class ProcessManager(
             addLog("[andClaw] Removed incompatible config key: agents.defaults.session")
         }
 
+        val legacyMemorySearch = defaults?.optJSONObject("memorySearch")
+            ?: root.optJSONObject("memorySearch")
+        if (legacyMemorySearch != null) {
+            val memory = root.optJSONObject("memory") ?: JSONObject().also { root.put("memory", it) }
+            val search = memory.optJSONObject("search") ?: JSONObject().also { memory.put("search", it) }
+            val keys = legacyMemorySearch.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                if (!search.has(key)) {
+                    search.put(key, legacyMemorySearch.get(key))
+                }
+            }
+            defaults?.remove("memorySearch")
+            root.remove("memorySearch")
+            changed = true
+            addLog("[andClaw] Migrated Memory Search config to memory.search")
+        }
+        val canonicalMemorySearch = root.optJSONObject("memory")?.optJSONObject("search")
+        if (canonicalMemorySearch?.optString("provider")?.trim()?.lowercase() == "auto") {
+            canonicalMemorySearch.remove("provider")
+            changed = true
+            addLog("[andClaw] Removed retired Memory Search auto provider")
+        }
+
+
         val channels = root.optJSONObject("channels")
         val whatsapp = channels?.optJSONObject("whatsapp")
         if (whatsapp != null && whatsapp.has("enabled")) {
             whatsapp.remove("enabled")
             changed = true
             addLog("[andClaw] Removed incompatible config key: channels.whatsapp.enabled")
+        }
+
+        val controlUi = root.optJSONObject("gateway")?.optJSONObject("controlUi")
+        listOf("allowInsecureAuth", "dangerouslyDisableDeviceAuth").forEach { key ->
+            if (controlUi?.has(key) == true) {
+                controlUi.remove(key)
+                changed = true
+                addLog("[andClaw] Removed retired config key: gateway.controlUi.$key")
+            }
+        }
+
+        val plugins = root.optJSONObject("plugins")
+        if (plugins?.has("bundledDiscovery") == true) {
+            plugins.remove("bundledDiscovery")
+            changed = true
+            addLog("[andClaw] Removed retired config key: plugins.bundledDiscovery")
         }
 
         return changed
@@ -2695,17 +2826,13 @@ class ProcessManager(
             changed = true
         }
 
-        if (plugins.optString("bundledDiscovery", "") != "allowlist") {
-            plugins.put("bundledDiscovery", "allowlist")
-            changed = true
-        }
 
         val allow = plugins.optJSONArray("allow")
         val merged = linkedSetOf<String>()
         if (allow != null) {
             for (index in 0 until allow.length()) {
                 val pluginId = allow.optString(index).trim().lowercase()
-                if (pluginId.isNotEmpty()) {
+                if (pluginId.isNotEmpty() && pluginId !in ANDCLAW_RETIRED_OPENCLAW_PLUGIN_IDS) {
                     merged += pluginId
                 }
             }
@@ -3420,6 +3547,352 @@ class ProcessManager(
         addLog("[andClaw] Invalidating Node.js compile cache (version changed)")
         cacheDir.listFiles()?.forEach { if (it.name != ".cache-version") it.deleteRecursively() }
         versionFile.writeText(OPENCLAW_PATCH_VERSION)
+    }
+    private fun SQLiteDatabase.hasTable(tableName: String): Boolean =
+        rawQuery(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            arrayOf(tableName),
+        ).use { it.moveToFirst() }
+
+    private fun SQLiteDatabase.readAgentSchemaVersion(): Int? =
+        rawQuery(
+            """
+            SELECT schema_version
+            FROM schema_meta
+            WHERE meta_key = 'primary' AND role = 'agent'
+            """.trimIndent(),
+            null,
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return null
+            val value = cursor.getInt(0)
+            if (cursor.moveToNext()) return null
+            value
+        }
+
+    private fun SQLiteDatabase.readParticipantColumnShape(tableName: String): List<List<Any>> =
+        rawQuery("PRAGMA table_info(\"$tableName\")", null).use { cursor ->
+            buildList {
+                val nameIndex = cursor.getColumnIndexOrThrow("name")
+                val typeIndex = cursor.getColumnIndexOrThrow("type")
+                val primaryKeyIndex = cursor.getColumnIndexOrThrow("pk")
+                while (cursor.moveToNext()) {
+                    add(
+                        listOf(
+                            cursor.getString(nameIndex),
+                            cursor.getString(typeIndex).uppercase(),
+                            cursor.getInt(primaryKeyIndex),
+                        ),
+                    )
+                }
+            }
+        }
+
+    private fun SQLiteDatabase.hasIdentityParticipantColumnShape(tableName: String): Boolean =
+        readParticipantColumnShape(tableName) == listOf(
+            listOf("session_key", "TEXT", 1),
+            listOf("identity_namespace", "TEXT", 2),
+            listOf("actor_id", "TEXT", 3),
+            listOf("contribution_count", "INTEGER", 0),
+            listOf("first_prompted_at", "INTEGER", 0),
+            listOf("last_prompted_at", "INTEGER", 0),
+        )
+
+    internal fun stageOpenClawIdentityParticipantsForMigrationIfNeeded(): Boolean {
+        val databaseFile = File(prorootManager.rootfsDir, OPENCLAW_AGENT_DATABASE_PATH)
+        if (!databaseFile.isFile) return false
+
+        var stagedRows = 0L
+        var stagedFromVersion = 0
+        SQLiteDatabase.openDatabase(
+            databaseFile.path,
+            null,
+            SQLiteDatabase.OPEN_READWRITE,
+        ).use { database ->
+            database.rawQuery("PRAGMA busy_timeout = 5000", null).use { it.moveToFirst() }
+            if (database.hasTable(OPENCLAW_AGENT_PARTICIPANTS_STAGING_TABLE)) return false
+            if (!database.hasTable("session_participants")) return false
+
+            val userVersion = database.rawQuery("PRAGMA user_version", null).use { cursor ->
+                if (!cursor.moveToFirst()) return false
+                cursor.getInt(0)
+            }
+            val schemaVersion = database.readAgentSchemaVersion() ?: return false
+            if (
+                userVersion >= OPENCLAW_AGENT_IDENTITY_SCHEMA_VERSION &&
+                schemaVersion == userVersion
+            ) {
+                return false
+            }
+            if (
+                userVersion !in 1 until OPENCLAW_AGENT_IDENTITY_SCHEMA_VERSION ||
+                schemaVersion != userVersion
+            ) {
+                addLog(
+                    "[andClaw] OpenClaw agent schema needs upstream diagnosis " +
+                        "(user_version=$userVersion, schema_version=$schemaVersion, " +
+                        "participant_columns=${database.readParticipantColumnShape("session_participants")}).",
+                )
+                return false
+            }
+            if (!database.hasIdentityParticipantColumnShape("session_participants")) {
+                addLog(
+                    "[andClaw] OpenClaw agent participant schema is not safe to stage " +
+                        "(user_version=$userVersion, schema_version=$schemaVersion, " +
+                        "columns=${database.readParticipantColumnShape("session_participants")}).",
+                )
+                return false
+            }
+
+            stagedRows = database.rawQuery(
+                "SELECT COUNT(*) FROM session_participants",
+                null,
+            ).use { cursor ->
+                check(cursor.moveToFirst())
+                cursor.getLong(0)
+            }
+            stagedFromVersion = userVersion
+            database.beginTransaction()
+            try {
+                database.execSQL(
+                    """
+                    CREATE TABLE $OPENCLAW_AGENT_PARTICIPANTS_STAGING_TABLE AS
+                    SELECT
+                      session_key,
+                      identity_namespace,
+                      actor_id,
+                      contribution_count,
+                      first_prompted_at,
+                      last_prompted_at
+                    FROM session_participants
+                    """.trimIndent(),
+                )
+                database.execSQL("DROP TABLE session_participants")
+                database.setTransactionSuccessful()
+            } finally {
+                database.endTransaction()
+            }
+        }
+
+        addLog(
+            "[andClaw] Staged $stagedRows OpenClaw identity participant row(s) " +
+                "while migrating agent schema from version $stagedFromVersion.",
+        )
+        return true
+    }
+
+    internal fun restoreStagedOpenClawIdentityParticipantsIfNeeded(): Boolean {
+        val databaseFile = File(prorootManager.rootfsDir, OPENCLAW_AGENT_DATABASE_PATH)
+        if (!databaseFile.isFile) return false
+
+        var restoredRows = 0L
+        SQLiteDatabase.openDatabase(
+            databaseFile.path,
+            null,
+            SQLiteDatabase.OPEN_READWRITE,
+        ).use { database ->
+            database.rawQuery("PRAGMA busy_timeout = 5000", null).use { it.moveToFirst() }
+            if (!database.hasTable(OPENCLAW_AGENT_PARTICIPANTS_STAGING_TABLE)) return false
+            if (!database.hasTable("session_participants")) return false
+
+            val userVersion = database.rawQuery("PRAGMA user_version", null).use { cursor ->
+                if (!cursor.moveToFirst()) return false
+                cursor.getInt(0)
+            }
+            val schemaVersion = database.readAgentSchemaVersion() ?: return false
+            if (
+                userVersion < OPENCLAW_AGENT_IDENTITY_SCHEMA_VERSION ||
+                schemaVersion != userVersion ||
+                !database.hasIdentityParticipantColumnShape("session_participants")
+            ) {
+                return false
+            }
+
+            val destinationRows = database.rawQuery(
+                "SELECT COUNT(*) FROM session_participants",
+                null,
+            ).use { cursor ->
+                check(cursor.moveToFirst())
+                cursor.getLong(0)
+            }
+            check(destinationRows == 0L) {
+                "OpenClaw created participant rows before andClaw could restore staged data."
+            }
+            restoredRows = database.rawQuery(
+                "SELECT COUNT(*) FROM $OPENCLAW_AGENT_PARTICIPANTS_STAGING_TABLE",
+                null,
+            ).use { cursor ->
+                check(cursor.moveToFirst())
+                cursor.getLong(0)
+            }
+
+            database.beginTransaction()
+            try {
+                database.execSQL(
+                    """
+                    INSERT INTO session_participants (
+                      session_key,
+                      identity_namespace,
+                      actor_id,
+                      contribution_count,
+                      first_prompted_at,
+                      last_prompted_at
+                    )
+                    SELECT
+                      session_key,
+                      identity_namespace,
+                      actor_id,
+                      COALESCE(contribution_count, 1),
+                      first_prompted_at,
+                      last_prompted_at
+                    FROM $OPENCLAW_AGENT_PARTICIPANTS_STAGING_TABLE
+                    """.trimIndent(),
+                )
+                val insertedRows = database.rawQuery(
+                    "SELECT COUNT(*) FROM session_participants",
+                    null,
+                ).use { cursor ->
+                    check(cursor.moveToFirst())
+                    cursor.getLong(0)
+                }
+                check(insertedRows == restoredRows) {
+                    "OpenClaw participant restore count mismatch: expected $restoredRows, got $insertedRows."
+                }
+                database.execSQL("DROP TABLE $OPENCLAW_AGENT_PARTICIPANTS_STAGING_TABLE")
+                database.setTransactionSuccessful()
+            } finally {
+                database.endTransaction()
+            }
+        }
+
+        addLog("[andClaw] Restored $restoredRows staged OpenClaw identity participant row(s).")
+        return true
+    }
+
+    private fun hasStagedOpenClawIdentityParticipants(): Boolean {
+        val databaseFile = File(prorootManager.rootfsDir, OPENCLAW_AGENT_DATABASE_PATH)
+        if (!databaseFile.isFile) return false
+        return SQLiteDatabase.openDatabase(
+            databaseFile.path,
+            null,
+            SQLiteDatabase.OPEN_READONLY,
+        ).use { it.hasTable(OPENCLAW_AGENT_PARTICIPANTS_STAGING_TABLE) }
+    }
+
+    internal fun buildOpenClawStartupMaintenanceEnv(): Map<String, String> = buildMap {
+        put("HOME", "/root")
+        put("PATH", "${prorootManager.codexAppServerPathDir}:/usr/local/bin:/usr/bin:/bin")
+        put("LANG", "C.UTF-8")
+        put("UV_USE_IO_URING", "0")
+        put("NODE_COMPILE_CACHE", "/root/.cache/node-compile-cache/startup-maintenance")
+        put("OPENCLAW_NO_RESPAWN", "1")
+        put("OPENCLAW_DISABLE_BONJOUR", "1")
+        put("OPENCLAW_CODEX_DISCOVERY_LIVE", "0")
+        put("PLAYWRIGHT_BROWSERS_PATH", "/root/.cache/ms-playwright")
+        putAll(buildOpenClawCliEnv())
+        put("PROROOT_PROBE_PHASE", "gateway-startup-maintenance")
+    }
+
+    private fun runOpenClawExecApprovalsMigrationPreflightIfNeeded(
+        runtime: ExecutionRuntime,
+        maintenanceEnv: Map<String, String>,
+    ) {
+        val rootfsDir = prorootManager.rootfsDir
+        val legacyFile = File(rootfsDir, OPENCLAW_EXEC_APPROVALS_LEGACY_PATH)
+        val claimFile = File(rootfsDir, OPENCLAW_EXEC_APPROVALS_CLAIM_PATH)
+        if (!legacyFile.exists() && !claimFile.exists()) return
+
+        File(rootfsDir, OPENCLAW_EXEC_APPROVALS_MIGRATION_SCRIPT_PATH).apply {
+            parentFile?.mkdirs()
+            writeText(buildOpenClawExecApprovalsMigrationScript())
+        }
+        addLog("[andClaw] Running canonical OpenClaw exec approvals migration preflight...")
+        val command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
+            "${ProrootManager.OPENCLAW_NODE_BIN} " +
+            "$OPENCLAW_EXEC_APPROVALS_MIGRATION_SCRIPT_GUEST_PATH 2>&1"
+        val result = prorootManager.executeWithResult(
+            command = command,
+            timeoutMs = OPENCLAW_STARTUP_MAINTENANCE_TIMEOUT_MS,
+            extraEnv = maintenanceEnv,
+            captureViaTempFile = true,
+            runtime = runtime,
+            returnFailureDiagnostics = true,
+        )
+        result?.output
+            ?.lineSequence()
+            ?.map { it.trim() }
+            ?.filter { it.startsWith("[andClaw]") }
+            ?.forEach(::addLog)
+        if (result == null || result.timedOut || result.exitCode != 0) {
+            val exit = result?.exitCode?.toString() ?: "unavailable"
+            val detail = result?.output
+                ?.takeLast(4_000)
+                ?.trim()
+                .orEmpty()
+                .ifBlank { "No diagnostic output." }
+            throw IllegalStateException(
+                "OpenClaw exec approvals migration preflight failed (exit: $exit). $detail",
+            )
+        }
+    }
+
+    internal fun runOpenClawStartupMigrationMaintenanceIfNeeded(runtime: ExecutionRuntime) {
+        val installedVersion = checkNotNull(readInstalledOpenClawVersion()) {
+            "Cannot determine the installed OpenClaw version before startup maintenance."
+        }
+        val expectedMarker = "$installedVersion:$OPENCLAW_STARTUP_MAINTENANCE_VERSION"
+        val markerFile = File(prorootManager.rootfsDir, OPENCLAW_STARTUP_MAINTENANCE_MARKER)
+        if (markerFile.isFile && markerFile.readText().trim() == expectedMarker) return
+
+        restoreStagedOpenClawIdentityParticipantsIfNeeded()
+        if (
+            OpenClawAuthProfileStore.reconcileSharedAuthRelocationConflict(
+                prorootManager.rootfsDir,
+            )
+        ) {
+            addLog(
+                "[andClaw] Reconciled conflicting legacy and shared OpenClaw auth rows " +
+                    "before Doctor relocation.",
+            )
+        }
+
+        File(
+            prorootManager.rootfsDir,
+            "root/.cache/node-compile-cache/startup-maintenance",
+        ).mkdirs()
+        val maintenanceEnv = buildOpenClawStartupMaintenanceEnv()
+        runOpenClawExecApprovalsMigrationPreflightIfNeeded(runtime, maintenanceEnv)
+        stageOpenClawIdentityParticipantsForMigrationIfNeeded()
+        addLog("[andClaw] Running stopped-writer OpenClaw startup maintenance...")
+        val command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
+            "openclaw doctor --fix 2>&1"
+        val result = prorootManager.executeWithResult(
+            command = command,
+            timeoutMs = OPENCLAW_STARTUP_MAINTENANCE_TIMEOUT_MS,
+            extraEnv = maintenanceEnv,
+            captureViaTempFile = true,
+            runtime = runtime,
+            returnFailureDiagnostics = true,
+        )
+        restoreStagedOpenClawIdentityParticipantsIfNeeded()
+        if (result == null || result.timedOut || result.exitCode != 0) {
+            val exit = result?.exitCode?.toString() ?: "unavailable"
+            val detail = result?.output
+                ?.takeLast(4_000)
+                ?.trim()
+                .orEmpty()
+                .ifBlank { "No diagnostic output." }
+            throw IllegalStateException(
+                "OpenClaw startup maintenance failed (exit: $exit). $detail",
+            )
+        }
+        check(!hasStagedOpenClawIdentityParticipants()) {
+            "OpenClaw startup maintenance did not produce the identity participant schema " +
+                "needed to restore staged data."
+        }
+
+        markerFile.parentFile?.mkdirs()
+        markerFile.writeText(expectedMarker)
+        addLog("[andClaw] OpenClaw startup maintenance completed.")
     }
 
     /** Clean up stale per-PID compile cache directories from previous runs. */

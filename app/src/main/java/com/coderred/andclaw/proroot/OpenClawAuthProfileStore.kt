@@ -15,14 +15,17 @@ import org.json.JSONObject
 internal object OpenClawAuthProfileStore {
     private const val AGENT_AUTH_PROFILES_PATH = "root/.openclaw/agents/main/agent/auth-profiles.json"
     private const val AGENT_AUTH_SQLITE_PATH = "root/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+    private const val SHARED_AUTH_SQLITE_PATH = "root/.openclaw/state/openclaw.sqlite"
     private const val LEGACY_CODEX_OAUTH_PROVIDER = "openai-codex"
     private const val OPENAI_PROVIDER = "openai"
     private const val CANONICAL_CODEX_PROFILE_ID = "openai:codex"
     private const val CANONICAL_API_KEY_PROFILE_ID = "openai:api-key"
     private const val PRIMARY_ROW_KEY = "primary"
+    private const val SHARED_STORE_ROW_KEY = "authProfiles.store"
+    private const val SHARED_STATE_ROW_KEY = "authProfiles.state"
+    private const val SHARED_OWNERSHIP_ROW_KEY = "auth.sharedStore"
     private const val AGENT_ID = "main"
     private const val AGENT_SCHEMA_VERSION = 1
-
     private val operationMutex = Mutex()
 
     enum class CredentialType {
@@ -100,12 +103,103 @@ internal object OpenClawAuthProfileStore {
         val result: (changed: Boolean) -> T,
     )
 
+    private data class AuthSqliteRowSpec(
+        val table: String,
+        val keyColumn: String,
+        val jsonColumn: String,
+        val rowKey: String,
+    )
+
+    private data class AuthSqliteStorage(
+        val file: File,
+        val store: AuthSqliteRowSpec,
+        val state: AuthSqliteRowSpec,
+        val timestampColumn: String,
+        val shared: Boolean,
+    )
+
+    private data class StoredAuthRow(
+        val rawJson: String,
+        val payload: JSONObject,
+        val updatedAt: Long,
+    )
+
     fun authProfilesJsonFile(rootfsDir: File): File {
         return File(rootfsDir, AGENT_AUTH_PROFILES_PATH)
     }
 
     fun authProfilesSqliteFile(rootfsDir: File): File {
         return File(rootfsDir, AGENT_AUTH_SQLITE_PATH)
+    }
+    private fun legacyAuthStorage(rootfsDir: File): AuthSqliteStorage =
+        AuthSqliteStorage(
+            file = authProfilesSqliteFile(rootfsDir),
+            store = AuthSqliteRowSpec(
+                table = "auth_profile_store",
+                keyColumn = "store_key",
+                jsonColumn = "store_json",
+                rowKey = PRIMARY_ROW_KEY,
+            ),
+            state = AuthSqliteRowSpec(
+                table = "auth_profile_state",
+                keyColumn = "state_key",
+                jsonColumn = "state_json",
+                rowKey = PRIMARY_ROW_KEY,
+            ),
+            timestampColumn = "updated_at",
+            shared = false,
+        )
+
+    private fun sharedAuthStorage(rootfsDir: File): AuthSqliteStorage {
+        val store = AuthSqliteRowSpec(
+            table = "config_machine_state",
+            keyColumn = "state_key",
+            jsonColumn = "value_json",
+            rowKey = SHARED_STORE_ROW_KEY,
+        )
+        return AuthSqliteStorage(
+            file = File(rootfsDir, SHARED_AUTH_SQLITE_PATH),
+            store = store,
+            state = store.copy(rowKey = SHARED_STATE_ROW_KEY),
+            timestampColumn = "updated_at_ms",
+            shared = true,
+        )
+    }
+
+    private fun resolveAuthStorage(rootfsDir: File): AuthSqliteStorage {
+        val shared = sharedAuthStorage(rootfsDir)
+        if (!shared.file.isFile) return legacyAuthStorage(rootfsDir)
+        val ownsSharedAuth = runCatching {
+            SQLiteDatabase.openDatabase(
+                shared.file.path,
+                null,
+                SQLiteDatabase.OPEN_READONLY,
+            ).use { database ->
+                database.rawQuery(
+                    "SELECT value_json FROM config_machine_state WHERE state_key = ?",
+                    arrayOf(SHARED_OWNERSHIP_ROW_KEY),
+                ).use { cursor ->
+                    cursor.moveToFirst() &&
+                        JSONObject(cursor.getString(0)).optString("location") == "state-db"
+                }
+            }
+        }.getOrDefault(false)
+        return if (ownsSharedAuth) shared else legacyAuthStorage(rootfsDir)
+    }
+
+    private fun prepareAuthStorage(database: SQLiteDatabase, storage: AuthSqliteStorage) {
+        if (!storage.shared) {
+            ensureAgentSchema(database)
+            return
+        }
+        check(
+            database.rawQuery(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                arrayOf(storage.store.table),
+            ).use { it.moveToFirst() },
+        ) {
+            "OpenClaw shared auth state table is missing."
+        }
     }
 
     private fun <T> withOperationLock(block: () -> T): T {
@@ -118,15 +212,176 @@ internal object OpenClawAuthProfileStore {
     fun readRawSnapshot(rootfsDir: File, preferenceApiKey: String? = null): RawAuthSnapshot {
         return withOperationLock { readRawSnapshotUnlocked(rootfsDir, preferenceApiKey) }
     }
+    internal fun reconcileSharedAuthRelocationConflict(rootfsDir: File): Boolean =
+        withOperationLock {
+            val legacy = legacyAuthStorage(rootfsDir)
+            val shared = sharedAuthStorage(rootfsDir)
+            if (!legacy.file.isFile || !shared.file.isFile) return@withOperationLock false
+
+            val sourceStore = readStoredAuthRow(legacy, legacy.store)
+            val sourceState = readStoredAuthRow(legacy, legacy.state)
+            if (sourceStore == null && sourceState == null) return@withOperationLock false
+            val targetStore = readStoredAuthRow(shared, shared.store)
+            val targetState = readStoredAuthRow(shared, shared.state)
+
+            val storeConflict = sourceStore != null && targetStore != null &&
+                !storedAuthRowsMatch(sourceStore, targetStore)
+            val stateConflict = sourceState != null && targetState != null &&
+                !storedAuthRowsMatch(sourceState, targetState)
+            if (!storeConflict && !stateConflict) return@withOperationLock false
+
+            val reconciledStore = if (storeConflict) {
+                mergeAuthStores(sourceStore!!.payload, targetStore!!.payload)
+            } else {
+                sourceStore?.payload ?: targetStore?.payload
+            }
+            val reconciledState = if (stateConflict) {
+                mergeAuthStates(sourceState!!.payload, targetState!!.payload)
+            } else {
+                sourceState?.payload ?: targetState?.payload
+            }
+            if (reconciledStore != null && reconciledState != null) {
+                pruneStateToExistingProfiles(
+                    reconciledState,
+                    reconciledStore.optJSONObject("profiles") ?: JSONObject(),
+                )
+            }
+            val timestamp = maxOf(
+                sourceStore?.updatedAt ?: 0L,
+                sourceState?.updatedAt ?: 0L,
+                targetStore?.updatedAt ?: 0L,
+                targetState?.updatedAt ?: 0L,
+                System.currentTimeMillis(),
+            )
+
+            writeReconciledRows(
+                storage = shared,
+                store = reconciledStore?.takeIf { sourceStore != null && targetStore != null },
+                state = reconciledState?.takeIf { sourceState != null && targetState != null },
+                timestamp = timestamp,
+            )
+            writeReconciledRows(
+                storage = legacy,
+                store = reconciledStore?.takeIf { sourceStore != null && targetStore != null },
+                state = reconciledState?.takeIf { sourceState != null && targetState != null },
+                timestamp = timestamp,
+            )
+            if (reconciledStore != null && reconciledState != null) {
+                val canonicalStorage = resolveAuthStorage(rootfsDir)
+                if (canonicalStorage.shared) {
+                    retireLegacyJsonStore(rootfsDir, MigrationHooks())
+                } else {
+                    writeJsonStoreAtomically(
+                        rootfsDir,
+                        buildJsonMirror(reconciledStore, reconciledState),
+                        MigrationHooks(),
+                    )
+                }
+            }
+            true
+        }
+
+    private fun mergeAuthStores(source: JSONObject, target: JSONObject): JSONObject {
+        val merged = target.deepCopy()
+        for (key in source.keys().asSequence().toList()) {
+            if (key == "profiles") continue
+            merged.put(key, deepCopyJsonValue(source.get(key)))
+        }
+        val profiles = target.optJSONObject("profiles")?.deepCopy() ?: JSONObject()
+        val sourceProfiles = source.optJSONObject("profiles")
+        if (sourceProfiles != null) {
+            for (profileId in sourceProfiles.keys().asSequence().toList()) {
+                profiles.put(profileId, deepCopyJsonValue(sourceProfiles.get(profileId)))
+            }
+        }
+        merged.put("profiles", profiles)
+        if (!merged.has("version")) merged.put("version", 1)
+        return merged
+    }
+
+    private fun mergeAuthStates(source: JSONObject, target: JSONObject): JSONObject {
+        val merged = target.deepCopy()
+        for (key in source.keys().asSequence().toList()) {
+            val sourceValue = source.get(key)
+            val targetValue = merged.opt(key)
+            if (sourceValue is JSONObject && targetValue is JSONObject) {
+                val mergedObject = targetValue.deepCopy()
+                for (nestedKey in sourceValue.keys().asSequence().toList()) {
+                    mergedObject.put(nestedKey, deepCopyJsonValue(sourceValue.get(nestedKey)))
+                }
+                merged.put(key, mergedObject)
+            } else {
+                merged.put(key, deepCopyJsonValue(sourceValue))
+            }
+        }
+        return merged
+    }
+
+    private fun storedAuthRowsMatch(left: StoredAuthRow, right: StoredAuthRow): Boolean =
+        left.updatedAt == right.updatedAt && left.rawJson == right.rawJson
+
+    private fun readStoredAuthRow(
+        storage: AuthSqliteStorage,
+        row: AuthSqliteRowSpec,
+    ): StoredAuthRow? {
+        if (!storage.file.isFile) return null
+        return SQLiteDatabase.openDatabase(
+            storage.file.path,
+            null,
+            SQLiteDatabase.OPEN_READONLY,
+        ).use { database ->
+            database.rawQuery(
+                """
+                SELECT ${row.jsonColumn}, ${storage.timestampColumn}
+                FROM ${row.table}
+                WHERE ${row.keyColumn} = ?
+                """.trimIndent(),
+                arrayOf(row.rowKey),
+            ).use { cursor ->
+                if (!cursor.moveToFirst()) return null
+                val rawJson = cursor.getString(0)
+                StoredAuthRow(
+                    rawJson = rawJson,
+                    payload = JSONObject(rawJson),
+                    updatedAt = cursor.getLong(1),
+                )
+            }
+        }
+    }
+
+    private fun writeReconciledRows(
+        storage: AuthSqliteStorage,
+        store: JSONObject?,
+        state: JSONObject?,
+        timestamp: Long,
+    ) {
+        if (store == null && state == null) return
+        SQLiteDatabase.openDatabase(
+            storage.file.path,
+            null,
+            SQLiteDatabase.OPEN_READWRITE,
+        ).use { database ->
+            database.rawQuery("PRAGMA busy_timeout = 5000", null).use { it.moveToFirst() }
+            database.beginTransaction()
+            try {
+                if (store != null) upsertJsonRow(database, storage, storage.store, store, timestamp)
+                if (state != null) upsertJsonRow(database, storage, storage.state, state, timestamp)
+                database.setTransactionSuccessful()
+            } finally {
+                database.endTransaction()
+            }
+        }
+    }
 
     private fun readRawSnapshotUnlocked(
         rootfsDir: File,
         preferenceApiKey: String? = null,
     ): RawAuthSnapshot {
+        val storage = resolveAuthStorage(rootfsDir)
         return RawAuthSnapshot(
             jsonStore = readJsonStore(rootfsDir)?.deepCopy(),
-            sqliteStore = readSqliteRow(rootfsDir, "auth_profile_store", "store_key", "store_json")?.deepCopy(),
-            sqliteState = readSqliteRow(rootfsDir, "auth_profile_state", "state_key", "state_json")?.deepCopy(),
+            sqliteStore = readSqliteRow(storage, storage.store)?.deepCopy(),
+            sqliteState = readSqliteRow(storage, storage.state)?.deepCopy(),
             preferenceApiKey = preferenceApiKey?.trim()?.takeIf { it.isNotEmpty() },
         )
     }
@@ -134,12 +389,13 @@ internal object OpenClawAuthProfileStore {
     private fun readRawSnapshotInTransaction(
         rootfsDir: File,
         db: SQLiteDatabase,
+        storage: AuthSqliteStorage,
         preferenceApiKey: String?,
     ): RawAuthSnapshot {
         return RawAuthSnapshot(
             jsonStore = readJsonStore(rootfsDir)?.deepCopy(),
-            sqliteStore = readSqliteRow(db, "auth_profile_store", "store_key", "store_json")?.deepCopy(),
-            sqliteState = readSqliteRow(db, "auth_profile_state", "state_key", "state_json")?.deepCopy(),
+            sqliteStore = readSqliteRow(db, storage, storage.store)?.deepCopy(),
+            sqliteState = readSqliteRow(db, storage, storage.state)?.deepCopy(),
             preferenceApiKey = preferenceApiKey?.trim()?.takeIf { it.isNotEmpty() },
         )
     }
@@ -150,7 +406,8 @@ internal object OpenClawAuthProfileStore {
         hooks: MigrationHooks,
         mutation: (RawAuthSnapshot) -> CanonicalMutation<T>,
     ): T {
-        val databaseFile = authProfilesSqliteFile(rootfsDir)
+        val storage = resolveAuthStorage(rootfsDir)
+        val databaseFile = storage.file
         databaseFile.parentFile?.mkdirs()
         SQLiteDatabase.openOrCreateDatabase(databaseFile, null).use { db ->
             db.rawQuery("PRAGMA busy_timeout = 5000", null).use { it.moveToFirst() }
@@ -159,14 +416,20 @@ internal object OpenClawAuthProfileStore {
             var snapshot: RawAuthSnapshot? = null
             var mirrorPersisted = false
             try {
-                ensureAgentSchema(db)
-                val currentSnapshot = readRawSnapshotInTransaction(rootfsDir, db, preferenceApiKey)
+                prepareAuthStorage(db, storage)
+                val currentSnapshot = readRawSnapshotInTransaction(
+                    rootfsDir,
+                    db,
+                    storage,
+                    preferenceApiKey,
+                )
                 snapshot = currentSnapshot
                 val operation = mutation(currentSnapshot)
                 val changed = operation.payload?.let { payload ->
                     val persisted = persistCanonicalPayloadInTransaction(
                         rootfsDir = rootfsDir,
                         db = db,
+                        storage = storage,
                         snapshot = currentSnapshot,
                         payload = payload,
                         hooks = hooks,
@@ -197,14 +460,17 @@ internal object OpenClawAuthProfileStore {
         preferenceApiKey: String? = null,
         read: (RawAuthSnapshot) -> T,
     ): T {
-        val databaseFile = authProfilesSqliteFile(rootfsDir)
+        val storage = resolveAuthStorage(rootfsDir)
+        val databaseFile = storage.file
         databaseFile.parentFile?.mkdirs()
         SQLiteDatabase.openOrCreateDatabase(databaseFile, null).use { db ->
             db.rawQuery("PRAGMA busy_timeout = 5000", null).use { it.moveToFirst() }
             db.beginTransaction()
             try {
-                ensureAgentSchema(db)
-                val result = read(readRawSnapshotInTransaction(rootfsDir, db, preferenceApiKey))
+                prepareAuthStorage(db, storage)
+                val result = read(
+                    readRawSnapshotInTransaction(rootfsDir, db, storage, preferenceApiKey),
+                )
                 db.setTransactionSuccessful()
                 return result
             } finally {
@@ -218,7 +484,8 @@ internal object OpenClawAuthProfileStore {
         hooks: MigrationHooks,
         mutation: (store: JSONObject, state: JSONObject) -> T,
     ): T {
-        val databaseFile = authProfilesSqliteFile(rootfsDir)
+        val storage = resolveAuthStorage(rootfsDir)
+        val databaseFile = storage.file
         databaseFile.parentFile?.mkdirs()
         SQLiteDatabase.openOrCreateDatabase(databaseFile, null).use { db ->
             db.rawQuery("PRAGMA busy_timeout = 5000", null).use { it.moveToFirst() }
@@ -227,8 +494,8 @@ internal object OpenClawAuthProfileStore {
             var snapshot: RawAuthSnapshot? = null
             var mirrorPersisted = false
             try {
-                ensureAgentSchema(db)
-                val currentSnapshot = readRawSnapshotInTransaction(rootfsDir, db, null)
+                prepareAuthStorage(db, storage)
+                val currentSnapshot = readRawSnapshotInTransaction(rootfsDir, db, storage, null)
                 snapshot = currentSnapshot
                 val store = selectSelectionRestoreStoreBase(currentSnapshot)
                 if (!store.has("version")) store.put("version", 1)
@@ -238,13 +505,14 @@ internal object OpenClawAuthProfileStore {
                 persistSelectionOnlyInTransaction(
                     rootfsDir = rootfsDir,
                     db = db,
+                    storage = storage,
                     snapshot = currentSnapshot,
                     store = store,
                     state = state,
                     hooks = hooks,
                 )
                 mirrorPersisted = true
-                val after = readRawSnapshotInTransaction(rootfsDir, db, null)
+                val after = readRawSnapshotInTransaction(rootfsDir, db, storage, null)
                 check(jsonContentEquals(after.sqliteStore, store)) {
                     "OpenClaw non-OpenAI auth profile store read-back mismatch."
                 }
@@ -341,28 +609,17 @@ internal object OpenClawAuthProfileStore {
     ): Boolean {
         require(profileId.isNotBlank()) { "OpenAI auth profile id must not be blank." }
         return withOperationLock {
-            val databaseFile = authProfilesSqliteFile(rootfsDir)
-            if (!databaseFile.isFile) return@withOperationLock false
+            val storage = resolveAuthStorage(rootfsDir)
+            if (!storage.file.isFile) return@withOperationLock false
             val sqliteSnapshot = runCatching {
                 SQLiteDatabase.openDatabase(
-                    databaseFile.path,
+                    storage.file.path,
                     null,
                     SQLiteDatabase.OPEN_READONLY,
                 ).use { db ->
-                    db.rawQuery(
-                        """
-                        SELECT
-                          (SELECT store_json FROM auth_profile_store WHERE store_key = ?) AS store_json,
-                          (SELECT state_json FROM auth_profile_state WHERE state_key = ?) AS state_json
-                        """.trimIndent(),
-                        arrayOf(PRIMARY_ROW_KEY, PRIMARY_ROW_KEY),
-                    ).use { cursor ->
-                        if (!cursor.moveToFirst() || cursor.isNull(0) || cursor.isNull(1)) {
-                            null
-                        } else {
-                            JSONObject(cursor.getString(0)) to JSONObject(cursor.getString(1))
-                        }
-                    }
+                    val store = readSqliteRow(db, storage, storage.store)
+                    val state = readSqliteRow(db, storage, storage.state)
+                    if (store == null || state == null) null else store to state
                 }
             }.getOrNull() ?: return@withOperationLock false
             val (store, state) = sqliteSnapshot
@@ -715,7 +972,8 @@ internal object OpenClawAuthProfileStore {
         previous: OpenAiSelectionSnapshot,
     ) {
         withOperationLock {
-            val databaseFile = authProfilesSqliteFile(rootfsDir)
+            val storage = resolveAuthStorage(rootfsDir)
+            val databaseFile = storage.file
             databaseFile.parentFile?.mkdirs()
             SQLiteDatabase.openOrCreateDatabase(databaseFile, null).use { db ->
                 db.rawQuery("PRAGMA busy_timeout = 5000", null).use { it.moveToFirst() }
@@ -724,16 +982,23 @@ internal object OpenClawAuthProfileStore {
                 var before: RawAuthSnapshot? = null
                 var mirrorPersisted = false
                 try {
-                    ensureAgentSchema(db)
-                    val currentSnapshot = readRawSnapshotInTransaction(rootfsDir, db, null)
+                    prepareAuthStorage(db, storage)
+                    val currentSnapshot = readRawSnapshotInTransaction(rootfsDir, db, storage, null)
                     before = currentSnapshot
                     val store = selectSelectionRestoreStoreBase(currentSnapshot)
                     val state = selectStateBase(currentSnapshot)
                     restoreSelectionContainer(state, "lastGood", previous.lastGood)
                     restoreSelectionContainer(state, "order", previous.order)
-                    persistSelectionOnlyInTransaction(rootfsDir, db, currentSnapshot, store, state)
+                    persistSelectionOnlyInTransaction(
+                        rootfsDir,
+                        db,
+                        storage,
+                        currentSnapshot,
+                        store,
+                        state,
+                    )
                     mirrorPersisted = true
-                    val after = readRawSnapshotInTransaction(rootfsDir, db, null)
+                    val after = readRawSnapshotInTransaction(rootfsDir, db, storage, null)
                     check(selectionSnapshotEquals(captureOpenAiSelectionSnapshotUnlocked(after), previous)) {
                         "OpenClaw OpenAI auth selection read-back mismatch."
                     }
@@ -1117,6 +1382,7 @@ internal object OpenClawAuthProfileStore {
     private fun persistSelectionOnlyInTransaction(
         rootfsDir: File,
         db: SQLiteDatabase,
+        storage: AuthSqliteStorage,
         snapshot: RawAuthSnapshot,
         store: JSONObject,
         state: JSONObject,
@@ -1125,22 +1391,36 @@ internal object OpenClawAuthProfileStore {
         val mirror = buildJsonMirror(store, state)
         val sqliteChanged = !jsonContentEquals(snapshot.sqliteStore, store) ||
             !jsonContentEquals(snapshot.sqliteState, state)
-        val jsonChanged = !jsonContentEquals(snapshot.jsonStore, mirror)
+        val jsonChanged = if (storage.shared) {
+            authProfilesJsonFile(rootfsDir).isFile
+        } else {
+            !jsonContentEquals(snapshot.jsonStore, mirror)
+        }
         var jsonReplaced = false
         try {
             if (sqliteChanged) {
-                upsertJsonRow(db, "auth_profile_store", "store_key", "store_json", store)
+                upsertJsonRow(db, storage, storage.store, store)
                 hooks.afterStoreUpsert?.invoke()
-                upsertJsonRow(db, "auth_profile_state", "state_key", "state_json", state)
+                upsertJsonRow(db, storage, storage.state, state)
             }
-            verifySqlitePayload(db, store, state)
+            verifySqlitePayload(db, storage, store, state)
             if (jsonChanged) {
-                writeJsonStoreAtomically(rootfsDir, mirror, hooks)
+                if (storage.shared) {
+                    retireLegacyJsonStore(rootfsDir, hooks)
+                } else {
+                    writeJsonStoreAtomically(rootfsDir, mirror, hooks)
+                }
                 jsonReplaced = true
             }
-            val verifiedMirror = readJsonStore(rootfsDir)
-            check(jsonContentEquals(verifiedMirror, mirror)) {
-                "OpenClaw auth JSON mirror selection read-back mismatch."
+            if (storage.shared) {
+                check(!authProfilesJsonFile(rootfsDir).exists()) {
+                    "Retired OpenClaw auth JSON store still exists after shared-state write."
+                }
+            } else {
+                val verifiedMirror = readJsonStore(rootfsDir)
+                check(jsonContentEquals(verifiedMirror, mirror)) {
+                    "OpenClaw auth JSON mirror selection read-back mismatch."
+                }
             }
         } catch (failure: Throwable) {
             if (jsonReplaced) {
@@ -1157,6 +1437,7 @@ internal object OpenClawAuthProfileStore {
     private fun persistCanonicalPayloadInTransaction(
         rootfsDir: File,
         db: SQLiteDatabase,
+        storage: AuthSqliteStorage,
         snapshot: RawAuthSnapshot,
         payload: CanonicalPayload,
         hooks: MigrationHooks,
@@ -1165,22 +1446,38 @@ internal object OpenClawAuthProfileStore {
         val sqliteChanged = !jsonContentEquals(snapshot.sqliteStore, payload.store) ||
             !jsonContentEquals(snapshot.sqliteState, payload.state)
         val mirror = buildJsonMirror(payload.store, payload.state)
-        val jsonChanged = !jsonContentEquals(snapshot.jsonStore, mirror)
+        val jsonChanged = if (storage.shared) {
+            authProfilesJsonFile(rootfsDir).isFile
+        } else {
+            !jsonContentEquals(snapshot.jsonStore, mirror)
+        }
         var jsonReplaced = false
         try {
             if (sqliteChanged) {
-                upsertJsonRow(db, "auth_profile_store", "store_key", "store_json", payload.store)
+                upsertJsonRow(db, storage, storage.store, payload.store)
                 hooks.afterStoreUpsert?.invoke()
-                upsertJsonRow(db, "auth_profile_state", "state_key", "state_json", payload.state)
+                upsertJsonRow(db, storage, storage.state, payload.state)
             }
-            verifySqlitePayload(db, payload.store, payload.state)
+            verifySqlitePayload(db, storage, payload.store, payload.state)
             if (jsonChanged) {
-                writeJsonStoreAtomically(rootfsDir, mirror, hooks)
+                if (storage.shared) {
+                    retireLegacyJsonStore(rootfsDir, hooks)
+                } else {
+                    writeJsonStoreAtomically(rootfsDir, mirror, hooks)
+                }
                 jsonReplaced = true
             }
-            val verifiedMirror = readJsonStore(rootfsDir)
-            check(jsonContentEquals(verifiedMirror, mirror)) { "OpenClaw auth JSON mirror read-back mismatch." }
-            verifyCanonicalProfilesInMirror(payload.store, verifiedMirror)
+            if (storage.shared) {
+                check(!authProfilesJsonFile(rootfsDir).exists()) {
+                    "Retired OpenClaw auth JSON store still exists after shared-state write."
+                }
+            } else {
+                val verifiedMirror = readJsonStore(rootfsDir)
+                check(jsonContentEquals(verifiedMirror, mirror)) {
+                    "OpenClaw auth JSON mirror read-back mismatch."
+                }
+                verifyCanonicalProfilesInMirror(payload.store, verifiedMirror)
+            }
             return sqliteChanged || jsonChanged
         } catch (failure: Throwable) {
             if (jsonReplaced) {
@@ -1208,23 +1505,33 @@ internal object OpenClawAuthProfileStore {
 
     private fun upsertJsonRow(
         db: SQLiteDatabase,
-        table: String,
-        keyColumn: String,
-        jsonColumn: String,
+        storage: AuthSqliteStorage,
+        row: AuthSqliteRowSpec,
         payload: JSONObject,
+        timestamp: Long = System.currentTimeMillis(),
     ) {
         val values = ContentValues().apply {
-            put(keyColumn, PRIMARY_ROW_KEY)
-            put(jsonColumn, payload.toString())
-            put("updated_at", System.currentTimeMillis())
+            put(row.keyColumn, row.rowKey)
+            put(row.jsonColumn, payload.toString())
+            put(storage.timestampColumn, timestamp)
         }
-        val rowId = db.insertWithOnConflict(table, null, values, SQLiteDatabase.CONFLICT_REPLACE)
-        check(rowId != -1L) { "OpenClaw auth SQLite upsert failed for $table." }
+        val rowId = db.insertWithOnConflict(
+            row.table,
+            null,
+            values,
+            SQLiteDatabase.CONFLICT_REPLACE,
+        )
+        check(rowId != -1L) { "OpenClaw auth SQLite upsert failed for ${row.table}." }
     }
 
-    private fun verifySqlitePayload(db: SQLiteDatabase, store: JSONObject, state: JSONObject) {
-        val actualStore = readSqliteRow(db, "auth_profile_store", "store_key", "store_json")
-        val actualState = readSqliteRow(db, "auth_profile_state", "state_key", "state_json")
+    private fun verifySqlitePayload(
+        db: SQLiteDatabase,
+        storage: AuthSqliteStorage,
+        store: JSONObject,
+        state: JSONObject,
+    ) {
+        val actualStore = readSqliteRow(db, storage, storage.store)
+        val actualState = readSqliteRow(db, storage, storage.state)
         check(jsonContentEquals(actualStore, store)) { "OpenClaw auth profile store read-back mismatch." }
         check(jsonContentEquals(actualState, state)) { "OpenClaw auth profile state read-back mismatch." }
         val profiles = actualStore?.optJSONObject("profiles") ?: error("OpenClaw auth profile store has no profiles.")
@@ -1241,6 +1548,14 @@ internal object OpenClawAuthProfileStore {
             mirror.put(key, deepCopyJsonValue(state.get(key)))
         }
         return mirror
+    }
+
+    private fun retireLegacyJsonStore(rootfsDir: File, hooks: MigrationHooks): Boolean {
+        val authFile = authProfilesJsonFile(rootfsDir)
+        if (!authFile.exists()) return false
+        hooks.beforeJsonReplace?.invoke()
+        check(authFile.delete()) { "Failed to retire OpenClaw auth JSON store." }
+        return true
     }
 
     private fun writeJsonStoreAtomically(
@@ -1275,29 +1590,29 @@ internal object OpenClawAuthProfileStore {
     }
 
     private fun readSqliteRow(
-        rootfsDir: File,
-        table: String,
-        keyColumn: String,
-        jsonColumn: String,
+        storage: AuthSqliteStorage,
+        row: AuthSqliteRowSpec,
     ): JSONObject? {
-        val databaseFile = authProfilesSqliteFile(rootfsDir)
-        if (!databaseFile.isFile) return null
+        if (!storage.file.isFile) return null
         return runCatching {
-            SQLiteDatabase.openDatabase(databaseFile.path, null, SQLiteDatabase.OPEN_READONLY).use { db ->
-                readSqliteRow(db, table, keyColumn, jsonColumn)
+            SQLiteDatabase.openDatabase(
+                storage.file.path,
+                null,
+                SQLiteDatabase.OPEN_READONLY,
+            ).use { db ->
+                readSqliteRow(db, storage, row)
             }
         }.getOrNull()
     }
 
     private fun readSqliteRow(
         db: SQLiteDatabase,
-        table: String,
-        keyColumn: String,
-        jsonColumn: String,
+        storage: AuthSqliteStorage,
+        row: AuthSqliteRowSpec,
     ): JSONObject? {
         db.rawQuery(
-            "SELECT $jsonColumn FROM $table WHERE $keyColumn = ?",
-            arrayOf(PRIMARY_ROW_KEY),
+            "SELECT ${row.jsonColumn} FROM ${row.table} WHERE ${row.keyColumn} = ?",
+            arrayOf(row.rowKey),
         ).use { cursor ->
             if (!cursor.moveToFirst()) return null
             return JSONObject(cursor.getString(0))
@@ -1363,6 +1678,19 @@ internal object OpenClawAuthProfileStore {
             )
             """.trimIndent(),
         )
+        val userVersion = db.rawQuery("PRAGMA user_version", null).use { cursor ->
+            check(cursor.moveToFirst())
+            cursor.getInt(0)
+        }
+        val metadataVersion = db.rawQuery(
+            "SELECT schema_version FROM schema_meta WHERE meta_key = ?",
+            arrayOf(PRIMARY_ROW_KEY),
+        ).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getInt(0) else 0
+        }
+        if (userVersion > AGENT_SCHEMA_VERSION || metadataVersion > AGENT_SCHEMA_VERSION) {
+            return
+        }
         db.execSQL("PRAGMA user_version = $AGENT_SCHEMA_VERSION")
 
         val now = System.currentTimeMillis()
