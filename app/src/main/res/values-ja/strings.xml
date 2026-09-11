@@ -372,4 +372,5 @@
     <string name="settings_transfer_error_import_failed">転送ファイルを取り込めませんでした。</string>
     <string name="settings_transfer_export_success">転送ファイルの書き出しが完了しました。</string>
     <string name="settings_transfer_share_failed">転送ファイルを共有できませんでした。</string>
+    <string name="settings_openclaw_doctor_stop_failed">ゲートウェイを停止できなかったため、修復を開始していません。ゲートウェイを停止してから、もう一度お試しください。</string>
 </resources>

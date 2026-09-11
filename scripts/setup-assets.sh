@@ -573,7 +573,7 @@ const { pathToFileURL } = require('node:url');
   }
 
   const storeModuleCandidates = fs.readdirSync(openClawDist)
-    .filter((name) => /^installed-plugin-index-store-[A-Za-z0-9_-]+\.js$/.test(name));
+    .filter((name) => /^installed-plugin-index-store-[A-Za-z0-9_-]+\.(?:mjs|js)$/.test(name));
   if (storeModuleCandidates.length === 0) {
     throw new Error('Cannot find OpenClaw installed plugin index store module');
   }
@@ -737,17 +737,6 @@ NODE
     AFTER=$(find . -type f | wc -l)
     echo "   Pruned: $BEFORE -> $AFTER files"
 
-    # 성능 패치: prewarmConfiguredPrimaryModel 스킵
-    # implicit provider discovery가 30+ 플러그인을 순차 로드하면서
-    # 모바일 환경에서 ~60초 소요되지만, andClaw는 env로 API 키를
-    # 전달하므로 discovery 결과가 항상 0건. 완전히 무의미한 작업이라 스킵.
-    PREWARM_FILE=$(grep -rl "async function prewarmConfiguredPrimaryModel" usr/local/lib/node_modules/openclaw/dist/*.js 2>/dev/null || true)
-    if [ -n "$PREWARM_FILE" ]; then
-        sed -i 's/async function prewarmConfiguredPrimaryModel(params) *{/async function prewarmConfiguredPrimaryModel(params){if(globalThis.OPENCLAW_SKIP_MODEL_WARMUP)return;/' "$PREWARM_FILE"
-        echo "   patched prewarmConfiguredPrimaryModel skip in $(basename "$PREWARM_FILE")"
-    else
-        echo "   ⚠ prewarmConfiguredPrimaryModel not found — skip patch not applied"
-    fi
 
     tar cf /tmp/openclaw-arm64.tar usr/ root/.openclaw/andclaw-bundled-plugins
     cd / && rm -rf "$PRUNE_DIR"

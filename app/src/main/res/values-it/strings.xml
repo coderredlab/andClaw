@@ -372,4 +372,5 @@ Non chiudere né forzare l’arresto dell’app mentre il ripristino è in corso
     <string name="settings_transfer_error_import_failed">Impossibile importare il file di trasferimento.</string>
     <string name="settings_transfer_export_success">Esportazione del trasferimento completata.</string>
     <string name="settings_transfer_share_failed">Impossibile condividere il file di trasferimento.</string>
+    <string name="settings_openclaw_doctor_stop_failed">Impossibile arrestare il gateway. La riparazione non è stata avviata. Arresti il gateway e riprovi.</string>
 </resources>

@@ -372,4 +372,5 @@ Ne fermez pas l’application et ne forcez pas son arrêt tant que la récupéra
     <string name="settings_transfer_error_import_failed">Échec de l’import du fichier de transfert.</string>
     <string name="settings_transfer_export_success">Export du fichier de transfert terminé.</string>
     <string name="settings_transfer_share_failed">Impossible de partager le fichier de transfert.</string>
+    <string name="settings_openclaw_doctor_stop_failed">La passerelle n’a pas pu être arrêtée. La réparation n’a pas commencé. Veuillez arrêter la passerelle et réessayer.</string>
 </resources>

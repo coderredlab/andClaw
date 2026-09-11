@@ -117,6 +117,12 @@ class SettingsViewModel(
         (Context, OpenAiConnectionMode, String) -> Unit = { context, targetMode, source ->
             GatewayService.setOpenAiConnectionMode(context, targetMode, source)
         },
+    private val gatewayStopRequester: (Context, String) -> Unit = { context, source ->
+        GatewayService.stop(context, source)
+    },
+    private val gatewayStartRequester: (Context, String) -> Unit = { context, source ->
+        GatewayService.start(context, source = source)
+    },
 ) : AndroidViewModel(application) {
 
     constructor(application: Application) : this(application, DefaultSettingsTransferManager())
@@ -1706,8 +1712,23 @@ class SettingsViewModel(
     fun runOpenClawDoctorFix() {
         if (_isDoctorFixRunning.value || _isRecoveryInstallRunning.value || _isOpenClawUpdateRunning.value) return
         _isDoctorFixRunning.value = true
-        viewModelScope.launch(Dispatchers.IO) {
+        _doctorFixResult.value = null
+        viewModelScope.launch(ioDispatcher) {
+            val context = getApplication<Application>()
+            val initialStatus = processManager.gatewayState.value.status
+            val restoreGateway = initialStatus == GatewayStatus.RUNNING || initialStatus == GatewayStatus.STARTING
+            var stoppedForRepair = false
             try {
+                if (initialStatus != GatewayStatus.STOPPED) {
+                    gatewayStopRequester(context, "settings:doctor_stop")
+                    val stopped = withTimeoutOrNull(60_000L) {
+                        processManager.gatewayState.first { it.status == GatewayStatus.STOPPED }
+                    }
+                    check(stopped != null) {
+                        context.getString(R.string.settings_openclaw_doctor_stop_failed)
+                    }
+                    stoppedForRepair = true
+                }
                 val launchConfig = prefs.getGatewayLaunchConfigSnapshot()
                 val provider = launchConfig.apiProvider
                 val apiKey = launchConfig.apiKey
@@ -1719,6 +1740,7 @@ class SettingsViewModel(
                     fun resolved(value: String): String = value.ifBlank { "__andclaw_env_placeholder__" }
 
                     put("OPENCLAW_NO_RESPAWN", "1")
+                    put("OPENCLAW_SERVICE_REPAIR_POLICY", "external")
                     put("OPENROUTER_API_KEY", "__andclaw_env_placeholder__")
                     put("OPENAI_API_KEY", "__andclaw_env_placeholder__")
                     put("OPENAI_COMPAT_API_KEY", "__andclaw_env_placeholder__")
@@ -1777,8 +1799,26 @@ class SettingsViewModel(
                         output = result.output.ifBlank { "No output." },
                     )
                 }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: Exception) {
+                _doctorFixResult.value = DoctorFixResult(
+                    success = false,
+                    output = error.message ?: context.getString(R.string.settings_openclaw_doctor_fix_failed),
+                )
             } finally {
-                _isDoctorFixRunning.value = false
+                try {
+                    if (restoreGateway && stoppedForRepair) {
+                        gatewayStartRequester(context, "settings:doctor_restore")
+                    }
+                } catch (error: Exception) {
+                    _doctorFixResult.value = DoctorFixResult(
+                        success = false,
+                        output = error.message ?: context.getString(R.string.settings_openclaw_doctor_fix_failed),
+                    )
+                } finally {
+                    _isDoctorFixRunning.value = false
+                }
             }
         }
     }
@@ -2466,8 +2506,7 @@ class SettingsViewModel(
             val previewResult = runCatching {
                 val sessionEntries = processManager.getSessionLogEntries()
                 val gatewayErrorMessage = processManager.gatewayState.value.errorMessage
-                val gatewayLogLines = processManager.logLines.value +
-                    BugReportBundleBuilder.collectSupplementalRuntimeLogLines(prorootManager.rootfsDir)
+                val gatewayLogLines = processManager.logLines.value
                 buildBugReportPreview(sessionEntries, gatewayErrorMessage, gatewayLogLines)
             }
 
@@ -2519,8 +2558,7 @@ class SettingsViewModel(
                 val context = getApplication<Application>()
                 val sessionEntries = processManager.getSessionLogEntries()
                 val gatewayErrorMessage = processManager.gatewayState.value.errorMessage
-                val gatewayLogLines = processManager.logLines.value +
-                    BugReportBundleBuilder.collectSupplementalRuntimeLogLines(prorootManager.rootfsDir)
+                val gatewayLogLines = processManager.logLines.value
                 val attachments = BugReportBundleBuilder.collectSupplementalRuntimeAttachments(prorootManager.rootfsDir)
                 val metadata = BugReportBundleBuilder.collectMetadata(context)
                 val bundle = BugReportBundleBuilder.build(
@@ -2824,7 +2862,9 @@ class SettingsViewModel(
                         "openai-compatible" -> emptyList()
                         else -> loadBuiltInModels(provider)
                     }
-                    (providerModels + persistedSelectedModels).distinctBy { it.id }
+                    (providerModels + persistedSelectedModels)
+                        .map { it.copy(id = PreferencesManager.canonicalizeModelId(provider, it.id)) }
+                        .distinctBy { it.id }
                 }
                 _availableModels.value = models
                 if (models.isEmpty()) {
@@ -5066,11 +5106,7 @@ internal fun resolveSelectionChangePrimaryDirective(
 ): String? {
     val normalizedProvider = provider.trim().lowercase()
     val normalize: (String) -> String = { modelId ->
-        when (normalizedProvider) {
-            "openai-compatible" -> modelId.trim().removePrefix("openai-compatible/")
-            "ollama", "ollama-cloud" -> modelId.trim().removePrefix("ollama/").removePrefix("ollama-cloud/").removeSuffix(":latest")
-            else -> modelId.trim()
-        }
+        PreferencesManager.canonicalizeModelId(normalizedProvider, modelId)
     }
     val normalizedAppliedIds = appliedModelIds.map(normalize).filter { it.isNotBlank() }.toSet()
     val normalizedCurrentIds = currentSelectedModelIds.map(normalize).filter { it.isNotBlank() }.toSet()

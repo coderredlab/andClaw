@@ -371,4 +371,5 @@ Kurtarma sürerken uygulamayı kapatmayın veya zorla durdurmayın.</string>
     <string name="settings_transfer_error_import_failed">Aktarım dosyası içe aktarılamadı.</string>
     <string name="settings_transfer_export_success">Aktarım dışa aktarma tamamlandı.</string>
     <string name="settings_transfer_share_failed">Aktarım dosyası paylaşılamadı.</string>
+    <string name="settings_openclaw_doctor_stop_failed">Ağ geçidi durdurulamadı. Onarım başlatılmadı. Lütfen ağ geçidini durdurup tekrar deneyin.</string>
 </resources>

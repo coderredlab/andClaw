@@ -377,4 +377,5 @@ Schließen Sie die App nicht und erzwingen Sie keinen Stopp, solange die Wiederh
     <string name="settings_transfer_error_import_failed">Transferdatei konnte nicht importiert werden.</string>
     <string name="settings_transfer_export_success">Transferexport abgeschlossen.</string>
     <string name="settings_transfer_share_failed">Die Transferdatei konnte nicht geteilt werden.</string>
+    <string name="settings_openclaw_doctor_stop_failed">Das Gateway konnte nicht beendet werden. Die Reparatur wurde nicht gestartet. Bitte beenden Sie das Gateway und versuchen Sie es erneut.</string>
 </resources>

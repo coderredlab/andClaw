@@ -23,8 +23,10 @@ internal object OpenClawPluginInstallStateStore {
     private const val LEGACY_INSTALLS_PATH = "root/.openclaw/plugins/installs.json"
     private const val BUNDLED_INSTALLS_TEMPLATE_PATH =
         "root/.openclaw/andclaw-bundled-plugins/install-records.json"
-    private const val INSTALLED_PLUGIN_INDEX_TABLE = "installed_plugin_index"
-    private const val INSTALLED_PLUGIN_INDEX_KEY = "installed-plugin-index"
+    private const val CONFIG_MACHINE_STATE_TABLE = "config_machine_state"
+    private const val CANONICAL_INSTALLED_PLUGIN_INDEX_KEY = "plugins.installedIndex"
+    private const val LEGACY_INSTALLED_PLUGIN_INDEX_TABLE = "installed_plugin_index"
+    private const val LEGACY_INSTALLED_PLUGIN_INDEX_KEY = "installed-plugin-index"
     private val managedPluginIds = listOf("whatsapp", "discord", "codex", "brave", "zai")
 
     fun mergeBundledInstallRecords(
@@ -33,95 +35,31 @@ internal object OpenClawPluginInstallStateStore {
         nowEpochMs: Long,
     ): MergeResult {
         val databaseFile = File(rootfsDir, OPENCLAW_STATE_SQLITE_PATH)
-        if (!databaseFile.isFile) {
-            return MergeResult(
-                changed = false,
-                mergedRecords = 0,
-                conflictingManagedPluginIds = emptyList(),
-                staleManagedPluginIds = emptyList(),
-            )
-        }
+        if (!databaseFile.isFile) return unchangedMergeResult()
 
         SQLiteDatabase.openDatabase(databaseFile.path, null, SQLiteDatabase.OPEN_READWRITE).use { db ->
-            if (!sqliteTableExists(db, INSTALLED_PLUGIN_INDEX_TABLE)) {
-                return MergeResult(
-                    changed = false,
-                    mergedRecords = 0,
-                    conflictingManagedPluginIds = emptyList(),
-                    staleManagedPluginIds = emptyList(),
+            val canonicalRow = readCanonicalInstalledPluginIndexRow(db)
+            if (canonicalRow != null) {
+                return mergeCanonicalInstalledPluginIndex(
+                    db = db,
+                    row = canonicalRow,
+                    template = template,
+                    nowEpochMs = nowEpochMs,
+                )
+            }
+            if (hasCanonicalInstalledPluginIndexRow(db)) {
+                throw SetupException(
+                    "OpenClaw canonical plugin install index is invalid; run stopped-writer Doctor repair before starting the gateway",
                 )
             }
 
-            var installRecordsRaw: String? = null
-            var pluginsRaw: String? = null
-            db.rawQuery(
-                """
-                SELECT install_records_json, plugins_json
-                  FROM installed_plugin_index
-                 WHERE index_key = ?
-                """.trimIndent(),
-                arrayOf(INSTALLED_PLUGIN_INDEX_KEY),
-            ).use { cursor ->
-                if (!cursor.moveToFirst()) {
-                    return MergeResult(
-                        changed = false,
-                        mergedRecords = 0,
-                        conflictingManagedPluginIds = emptyList(),
-                        staleManagedPluginIds = emptyList(),
-                    )
-                }
-                installRecordsRaw = cursor.getString(0)
-                pluginsRaw = cursor.getString(1)
-            }
-
-            val installRecords = JSONObject(installRecordsRaw ?: "{}")
-            val existingPlugins = JSONArray(pluginsRaw ?: "[]")
-            val templateRecords = template.optJSONObject("installRecords")
-                ?: throw SetupException("Bundled OpenClaw plugin install records are missing installRecords")
-            val beforeState = ManagedPluginState(
-                installPaths = managedInstallPaths(installRecords),
-                rootDirs = managedPluginRootDirs(existingPlugins),
-            )
-            val templateState = ManagedPluginState(
-                installPaths = managedInstallPaths(templateRecords),
-                rootDirs = managedPluginRootDirs(template.optJSONArray("plugins") ?: JSONArray()),
-            )
-            val staleBefore = staleManagedPluginIds(beforeState, templateState)
-
-            val beforeInstallRecords = installRecords.toString()
-            val beforePlugins = existingPlugins.toString()
-            val mergedRecords = mergeManagedInstallRecords(installRecords, templateRecords)
-            val mergedPlugins = mergeManagedPluginEntries(existingPlugins, template)
-            val changed = beforeInstallRecords != installRecords.toString() ||
-                beforePlugins != mergedPlugins.toString()
-
-            if (changed) {
-                db.beginTransaction()
-                try {
-                    val values = ContentValues().apply {
-                        put("install_records_json", installRecords.toString())
-                        put("plugins_json", mergedPlugins.toString())
-                        put("updated_at_ms", nowEpochMs)
-                    }
-                    val updated = db.update(
-                        INSTALLED_PLUGIN_INDEX_TABLE,
-                        values,
-                        "index_key = ?",
-                        arrayOf(INSTALLED_PLUGIN_INDEX_KEY),
-                    )
-                    if (updated > 0) {
-                        db.setTransactionSuccessful()
-                    }
-                } finally {
-                    db.endTransaction()
-                }
-            }
-
-            return MergeResult(
-                changed = changed,
-                mergedRecords = mergedRecords,
-                conflictingManagedPluginIds = emptyList(),
-                staleManagedPluginIds = staleBefore,
+            // Before the stopped-writer Doctor migration, this old table is its only plugin-index
+            // input. Do not manufacture a canonical row: the migration preserves its metadata and
+            // atomically drops the retired table after importing it.
+            return mergeLegacyInstalledPluginIndex(
+                db = db,
+                template = template,
+                nowEpochMs = nowEpochMs,
             )
         }
     }
@@ -155,10 +93,10 @@ internal object OpenClawPluginInstallStateStore {
 
         val mergedPlugins = JSONArray()
         for (index in 0 until existingPlugins.length()) {
-            val plugin = existingPlugins.optJSONObject(index) ?: continue
-            val pluginId = plugin.optString("pluginId").trim()
-            if (pluginId !in managedPluginIds) {
-                mergedPlugins.put(plugin)
+            val plugin = existingPlugins.optJSONObject(index)
+            val pluginId = plugin?.optString("pluginId")?.trim()
+            if (pluginId == null || pluginId !in templatePluginsById) {
+                mergedPlugins.put(existingPlugins.get(index))
             }
         }
         managedPluginIds.forEach { pluginId ->
@@ -166,6 +104,138 @@ internal object OpenClawPluginInstallStateStore {
         }
         return mergedPlugins
     }
+
+    private fun mergeCanonicalInstalledPluginIndex(
+        db: SQLiteDatabase,
+        row: CanonicalInstalledPluginIndexRow,
+        template: JSONObject,
+        nowEpochMs: Long,
+    ): MergeResult {
+        val templateRecords = template.optJSONObject("installRecords")
+            ?: throw SetupException("Bundled OpenClaw plugin install records are missing installRecords")
+        val index = row.envelope.optJSONObject("index") ?: return unchangedMergeResult()
+        val installRecords = index.optJSONObject("installRecords") ?: return unchangedMergeResult()
+        val existingPlugins = index.optJSONArray("plugins") ?: return unchangedMergeResult()
+        val beforeState = ManagedPluginState(
+            installPaths = managedInstallPaths(installRecords),
+            rootDirs = managedPluginRootDirs(existingPlugins),
+        )
+        val templateState = ManagedPluginState(
+            installPaths = managedInstallPaths(templateRecords),
+            rootDirs = managedPluginRootDirs(template.optJSONArray("plugins") ?: JSONArray()),
+        )
+        val staleBefore = staleManagedPluginIds(beforeState, templateState)
+
+        val beforeInstallRecords = installRecords.toString()
+        val beforePlugins = existingPlugins.toString()
+        val mergedRecords = mergeManagedInstallRecords(installRecords, templateRecords)
+        val mergedPlugins = mergeManagedPluginEntries(existingPlugins, template)
+        val changed = beforeInstallRecords != installRecords.toString() ||
+            beforePlugins != mergedPlugins.toString()
+        if (!changed) {
+            return MergeResult(
+                changed = false,
+                mergedRecords = mergedRecords,
+                conflictingManagedPluginIds = emptyList(),
+                staleManagedPluginIds = staleBefore,
+            )
+        }
+
+        index.put("plugins", mergedPlugins)
+        val revision = maxOf(nowEpochMs, row.revision + 1)
+        row.envelope.put("revision", revision)
+        db.beginTransaction()
+        try {
+            val values = ContentValues().apply {
+                put("value_json", row.envelope.toString())
+                put("updated_at_ms", revision)
+            }
+            db.update(
+                CONFIG_MACHINE_STATE_TABLE,
+                values,
+                "state_key = ?",
+                arrayOf(CANONICAL_INSTALLED_PLUGIN_INDEX_KEY),
+            )
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+        return MergeResult(
+            changed = true,
+            mergedRecords = mergedRecords,
+            conflictingManagedPluginIds = emptyList(),
+            staleManagedPluginIds = staleBefore,
+        )
+    }
+
+    private fun mergeLegacyInstalledPluginIndex(
+        db: SQLiteDatabase,
+        template: JSONObject,
+        nowEpochMs: Long,
+    ): MergeResult {
+        if (!sqliteTableExists(db, LEGACY_INSTALLED_PLUGIN_INDEX_TABLE)) return unchangedMergeResult()
+        var installRecordsRaw: String? = null
+        var pluginsRaw: String? = null
+        db.rawQuery(
+            """
+            SELECT install_records_json, plugins_json
+              FROM installed_plugin_index
+             WHERE index_key = ?
+            """.trimIndent(),
+            arrayOf(LEGACY_INSTALLED_PLUGIN_INDEX_KEY),
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return unchangedMergeResult()
+            installRecordsRaw = cursor.getString(0)
+            pluginsRaw = cursor.getString(1)
+        }
+
+        val installRecords = JSONObject(installRecordsRaw ?: "{}")
+        val existingPlugins = JSONArray(pluginsRaw ?: "[]")
+        val templateRecords = template.optJSONObject("installRecords")
+            ?: throw SetupException("Bundled OpenClaw plugin install records are missing installRecords")
+        val beforeState = ManagedPluginState(
+            installPaths = managedInstallPaths(installRecords),
+            rootDirs = managedPluginRootDirs(existingPlugins),
+        )
+        val templateState = ManagedPluginState(
+            installPaths = managedInstallPaths(templateRecords),
+            rootDirs = managedPluginRootDirs(template.optJSONArray("plugins") ?: JSONArray()),
+        )
+        val staleBefore = staleManagedPluginIds(beforeState, templateState)
+
+        val beforeInstallRecords = installRecords.toString()
+        val beforePlugins = existingPlugins.toString()
+        val mergedRecords = mergeManagedInstallRecords(installRecords, templateRecords)
+        val mergedPlugins = mergeManagedPluginEntries(existingPlugins, template)
+        val changed = beforeInstallRecords != installRecords.toString() ||
+            beforePlugins != mergedPlugins.toString()
+        if (changed) {
+            db.beginTransaction()
+            try {
+                val values = ContentValues().apply {
+                    put("install_records_json", installRecords.toString())
+                    put("plugins_json", mergedPlugins.toString())
+                    put("updated_at_ms", nowEpochMs)
+                }
+                db.update(
+                    LEGACY_INSTALLED_PLUGIN_INDEX_TABLE,
+                    values,
+                    "index_key = ?",
+                    arrayOf(LEGACY_INSTALLED_PLUGIN_INDEX_KEY),
+                )
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+        return MergeResult(
+            changed = changed,
+            mergedRecords = mergedRecords,
+            conflictingManagedPluginIds = emptyList(),
+            staleManagedPluginIds = staleBefore,
+        )
+    }
+
 
     fun readDiagnostic(rootfsDir: File): Diagnostic? {
         val templateFile = File(rootfsDir, BUNDLED_INSTALLS_TEMPLATE_PATH)
@@ -203,6 +273,7 @@ internal object OpenClawPluginInstallStateStore {
                     put("managedInstallPaths", jsonObject(sharedStateManaged.installPaths))
                     put("managedPluginRootDirs", jsonObject(sharedStateManaged.rootDirs))
                     sharedState?.let {
+                        put("revision", it.revision)
                         put("hostContractVersion", it.hostContractVersion)
                         put("compatRegistryVersion", it.compatRegistryVersion)
                         put("generatedAtMs", it.generatedAtMs)
@@ -222,7 +293,13 @@ internal object OpenClawPluginInstallStateStore {
         )
     }
 
+    private data class CanonicalInstalledPluginIndexRow(
+        val envelope: JSONObject,
+        val revision: Long,
+    )
+
     private data class SharedStateIndex(
+        val revision: Long,
         val installRecords: JSONObject,
         val plugins: JSONArray,
         val hostContractVersion: String?,
@@ -236,34 +313,78 @@ internal object OpenClawPluginInstallStateStore {
         val rootDirs: Map<String, String> = emptyMap(),
     )
 
+    private fun unchangedMergeResult() = MergeResult(
+        changed = false,
+        mergedRecords = 0,
+        conflictingManagedPluginIds = emptyList(),
+        staleManagedPluginIds = emptyList(),
+    )
+
     private fun readJsonObject(file: File): JSONObject? {
         if (!file.isFile) return null
         return JSONObject(file.readText())
     }
 
+    private fun readCanonicalInstalledPluginIndexRow(db: SQLiteDatabase): CanonicalInstalledPluginIndexRow? {
+        if (!sqliteTableExists(db, CONFIG_MACHINE_STATE_TABLE)) return null
+        db.rawQuery(
+            """
+            SELECT value_json
+              FROM config_machine_state
+             WHERE state_key = ?
+            """.trimIndent(),
+            arrayOf(CANONICAL_INSTALLED_PLUGIN_INDEX_KEY),
+        ).use { cursor ->
+            if (!cursor.moveToFirst()) return null
+            val envelope = runCatching { JSONObject(cursor.getString(0)) }.getOrNull() ?: return null
+            val revision = envelope.opt("revision") as? Number ?: return null
+            val index = envelope.optJSONObject("index") ?: return null
+            if (!isMergeableCanonicalInstalledPluginIndex(index)) return null
+            return CanonicalInstalledPluginIndexRow(envelope, revision.toLong())
+        }
+    }
+
+    private fun isMergeableCanonicalInstalledPluginIndex(index: JSONObject): Boolean {
+        val migrationVersion = index.opt("migrationVersion") as? Number
+        return index.optInt("version", -1) == 1 &&
+            index.optString("hostContractVersion").isNotBlank() &&
+            index.optString("compatRegistryVersion").isNotBlank() &&
+            migrationVersion?.toInt() == 1 &&
+            index.optString("policyHash").isNotBlank() &&
+            index.opt("generatedAtMs") is Number &&
+            index.optJSONObject("installRecords") != null &&
+            index.optJSONArray("plugins") != null &&
+            index.optJSONArray("diagnostics") != null
+    }
+
+    private fun hasCanonicalInstalledPluginIndexRow(db: SQLiteDatabase): Boolean {
+        if (!sqliteTableExists(db, CONFIG_MACHINE_STATE_TABLE)) return false
+        db.rawQuery(
+            """
+            SELECT 1
+              FROM config_machine_state
+             WHERE state_key = ?
+            """.trimIndent(),
+            arrayOf(CANONICAL_INSTALLED_PLUGIN_INDEX_KEY),
+        ).use { cursor ->
+            return cursor.moveToFirst()
+        }
+    }
+
     private fun readSharedStateIndex(databaseFile: File): SharedStateIndex? {
         if (!databaseFile.isFile) return null
         SQLiteDatabase.openDatabase(databaseFile.path, null, SQLiteDatabase.OPEN_READONLY).use { db ->
-            if (!sqliteTableExists(db, INSTALLED_PLUGIN_INDEX_TABLE)) return null
-            db.rawQuery(
-                """
-                SELECT install_records_json, plugins_json, host_contract_version,
-                       compat_registry_version, generated_at_ms, refresh_reason
-                  FROM installed_plugin_index
-                 WHERE index_key = ?
-                """.trimIndent(),
-                arrayOf(INSTALLED_PLUGIN_INDEX_KEY),
-            ).use { cursor ->
-                if (!cursor.moveToFirst()) return null
-                return SharedStateIndex(
-                    installRecords = JSONObject(cursor.getString(0) ?: "{}"),
-                    plugins = JSONArray(cursor.getString(1) ?: "[]"),
-                    hostContractVersion = cursor.getStringOrNull(2),
-                    compatRegistryVersion = cursor.getStringOrNull(3),
-                    generatedAtMs = cursor.getLongOrNull(4),
-                    refreshReason = cursor.getStringOrNull(5),
-                )
-            }
+            val row = readCanonicalInstalledPluginIndexRow(db) ?: return null
+            val index = row.envelope.optJSONObject("index") ?: return null
+            return SharedStateIndex(
+                revision = row.revision,
+                installRecords = index.optJSONObject("installRecords") ?: return null,
+                plugins = index.optJSONArray("plugins") ?: return null,
+                hostContractVersion = index.optString("hostContractVersion").ifBlank { null },
+                compatRegistryVersion = index.optString("compatRegistryVersion").ifBlank { null },
+                generatedAtMs = (index.opt("generatedAtMs") as? Number)?.toLong(),
+                refreshReason = index.optString("refreshReason").ifBlank { null },
+            )
         }
     }
 
@@ -378,10 +499,3 @@ internal object OpenClawPluginInstallStateStore {
     }
 }
 
-private fun android.database.Cursor.getStringOrNull(index: Int): String? {
-    return if (isNull(index)) null else getString(index)
-}
-
-private fun android.database.Cursor.getLongOrNull(index: Int): Long? {
-    return if (isNull(index)) null else getLong(index)
-}

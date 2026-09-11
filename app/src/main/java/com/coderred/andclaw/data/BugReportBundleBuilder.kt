@@ -66,50 +66,25 @@ object BugReportBundleBuilder {
         return fileAttachments + listOfNotNull(pluginStateAttachment)
     }
 
-    fun collectSupplementalRuntimeLogLines(rootfsDir: File): List<String> {
-        val lines = mutableListOf<String>()
-
-        collectSupplementalRuntimeLogSpecs(rootfsDir).forEach { spec ->
-            val file = resolveSupplementalRuntimeFile(rootfsDir, spec) ?: return@forEach
-            if (!file.isFile) return@forEach
-
-            lines += "[andClaw][RuntimeFile] ${spec.displayPath}"
-            sanitizeSupplementalRuntimeLines(
-                readTextFileLinesBounded(
-                    file = file,
-                    maxBytes = MAX_SUPPLEMENTAL_RUNTIME_FILE_BYTES,
-                    maxLines = MAX_SUPPLEMENTAL_RUNTIME_LOG_LINES_PER_FILE,
-                    fromEnd = spec.sanitizeMode == SupplementalRuntimeSanitizeMode.OPENCLAW_LOG_TAIL,
-                ),
-                spec,
-            ).asSequence()
-                .filter { it.isNotBlank() }
-                .forEach(lines::add)
-        }
-
-        OpenClawPluginInstallStateStore.readDiagnostic(rootfsDir)?.let { diagnostic ->
-            lines += diagnostic.summaryLine
-        }
-
-        return lines
-    }
-
     fun sanitizeGatewayLogLines(gatewayLogLines: List<String>): List<String> {
-        val sanitizedLines = gatewayLogLines
+        val lastGatewayStart = gatewayLogLines.indexOfLast { line ->
+            line.contains(GATEWAY_START_MARKER, ignoreCase = true)
+        }
+        val currentAttemptLines = if (lastGatewayStart >= 0) {
+            gatewayLogLines.subList(lastGatewayStart, gatewayLogLines.size)
+        } else {
+            gatewayLogLines
+        }
+        val sanitizedLines = currentAttemptLines
             .asSequence()
             .map { it.sanitizeGatewayLogLine() }
             .filter { it.isNotBlank() }
             .toList()
 
-        val cappedLines = sanitizedLines.take(MAX_GATEWAY_LOG_LINES)
-        val preservedProrootLines = sanitizedLines
-            .drop(MAX_GATEWAY_LOG_LINES)
-            .filter { it.contains(PROROOT_PRESERVE_KEYWORD, ignoreCase = true) }
-
-        return if (preservedProrootLines.isEmpty()) {
-            cappedLines
+        return if (sanitizedLines.size <= MAX_GATEWAY_LOG_LINES) {
+            sanitizedLines
         } else {
-            cappedLines + preservedProrootLines
+            listOf(sanitizedLines.first()) + sanitizedLines.takeLast(MAX_GATEWAY_LOG_LINES - 1)
         }
     }
 
@@ -176,15 +151,32 @@ private fun String?.normalizeError(): String? {
 }
 
 private fun String.sanitizeGatewayLogLine(): String {
-    return sanitizeGatewayLogLineUnbounded(this).take(MAX_GATEWAY_LOG_LINE_LENGTH)
+    return sanitizeGatewayLogLineUnbounded(removeTerminalEscapeSequences())
+        .truncateGatewayLogLine()
 }
 
-private const val MAX_GATEWAY_LOG_LINES = 400
-private const val MAX_GATEWAY_LOG_LINE_LENGTH = 500
+private fun String.removeTerminalEscapeSequences(): String {
+    return TERMINAL_ESCAPE_SEQUENCE_REGEX.replace(this, "").replace("\u001B", "")
+}
+
+private fun String.truncateGatewayLogLine(): String {
+    if (length <= MAX_GATEWAY_LOG_LINE_LENGTH) return this
+
+    val omittedCharacters = length - MAX_GATEWAY_LOG_LINE_CONTEXT_CHARS * 2
+    return take(MAX_GATEWAY_LOG_LINE_CONTEXT_CHARS) +
+        "… [truncated $omittedCharacters chars] …" +
+        takeLast(MAX_GATEWAY_LOG_LINE_CONTEXT_CHARS)
+}
+
+private const val GATEWAY_START_MARKER = "[andClaw] Starting gateway..."
+private const val MAX_GATEWAY_LOG_LINES = 60
+private const val MAX_GATEWAY_LOG_LINE_LENGTH = 1_800
+private const val MAX_GATEWAY_LOG_LINE_CONTEXT_CHARS = 800
 private const val MAX_SUPPLEMENTAL_RUNTIME_LOG_LINES_PER_FILE = 200
 private const val MAX_OPENCLAW_RUNTIME_LOG_FILES = 2
-private const val PROROOT_PRESERVE_KEYWORD = "proroot"
 private const val MAX_SUPPLEMENTAL_RUNTIME_FILE_BYTES = 1024 * 1024
+
+private val TERMINAL_ESCAPE_SEQUENCE_REGEX = Regex("\u001B\\[[0-9;?]*[ -/]*[@-~]")
 
 internal fun readTextFileLinesBounded(
     file: File,
@@ -274,6 +266,11 @@ private fun resolveSupplementalRuntimeFile(
 }
 
 private val SUPPLEMENTAL_RUNTIME_LOG_FILES = listOf(
+    SupplementalRuntimeLogSpec(
+        base = SupplementalRuntimeBase.ROOTFS,
+        sourceRelativePath = "tmp/andclaw-agent-lease-last.json",
+        zipEntryName = "runtime/openclaw/agent-lease-last.json",
+    ),
     SupplementalRuntimeLogSpec(
         base = SupplementalRuntimeBase.ROOTFS,
         sourceRelativePath = "tmp/proroot-sigsys-last.txt",

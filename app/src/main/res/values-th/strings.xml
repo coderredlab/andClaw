@@ -371,4 +371,5 @@
     <string name="settings_transfer_error_import_failed">นำเข้าไฟล์ถ่ายโอนไม่สำเร็จ</string>
     <string name="settings_transfer_export_success">ส่งออกไฟล์ถ่ายโอนเสร็จแล้ว</string>
     <string name="settings_transfer_share_failed">ไม่สามารถแชร์ไฟล์ถ่ายโอนได้</string>
+    <string name="settings_openclaw_doctor_stop_failed">ไม่สามารถหยุดเกตเวย์ได้ จึงยังไม่ได้เริ่มการซ่อมแซม กรุณาหยุดเกตเวย์แล้วลองอีกครั้ง</string>
 </resources>

@@ -630,18 +630,21 @@ class SetupManager(
             ?: throw SetupException("Bundled OpenClaw plugin install records are missing installRecords")
         if (templateRecords.length() == 0) return
 
+        val sharedMerge = OpenClawPluginInstallStateStore.mergeBundledInstallRecords(
+            rootfsDir = prorootManager.rootfsDir,
+            template = template,
+            nowEpochMs = nowEpochMs(),
+        )
+        if (sharedMerge.mergedRecords > 0) {
+            logOpenClawSharedPluginRecordMerge(sharedMerge)
+            return
+        }
+
         val registryFile = File(prorootManager.rootfsDir, "root/.openclaw/plugins/installs.json")
         registryFile.parentFile?.mkdirs()
         if (!registryFile.exists()) {
             registryFile.writeText(template.toString(2))
             log("   OpenClaw bundled plugin registry installed")
-            logOpenClawSharedPluginRecordMerge(
-                OpenClawPluginInstallStateStore.mergeBundledInstallRecords(
-                    rootfsDir = prorootManager.rootfsDir,
-                    template = template,
-                    nowEpochMs = nowEpochMs(),
-                ),
-            )
             return
         }
         val registry = JSONObject(registryFile.readText())
@@ -669,13 +672,6 @@ class SetupManager(
         )
         registryFile.writeText(registry.toString(2))
         log("   OpenClaw bundled plugin records merged ($merged)")
-        logOpenClawSharedPluginRecordMerge(
-            OpenClawPluginInstallStateStore.mergeBundledInstallRecords(
-                rootfsDir = prorootManager.rootfsDir,
-                template = template,
-                nowEpochMs = nowEpochMs(),
-            ),
-        )
     }
 
     private fun logOpenClawSharedPluginRecordMerge(result: OpenClawPluginInstallStateStore.MergeResult) {

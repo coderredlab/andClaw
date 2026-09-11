@@ -371,4 +371,5 @@ Não feche nem force a parada do app enquanto a recuperação estiver em andamen
     <string name="settings_transfer_error_import_failed">Não foi possível importar o arquivo de transferência.</string>
     <string name="settings_transfer_export_success">Exportação da transferência concluída.</string>
     <string name="settings_transfer_share_failed">Não foi possível compartilhar o arquivo de transferência.</string>
+    <string name="settings_openclaw_doctor_stop_failed">Não foi possível parar o gateway. O reparo não foi iniciado. Pare o gateway e tente novamente.</string>
 </resources>

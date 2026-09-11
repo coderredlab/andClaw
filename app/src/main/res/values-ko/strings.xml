@@ -381,4 +381,5 @@
     <string name="settings_transfer_error_import_failed">전송 파일을 가져오지 못했습니다.</string>
     <string name="settings_transfer_export_success">전송 파일 내보내기가 완료되었습니다.</string>
     <string name="settings_transfer_share_failed">전송 파일을 공유하지 못했습니다.</string>
+    <string name="settings_openclaw_doctor_stop_failed">게이트웨이를 종료하지 못해 복구를 시작하지 않았습니다. 게이트웨이를 종료한 후 다시 시도해 주세요.</string>
 </resources>

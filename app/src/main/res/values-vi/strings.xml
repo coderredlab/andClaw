@@ -371,4 +371,5 @@ Trong khi khôi phục đang chạy, đừng đóng hoặc buộc dừng ứng d
     <string name="settings_transfer_error_import_failed">Không thể nhập tệp chuyển thiết bị.</string>
     <string name="settings_transfer_export_success">Xuất tệp chuyển thiết bị hoàn tất.</string>
     <string name="settings_transfer_share_failed">Không thể chia sẻ tệp chuyển thiết bị.</string>
+    <string name="settings_openclaw_doctor_stop_failed">Không thể dừng cổng kết nối nên quá trình sửa chữa chưa bắt đầu. Vui lòng dừng cổng kết nối rồi thử lại.</string>
 </resources>

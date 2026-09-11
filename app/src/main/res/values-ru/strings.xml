@@ -371,4 +371,5 @@
     <string name="settings_transfer_error_import_failed">Не удалось импортировать файл переноса.</string>
     <string name="settings_transfer_export_success">Экспорт файла переноса завершен.</string>
     <string name="settings_transfer_share_failed">Не удалось поделиться файлом переноса.</string>
+    <string name="settings_openclaw_doctor_stop_failed">Не удалось остановить шлюз. Восстановление не начато. Пожалуйста, остановите шлюз и повторите попытку.</string>
 </resources>

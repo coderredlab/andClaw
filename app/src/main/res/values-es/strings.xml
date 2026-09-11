@@ -383,4 +383,5 @@ No cierre ni fuerce la detención de la app mientras la recuperación esté en c
     <string name="settings_transfer_error_import_failed">No se pudo importar el archivo de transferencia.</string>
     <string name="settings_transfer_export_success">Exportación de transferencia completada.</string>
     <string name="settings_transfer_share_failed">No se pudo compartir el archivo de transferencia.</string>
+    <string name="settings_openclaw_doctor_stop_failed">No se pudo detener la puerta de enlace. La reparación no se ha iniciado. Detenga la puerta de enlace y vuelva a intentarlo.</string>
 </resources>

@@ -212,6 +212,9 @@ class ProrootManager(
     val rootfsDir: File
         get() = File(context.filesDir, "rootfs")
 
+    internal fun foreignPrivateLeaseOwnerProbe(): ((Int, String) -> Boolean)? =
+        OpenClawAgentLeaseRecovery.foreignPrivateOwnerProbe(context, rootfsDir)
+
     val cacheDir: File
         get() = context.cacheDir
 

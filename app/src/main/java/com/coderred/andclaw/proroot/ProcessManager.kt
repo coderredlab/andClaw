@@ -335,7 +335,7 @@ function findExportByName(moduleExports, targetName) {
 
 async function importDistExport(prefix, exportName) {
   const distDir = resolveDistDir();
-  const candidates = fs.readdirSync(distDir).filter((name) => name.startsWith(prefix) && name.endsWith(".js")).sort();
+  const candidates = fs.readdirSync(distDir).filter((name) => name.startsWith(prefix) && (name.endsWith(".js") || name.endsWith(".mjs"))).sort();
   if (candidates.length === 0) {
     throw new Error("missing openclaw module: " + prefix);
   }
@@ -416,45 +416,49 @@ import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-const STATE_DIR = "/root/.openclaw";
-const DIST_DIR = "/usr/local/lib/node_modules/openclaw/dist";
+const STATE_DIR = process.env.OPENCLAW_STATE_DIR || "/root/.openclaw";
+const DIST_DIR = process.env.OPENCLAW_DIST_DIR || "/usr/local/lib/node_modules/openclaw/dist";
 process.env.OPENCLAW_STATE_DIR = STATE_DIR;
 
 function resolveExportName(source, localName) {
   const exportIndex = source.lastIndexOf("export {");
-  if (exportIndex < 0) {
-    throw new Error("OpenClaw migration module has no export block");
-  }
+  if (exportIndex < 0) return null;
   const exportBlock = source.slice(exportIndex);
   const aliasMatch = exportBlock.match(
     new RegExp("\\b" + localName + "\\s+as\\s+([A-Za-z_][A-Za-z0-9_]*)\\b"),
   );
   if (aliasMatch) return aliasMatch[1];
   if (new RegExp("\\b" + localName + "\\b").test(exportBlock)) return localName;
-  throw new Error("OpenClaw migration module does not export " + localName);
+  return null;
 }
 
 try {
   const moduleFiles = fs.readdirSync(DIST_DIR).filter(
-    (name) => name.startsWith("state-migrations.exec-approvals-") && name.endsWith(".js"),
+    (name) => name.startsWith("state-migrations.exec-approvals-") && (name.endsWith(".js") || name.endsWith(".mjs")),
   );
-  if (moduleFiles.length !== 1) {
-    throw new Error(
-      "Expected one OpenClaw exec approvals migration module, found " + moduleFiles.length,
-    );
-  }
+  let detect;
+  let migrate;
+  for (const moduleFile of moduleFiles) {
+    const modulePath = path.join(DIST_DIR, moduleFile);
+    const moduleSource = fs.readFileSync(modulePath, "utf8");
+    const detectExport = resolveExportName(moduleSource, "detectLegacyExecApprovals");
+    const migrateExport = resolveExportName(moduleSource, "migrateLegacyExecApprovals");
+    if (!detectExport || !migrateExport) continue;
 
-  const modulePath = path.join(DIST_DIR, moduleFiles[0]);
-  const moduleSource = fs.readFileSync(modulePath, "utf8");
-  const migrationModule = await import(pathToFileURL(modulePath).href);
-  const detect = migrationModule[
-    resolveExportName(moduleSource, "detectLegacyExecApprovals")
-  ];
-  const migrate = migrationModule[
-    resolveExportName(moduleSource, "migrateLegacyExecApprovals")
-  ];
-  if (typeof detect !== "function" || typeof migrate !== "function") {
-    throw new Error("OpenClaw exec approvals migration exports are not callable");
+    const migrationModule = await import(pathToFileURL(modulePath).href);
+    const candidateDetect = migrationModule[detectExport];
+    const candidateMigrate = migrationModule[migrateExport];
+    if (typeof candidateDetect !== "function" || typeof candidateMigrate !== "function") {
+      throw new Error("OpenClaw exec approvals migration exports are not callable");
+    }
+    if (detect && (detect !== candidateDetect || migrate !== candidateMigrate)) {
+      throw new Error("Conflicting OpenClaw exec approvals migration implementations");
+    }
+    detect = candidateDetect;
+    migrate = candidateMigrate;
+  }
+  if (!detect || !migrate) {
+    throw new Error("OpenClaw exec approvals migration exports not found");
   }
 
   const detected = detect({
@@ -493,6 +497,209 @@ try {
 }
 """.trimIndent()
 
+internal fun buildOpenClawDanglingTranscriptArchiveRecoveryScript(): String = """
+import fs from "node:fs";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
+
+const STATE_DIR = process.env.OPENCLAW_STATE_DIR || "/root/.openclaw";
+const DIST_DIR = process.env.OPENCLAW_DIST_DIR || "/usr/local/lib/node_modules/openclaw/dist";
+const AGENTS_DIR = path.join(STATE_DIR, "agents");
+const TEMP_ARCHIVE_SUFFIX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/i;
+process.env.OPENCLAW_STATE_DIR = STATE_DIR;
+
+function* readPendingArchiveMetadata(databasePath) {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const table = database.prepare(
+      "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+    ).get("session_transcript_archives");
+    if (!table) return;
+    yield* database.prepare(
+      "SELECT session_id, generation, archive_name " +
+        "FROM session_transcript_archives WHERE published_at IS NULL",
+    ).iterate();
+  } finally {
+    database.close();
+  }
+}
+
+function resolveCanonicalArchivePath(archiveDirectory, archiveName) {
+  if (typeof archiveName !== "string" || !archiveName || path.basename(archiveName) !== archiveName) {
+    throw new Error("Pending SQLite transcript archive has an invalid registered archive name");
+  }
+  const resolvedDirectory = path.resolve(archiveDirectory);
+  const archivePath = path.resolve(resolvedDirectory, archiveName);
+  if (path.dirname(archivePath) !== resolvedDirectory) {
+    throw new Error("Pending SQLite transcript archive escapes its session directory");
+  }
+  return archivePath;
+}
+
+function isMissingPath(filePath) {
+  try {
+    fs.statSync(filePath);
+    return false;
+  } catch (error) {
+    if (error && error.code === "ENOENT") return true;
+    throw error;
+  }
+}
+
+function inspectDanglingArchiveLink(entry) {
+  const archivePath = resolveCanonicalArchivePath(entry.archiveDirectory, entry.archiveName);
+  let stat;
+  try {
+    stat = fs.lstatSync(archivePath);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+  if (!stat.isSymbolicLink()) return null;
+  if (!isMissingPath(archivePath)) return null;
+
+  const target = fs.readlinkSync(archivePath);
+  const targetPath = path.resolve(path.dirname(archivePath), target);
+  const targetName = path.basename(targetPath);
+  const expectedPrefix = path.basename(archivePath) + ".";
+  if (
+    path.dirname(targetPath) !== path.resolve(entry.archiveDirectory) ||
+    !targetName.startsWith(expectedPrefix) ||
+    !TEMP_ARCHIVE_SUFFIX.test(targetName.slice(expectedPrefix.length))
+  ) {
+    throw new Error("Found an unrelated dangling pending transcript archive link: " + archivePath);
+  }
+  return {
+    ...entry,
+    archivePath,
+    linkDevice: stat.dev,
+    linkInode: stat.ino,
+    linkTarget: target,
+  };
+}
+
+function* collectDanglingArchiveLinks() {
+  let agentEntries;
+  try {
+    agentEntries = fs.readdirSync(AGENTS_DIR, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .sort((left, right) => left.name.localeCompare(right.name));
+  } catch (error) {
+    if (error && error.code === "ENOENT") return;
+    throw error;
+  }
+
+  for (const agentEntry of agentEntries) {
+    const agentId = agentEntry.name;
+    const agentDirectory = path.join(AGENTS_DIR, agentId);
+    const databasePath = path.join(agentDirectory, "agent", "openclaw-agent.sqlite");
+    if (isMissingPath(databasePath)) continue;
+    const archiveDirectory = path.join(agentDirectory, "sessions");
+    for (const row of readPendingArchiveMetadata(databasePath)) {
+      if (typeof row.session_id !== "string" || typeof row.generation !== "string") {
+        throw new Error("Pending SQLite transcript archive has invalid identity metadata");
+      }
+      const recovery = inspectDanglingArchiveLink({
+        agentId,
+        archiveDirectory,
+        archiveName: row.archive_name,
+        databasePath,
+        generation: row.generation,
+        sessionId: row.session_id,
+      });
+      if (recovery) yield recovery;
+    }
+  }
+}
+
+function syncDirectory(directory) {
+  const descriptor = fs.openSync(directory, "r");
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function recoverDanglingArchiveLink(publisher, recovery) {
+  const stagingDirectory = fs.mkdtempSync(
+    path.join(recovery.archiveDirectory, ".andclaw-transcript-recovery-"),
+  );
+  const published = publisher({
+    agentId: recovery.agentId,
+    archiveDirectory: stagingDirectory,
+    databasePath: recovery.databasePath,
+    generation: recovery.generation,
+    sessionId: recovery.sessionId,
+  });
+  if (
+    !published ||
+    typeof published.error === "string" ||
+    published.generation !== recovery.generation ||
+    published.sessionId !== recovery.sessionId ||
+    typeof published.archivedPath !== "string"
+  ) {
+    throw new Error(
+      "Official SQLite transcript archive recovery failed for " + recovery.sessionId +
+        ": " + String(published?.error || "invalid publisher result"),
+    );
+  }
+
+  const stagedPath = path.resolve(published.archivedPath);
+  const expectedStagedPath = path.resolve(stagingDirectory, recovery.archiveName);
+  if (
+    stagedPath !== expectedStagedPath ||
+    path.dirname(stagedPath) !== path.resolve(stagingDirectory) ||
+    !fs.lstatSync(stagedPath).isFile()
+  ) {
+    throw new Error("Official SQLite transcript archive recovery returned an invalid staged archive path");
+  }
+
+  const current = fs.lstatSync(recovery.archivePath);
+  if (
+    !current.isSymbolicLink() ||
+    current.dev !== recovery.linkDevice ||
+    current.ino !== recovery.linkInode ||
+    fs.readlinkSync(recovery.archivePath) !== recovery.linkTarget ||
+    !isMissingPath(recovery.archivePath)
+  ) {
+    throw new Error("Pending transcript archive link changed before recovery replacement");
+  }
+
+  fs.unlinkSync(recovery.archivePath);
+  fs.renameSync(stagedPath, recovery.archivePath);
+  syncDirectory(recovery.archiveDirectory);
+  fs.rmdirSync(stagingDirectory);
+  console.log("[andClaw] Restored pending SQLite transcript archive: " + recovery.archivePath);
+}
+
+try {
+  let publisher;
+  for (const recovery of collectDanglingArchiveLinks()) {
+    if (!publisher) {
+      const workerPath = path.join(
+        DIST_DIR,
+        "config/sessions/session-accessor.sqlite-archive.worker.js",
+      );
+      const worker = await import(pathToFileURL(workerPath).href);
+      if (typeof worker.publishTranscriptArchiveInWorker !== "function") {
+        throw new Error("OpenClaw transcript archive publisher export is unavailable");
+      }
+      publisher = worker.publishTranscriptArchiveInWorker;
+    }
+    recoverDanglingArchiveLink(publisher, recovery);
+  }
+  if (!publisher) {
+    console.log("[andClaw] No dangling pending SQLite transcript archive links.");
+  }
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error("[andClaw] Pending SQLite transcript archive recovery failed: " + message);
+  process.exitCode = 1;
+}
+""".trimIndent()
+
 /**
  * proot 환경에서 OpenClaw 게이트웨이 프로세스를 관리한다.
  *
@@ -516,9 +723,12 @@ class ProcessManager(
     companion object {
         private const val TAG = "ProcessManager"
         private const val GATEWAY_PORT = 18789
+        private val GATEWAY_READY_LOG_PATTERN = Regex(
+            """\[gateway](?:\s|\x1B\[[0-?]*[ -/]*[@-~])+(?:gateway )?ready(?:\s|\x1B\[[0-?]*[ -/]*[@-~])*$""",
+        )
         private const val DEFAULT_MEMORY_SEARCH_PROVIDER = "auto"
         private const val OPENCLAW_PATCH_VERSION = "openclaw-patch-v12-codex-header-metrics"
-        private const val OPENCLAW_STARTUP_MAINTENANCE_VERSION = "v6"
+        private const val OPENCLAW_STARTUP_MAINTENANCE_VERSION = "v8"
         private const val OPENCLAW_STARTUP_MAINTENANCE_MARKER =
             "root/.openclaw/.andclaw-startup-maintenance"
         private const val OPENCLAW_STARTUP_MAINTENANCE_TIMEOUT_MS = 300_000L
@@ -530,6 +740,10 @@ class ProcessManager(
             "root/.andclaw-openclaw-exec-approvals-migration.mjs"
         private const val OPENCLAW_EXEC_APPROVALS_MIGRATION_SCRIPT_GUEST_PATH =
             "/root/.andclaw-openclaw-exec-approvals-migration.mjs"
+        private const val OPENCLAW_TRANSCRIPT_ARCHIVE_RECOVERY_SCRIPT_PATH =
+            "root/.andclaw-openclaw-transcript-archive-recovery.mjs"
+        private const val OPENCLAW_TRANSCRIPT_ARCHIVE_RECOVERY_SCRIPT_GUEST_PATH =
+            "/root/.andclaw-openclaw-transcript-archive-recovery.mjs"
         private const val OPENCLAW_AGENT_DATABASE_PATH =
             "root/.openclaw/agents/main/agent/openclaw-agent.sqlite"
         private const val OPENCLAW_AGENT_IDENTITY_SCHEMA_VERSION = 18
@@ -2137,6 +2351,8 @@ class ProcessManager(
                 changed = true
             }
 
+            if (inheritPrimaryAgentModelFromDefaults(agents)) changed = true
+
             // OpenRouter 모델 등록:
             // 내장 모델(레거시 레지스트리에서 식별)은 compat 설정 포함 정확한 정의를 갖고 있으므로
             // 커스텀 등록으로 덮어쓰면 안 된다. 비내장 모델만 models.json에 등록.
@@ -2694,6 +2910,42 @@ class ProcessManager(
             Thread.sleep(200)
         }
         return findListeningSocketInodes(port).isEmpty()
+    }
+
+    /** The app's default model controls the owner used by OpenClaw system work. */
+    private fun inheritPrimaryAgentModelFromDefaults(agents: JSONObject): Boolean {
+        val entries = agents.optJSONObject("entries")
+        val roster = if (entries != null) {
+            entries.keys().asSequence().mapNotNull { id ->
+                entries.optJSONObject(id)?.let { id to it }
+            }.toList()
+        } else {
+            val legacy = agents.optJSONArray("list")
+            (0 until (legacy?.length() ?: 0)).mapNotNull { index ->
+                legacy?.optJSONObject(index)?.let { it.optString("id") to it }
+            }
+        }
+        val explicitOwner = agents.optJSONObject("defaults")
+            ?.optJSONObject("systemAgent")?.optString("agentId")?.trim().orEmpty()
+        val owner = when {
+            explicitOwner.isNotBlank() -> roster.singleOrNull { it.first == explicitOwner }
+            roster.size == 1 -> roster.single()
+            agents.optString("ownership") != "explicit" ->
+                roster.filter { it.second.optBoolean("default") }.singleOrNull()
+            else -> null
+        }?.second ?: return false
+        return when (val model = owner.opt("model")) {
+            is String -> {
+                owner.remove("model")
+                true
+            }
+            is JSONObject -> {
+                val removed = model.remove("primary") != null
+                if (removed && model.length() == 0) owner.remove("model")
+                removed
+            }
+            else -> false
+        }
     }
 
     private fun jsonArrayStringListEquals(array: JSONArray?, expected: List<String>): Boolean {
@@ -3779,6 +4031,7 @@ class ProcessManager(
     }
 
     internal fun buildOpenClawStartupMaintenanceEnv(): Map<String, String> = buildMap {
+        put("OPENCLAW_SERVICE_REPAIR_POLICY", "external")
         put("HOME", "/root")
         put("PATH", "${prorootManager.codexAppServerPathDir}:/usr/local/bin:/usr/bin:/bin")
         put("LANG", "C.UTF-8")
@@ -3835,12 +4088,115 @@ class ProcessManager(
         }
     }
 
+    private fun runOpenClawDanglingTranscriptArchiveRecoveryPreflight(
+        runtime: ExecutionRuntime,
+        maintenanceEnv: Map<String, String>,
+    ) {
+        val rootfsDir = prorootManager.rootfsDir
+        File(rootfsDir, OPENCLAW_TRANSCRIPT_ARCHIVE_RECOVERY_SCRIPT_PATH).apply {
+            parentFile?.mkdirs()
+            writeText(buildOpenClawDanglingTranscriptArchiveRecoveryScript())
+        }
+        addLog("[andClaw] Checking pending OpenClaw transcript archives for native unlink damage...")
+        val command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
+            "${ProrootManager.OPENCLAW_NODE_BIN} " +
+            "$OPENCLAW_TRANSCRIPT_ARCHIVE_RECOVERY_SCRIPT_GUEST_PATH 2>&1"
+        val result = prorootManager.executeWithResult(
+            command = command,
+            timeoutMs = OPENCLAW_STARTUP_MAINTENANCE_TIMEOUT_MS,
+            extraEnv = maintenanceEnv,
+            captureViaTempFile = true,
+            runtime = runtime,
+            returnFailureDiagnostics = true,
+        )
+        result?.output
+            ?.lineSequence()
+            ?.map { it.trim() }
+            ?.filter { it.startsWith("[andClaw]") }
+            ?.forEach(::addLog)
+        if (result == null || result.timedOut || result.exitCode != 0) {
+            val exit = result?.exitCode?.toString() ?: "unavailable"
+            val detail = result?.output
+                ?.takeLast(4_000)
+                ?.trim()
+                .orEmpty()
+                .ifBlank { "No diagnostic output." }
+            throw IllegalStateException(
+                "OpenClaw pending transcript archive recovery preflight failed (exit: $exit). $detail",
+            )
+        }
+    }
+
+    private fun captureOpenClawAgentLeaseDiagnostics(
+        runtime: ExecutionRuntime,
+        maintenanceEnv: Map<String, String>,
+        installedVersion: String,
+    ) {
+        try {
+            val diagnostic = OpenClawAgentLeaseDiagnostics.collect(prorootManager.rootfsDir)
+                .put("openClawVersion", installedVersion)
+                .put("runtime", runtime.storageValue)
+            val file = File(prorootManager.rootfsDir, OpenClawAgentLeaseDiagnostics.RELATIVE_PATH)
+            file.parentFile?.mkdirs()
+            file.writeText(diagnostic.toString(2))
+            val probe = prorootManager.executeWithResult(
+                command = "exec ${ProrootManager.OPENCLAW_NODE_BIN} -e " +
+                    shellSingleQuote(OpenClawAgentLeaseDiagnostics.guestProbeScript(diagnostic)) + " 2>&1",
+                timeoutMs = 10_000L,
+                extraEnv = maintenanceEnv,
+                captureViaTempFile = true,
+                runtime = runtime,
+                returnFailureDiagnostics = true,
+            )
+            val guest = JSONObject()
+                .put("exitCode", probe?.exitCode ?: JSONObject.NULL)
+                .put("timedOut", probe?.timedOut ?: JSONObject.NULL)
+            if (probe != null && !probe.timedOut && probe.exitCode == 0) {
+                try {
+                    guest.put("result", JSONObject(probe.output.take(16_000)))
+                } catch (error: Exception) {
+                    guest.put("parseError", error.javaClass.simpleName)
+                }
+            }
+            diagnostic.put("guest", guest)
+            file.writeText(diagnostic.toString(2))
+            addLog("[andClaw] Captured read-only agent database lease diagnostics for the error report.")
+        } catch (error: Exception) {
+            addLog("[andClaw] Agent database lease diagnostics unavailable: ${error.javaClass.simpleName}")
+        }
+    }
+
     internal fun runOpenClawStartupMigrationMaintenanceIfNeeded(runtime: ExecutionRuntime) {
         val installedVersion = checkNotNull(readInstalledOpenClawVersion()) {
             "Cannot determine the installed OpenClaw version before startup maintenance."
         }
+        val pluginTemplateFile = File(
+            prorootManager.rootfsDir,
+            "root/.openclaw/andclaw-bundled-plugins/install-records.json",
+        )
+        if (pluginTemplateFile.isFile) {
+            val pluginMerge = OpenClawPluginInstallStateStore.mergeBundledInstallRecords(
+                rootfsDir = prorootManager.rootfsDir,
+                template = JSONObject(pluginTemplateFile.readText()),
+                nowEpochMs = System.currentTimeMillis(),
+            )
+            if (pluginMerge.changed) {
+                addLog("[andClaw] Updated ${pluginMerge.mergedRecords} bundled plugin records before gateway startup.")
+            }
+        }
         val expectedMarker = "$installedVersion:$OPENCLAW_STARTUP_MAINTENANCE_VERSION"
         val markerFile = File(prorootManager.rootfsDir, OPENCLAW_STARTUP_MAINTENANCE_MARKER)
+
+        val recoveredLeases = OpenClawAgentLeaseRecovery.recover(
+            prorootManager.rootfsDir,
+            foreignPrivateOwner = prorootManager.foreignPrivateLeaseOwnerProbe(),
+        )
+        if (recoveredLeases > 0) {
+            addLog(
+                "[andClaw] Reclaimed $recoveredLeases OpenClaw database leases " +
+                    "with impossible boot identities or foreign private-store owners.",
+            )
+        }
         if (markerFile.isFile && markerFile.readText().trim() == expectedMarker) return
 
         restoreStagedOpenClawIdentityParticipantsIfNeeded()
@@ -3861,6 +4217,7 @@ class ProcessManager(
         ).mkdirs()
         val maintenanceEnv = buildOpenClawStartupMaintenanceEnv()
         runOpenClawExecApprovalsMigrationPreflightIfNeeded(runtime, maintenanceEnv)
+        runOpenClawDanglingTranscriptArchiveRecoveryPreflight(runtime, maintenanceEnv)
         stageOpenClawIdentityParticipantsForMigrationIfNeeded()
         addLog("[andClaw] Running stopped-writer OpenClaw startup maintenance...")
         val command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
@@ -3881,6 +4238,12 @@ class ProcessManager(
                 ?.trim()
                 .orEmpty()
                 .ifBlank { "No diagnostic output." }
+            if (
+                result != null && !result.timedOut &&
+                result.output.contains("OpenClawAgentDatabaseLeaseActiveError")
+            ) {
+                captureOpenClawAgentLeaseDiagnostics(runtime, maintenanceEnv, installedVersion)
+            }
             throw IllegalStateException(
                 "OpenClaw startup maintenance failed (exit: $exit). $detail",
             )
@@ -4377,7 +4740,7 @@ class ProcessManager(
         ) {
             gatewayUsesTls = lineLower.contains("wss://")
             // 서버 포트가 열렸지만 아직 startup 작업 진행 중 — STARTING 유지.
-            // Browser control listening 로그가 나오면 RUNNING으로 전환.
+            // gateway ready 로그가 나오면 RUNNING으로 전환.
             addLog("[andClaw] Gateway port open, waiting for full startup...")
             startPairingObserver()
         }
@@ -4386,13 +4749,8 @@ class ProcessManager(
             startPairingObserver()
         }
 
-        val isGatewayReady = lineLower.contains("gateway ready") ||
-            lineLower.contains("[gateway] ready")
-
         // OpenClaw가 startup sidecar 준비까지 끝냈다고 알리면 startup 완전 완료.
-        if (isGatewayReady ||
-            lineLower.contains("browser") && lineLower.contains("control listening") ||
-            lineLower.contains("browser/server") && lineLower.contains("listening")) {
+        if (GATEWAY_READY_LOG_PATTERN.containsMatchIn(lineLower)) {
             if (!publishRunningAttempt(attempt)) return
             addLog("[andClaw] Gateway is ready!")
         }

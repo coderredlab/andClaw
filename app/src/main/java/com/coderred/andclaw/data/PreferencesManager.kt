@@ -642,7 +642,6 @@ private val OLLAMA_MANUAL_FALLBACK_KEY = booleanPreferencesKey("ollama_manual_fa
             "openrouter",
             "anthropic",
             "openai",
-            "openai-codex",
             "github-copilot",
             "google",
             "zai",

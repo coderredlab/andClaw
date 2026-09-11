@@ -371,4 +371,5 @@
     <string name="settings_transfer_error_import_failed">ट्रांसफर फ़ाइल आयात नहीं की जा सकी।</string>
     <string name="settings_transfer_export_success">ट्रांसफर निर्यात पूरा हुआ।</string>
     <string name="settings_transfer_share_failed">ट्रांसफर फ़ाइल साझा नहीं की जा सकी।</string>
+    <string name="settings_openclaw_doctor_stop_failed">गेटवे बंद नहीं हो सका। मरम्मत शुरू नहीं हुई है। कृपया गेटवे बंद करके फिर से प्रयास करें।</string>
 </resources>

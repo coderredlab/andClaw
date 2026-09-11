@@ -371,4 +371,5 @@ Jangan tutup atau paksa hentikan aplikasi selama pemulihan masih berlangsung.</s
     <string name="settings_transfer_error_import_failed">Gagal mengimpor file transfer.</string>
     <string name="settings_transfer_export_success">Ekspor transfer selesai.</string>
     <string name="settings_transfer_share_failed">File transfer tidak dapat dibagikan.</string>
+    <string name="settings_openclaw_doctor_stop_failed">Gateway tidak dapat dihentikan. Perbaikan belum dimulai. Silakan hentikan gateway dan coba lagi.</string>
 </resources>
