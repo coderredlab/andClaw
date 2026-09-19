@@ -2800,14 +2800,24 @@ class ProcessManager(
             val result = prorootManager.executeWithResult(
                 command =
                     "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
-                        "openclaw gateway stop >/dev/null 2>&1 || true",
+                        "openclaw gateway stop --force",
                 timeoutMs = 15_000L,
-            ) ?: return
-            if (!result.timedOut) {
-                addLog("[andClaw] Requested existing supervised gateway stop")
+            )
+            when {
+                result == null ->
+                    addLog("[andClaw] Supervised gateway stop request could not be started; continuing fallback cleanup")
+                result.timedOut ->
+                    addLog("[andClaw] Supervised gateway stop request timed out; continuing fallback cleanup")
+                result.exitCode == 0 ->
+                    addLog("[andClaw] Requested existing supervised gateway stop")
+                else ->
+                    addLog(
+                        "[andClaw] Supervised gateway stop request failed " +
+                            "(exit code ${result.exitCode}); continuing fallback cleanup",
+                    )
             }
         } catch (_: Exception) {
-            // 실패해도 fallback cleanup로 계속 진행
+            addLog("[andClaw] Supervised gateway stop request failed; continuing fallback cleanup")
         }
     }
 
@@ -4217,7 +4227,6 @@ class ProcessManager(
         ).mkdirs()
         val maintenanceEnv = buildOpenClawStartupMaintenanceEnv()
         runOpenClawExecApprovalsMigrationPreflightIfNeeded(runtime, maintenanceEnv)
-        runOpenClawDanglingTranscriptArchiveRecoveryPreflight(runtime, maintenanceEnv)
         stageOpenClawIdentityParticipantsForMigrationIfNeeded()
         addLog("[andClaw] Running stopped-writer OpenClaw startup maintenance...")
         val command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
@@ -4252,6 +4261,7 @@ class ProcessManager(
             "OpenClaw startup maintenance did not produce the identity participant schema " +
                 "needed to restore staged data."
         }
+        runOpenClawDanglingTranscriptArchiveRecoveryPreflight(runtime, maintenanceEnv)
 
         markerFile.parentFile?.mkdirs()
         markerFile.writeText(expectedMarker)
@@ -4956,35 +4966,24 @@ class ProcessManager(
     }
 
     private fun buildOpenClawCliEnv(): Map<String, String> {
-        fun resolved(value: String): String = value.ifBlank { "__andclaw_env_placeholder__" }
-
         return buildMap {
-            put("OPENROUTER_API_KEY", "__andclaw_env_placeholder__")
-            put("OPENAI_API_KEY", "__andclaw_env_placeholder__")
-            put("OPENAI_COMPAT_API_KEY", "__andclaw_env_placeholder__")
-            put("OLLAMA_API_KEY", "__andclaw_env_placeholder__")
-            put("ANTHROPIC_API_KEY", "__andclaw_env_placeholder__")
-            put("GOOGLE_API_KEY", "__andclaw_env_placeholder__")
-            put("GEMINI_API_KEY", "__andclaw_env_placeholder__")
-            githubCopilotAuthEnv().forEach { (key, value) -> put(key, value) }
-            if (!containsKey("COPILOT_GITHUB_TOKEN")) put("COPILOT_GITHUB_TOKEN", "__andclaw_env_placeholder__")
-            if (!containsKey("GH_TOKEN")) put("GH_TOKEN", "__andclaw_env_placeholder__")
-            if (!containsKey("GITHUB_TOKEN")) put("GITHUB_TOKEN", "__andclaw_env_placeholder__")
-            put("ZAI_API_KEY", "__andclaw_env_placeholder__")
-            put("Z_AI_API_KEY", "__andclaw_env_placeholder__")
-            put("KIMI_API_KEY", "__andclaw_env_placeholder__")
-            put("KIMICODE_API_KEY", "__andclaw_env_placeholder__")
-            put("MINIMAX_API_KEY", "__andclaw_env_placeholder__")
-            put("BRAVE_API_KEY", resolved(lastBraveSearchApiKey))
-            put("BRAVE_SEARCH_API_KEY", resolved(lastBraveSearchApiKey))
+            putAll(githubCopilotAuthEnv())
+            if (lastBraveSearchApiKey.isNotBlank()) {
+                put("BRAVE_API_KEY", lastBraveSearchApiKey)
+                put("BRAVE_SEARCH_API_KEY", lastBraveSearchApiKey)
+            }
             if (lastMemorySearchEnabled &&
                 supportsMemorySearchRemoteApiKey(lastMemorySearchProvider) &&
                 lastMemorySearchApiKey.isNotBlank()
             ) {
                 put("MEMORY_SEARCH_API_KEY", lastMemorySearchApiKey)
             }
-            put("TELEGRAM_BOT_TOKEN", resolved(lastChannelConfig.telegramBotToken))
-            put("DISCORD_BOT_TOKEN", resolved(lastChannelConfig.discordBotToken))
+            if (lastChannelConfig.telegramBotToken.isNotBlank()) {
+                put("TELEGRAM_BOT_TOKEN", lastChannelConfig.telegramBotToken)
+            }
+            if (lastChannelConfig.discordBotToken.isNotBlank()) {
+                put("DISCORD_BOT_TOKEN", lastChannelConfig.discordBotToken)
+            }
 
             if (lastApiKey.isNotBlank()) {
                 when (lastApiProvider) {

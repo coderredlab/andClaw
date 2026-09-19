@@ -573,27 +573,27 @@ const { pathToFileURL } = require('node:url');
   }
 
   const storeModuleCandidates = fs.readdirSync(openClawDist)
-    .filter((name) => /^installed-plugin-index-store-[A-Za-z0-9_-]+\.(?:mjs|js)$/.test(name));
+    .filter((name) => /^installed-plugin-index-store-write-[A-Za-z0-9_-]+\.(?:mjs|js)$/.test(name));
   if (storeModuleCandidates.length === 0) {
-    throw new Error('Cannot find OpenClaw installed plugin index store module');
+    throw new Error('Cannot find OpenClaw installed plugin index writer module');
   }
-  let refreshPersistedInstalledPluginIndexSync = null;
+  let refreshPersistedInstalledPluginIndex = null;
   for (const candidate of storeModuleCandidates) {
     const mod = await import(pathToFileURL(path.join(openClawDist, candidate)).href);
     const exportedRefresh = Object.values(mod).find(
       (value) =>
         typeof value === 'function' &&
-        value.name === 'refreshPersistedInstalledPluginIndexSync',
+        value.name === 'refreshPersistedInstalledPluginIndex',
     );
     if (exportedRefresh) {
-      refreshPersistedInstalledPluginIndexSync = exportedRefresh;
+      refreshPersistedInstalledPluginIndex = exportedRefresh;
       break;
     }
   }
-  if (!refreshPersistedInstalledPluginIndexSync) {
-    throw new Error('No installed-plugin-index-store candidate exports refreshPersistedInstalledPluginIndexSync. Candidates tried: ' + storeModuleCandidates.join(', '));
+  if (!refreshPersistedInstalledPluginIndex) {
+    throw new Error('No installed-plugin-index-store-write candidate exports refreshPersistedInstalledPluginIndex. Candidates tried: ' + storeModuleCandidates.join(', '));
   }
-  const index = refreshPersistedInstalledPluginIndexSync({
+  const index = refreshPersistedInstalledPluginIndex({
     reason: 'source-changed',
     installRecords,
     env: {
