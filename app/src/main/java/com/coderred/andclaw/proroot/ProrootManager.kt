@@ -215,6 +215,9 @@ class ProrootManager(
     internal fun foreignPrivateLeaseOwnerProbe(): ((Int, String) -> Boolean)? =
         OpenClawAgentLeaseRecovery.foreignPrivateOwnerProbe(context, rootfsDir)
 
+    internal fun foreignPrivateGatewayLockOwnerProbe(): ((Int, String) -> Boolean)? =
+        OpenClawPrivateStoreOwner.foreignPrivateGatewayLockOwnerProbe(context, rootfsDir)
+
     val cacheDir: File
         get() = context.cacheDir
 
@@ -670,7 +673,6 @@ class ProrootManager(
                 "export OPENCLAW_CODEX_APP_SERVER_MODE=yolo && " +
                 "export OPENCLAW_CODEX_APP_SERVER_APPROVAL_POLICY=never && " +
                 "export OPENCLAW_CODEX_APP_SERVER_SANDBOX=danger-full-access && " +
-                "export OPENCLAW_CODEX_DISCOVERY_LIVE=0 && " +
                 "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
                 "export NODE_COMPILE_CACHE=/root/.cache/node-compile-cache && " +
                 "mkdir -p /root/.openclaw/workspace && " +

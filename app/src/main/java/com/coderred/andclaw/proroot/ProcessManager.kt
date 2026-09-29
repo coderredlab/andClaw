@@ -727,7 +727,7 @@ class ProcessManager(
             """\[gateway](?:\s|\x1B\[[0-?]*[ -/]*[@-~])+(?:gateway )?ready(?:\s|\x1B\[[0-?]*[ -/]*[@-~])*$""",
         )
         private const val DEFAULT_MEMORY_SEARCH_PROVIDER = "auto"
-        private const val OPENCLAW_PATCH_VERSION = "openclaw-patch-v12-codex-header-metrics"
+        private const val OPENCLAW_PATCH_VERSION = "openclaw-patch-v13-worker-error-ownership"
         private const val OPENCLAW_STARTUP_MAINTENANCE_VERSION = "v8"
         private const val OPENCLAW_STARTUP_MAINTENANCE_MARKER =
             "root/.openclaw/.andclaw-startup-maintenance"
@@ -1311,7 +1311,6 @@ class ProcessManager(
                     put("UV_USE_IO_URING", "0")
                     put("OPENCLAW_NO_RESPAWN", "1")
                     put("OPENCLAW_DISABLE_BONJOUR", "1")
-                    put("OPENCLAW_CODEX_DISCOVERY_LIVE", "0")
                     put("PLAYWRIGHT_BROWSERS_PATH", "/root/.cache/ms-playwright")
                     put("RUST_LOG", ProrootManager.CODEX_RUST_LOG_FILTER)
                     put("RUST_BACKTRACE", "1")
@@ -3047,6 +3046,14 @@ class ProcessManager(
             codex.put("config", it)
             changed = true
         }
+        val discovery = config.optJSONObject("discovery") ?: JSONObject().also {
+            config.put("discovery", it)
+            changed = true
+        }
+        if (discovery.opt("enabled") != false) {
+            discovery.put("enabled", false)
+            changed = true
+        }
         val appServer = config.optJSONObject("appServer") ?: JSONObject().also {
             config.put("appServer", it)
             changed = true
@@ -4049,10 +4056,47 @@ class ProcessManager(
         put("NODE_COMPILE_CACHE", "/root/.cache/node-compile-cache/startup-maintenance")
         put("OPENCLAW_NO_RESPAWN", "1")
         put("OPENCLAW_DISABLE_BONJOUR", "1")
-        put("OPENCLAW_CODEX_DISCOVERY_LIVE", "0")
         put("PLAYWRIGHT_BROWSERS_PATH", "/root/.cache/ms-playwright")
         putAll(buildOpenClawCliEnv())
         put("PROROOT_PROBE_PHASE", "gateway-startup-maintenance")
+    }
+
+    private fun recoverLegacyOpenClawGatewayLockIfNeeded(runtime: ExecutionRuntime) {
+        // Legacy proot emulates UID 0; only proroot uses the native app UID for this lock.
+        if (runtime != ExecutionRuntime.PROROOT) return
+        val rootfsDir = prorootManager.rootfsDir
+        val proof = OpenClawLegacyGatewayLockRecovery.capture(
+            rootfsDir,
+            android.os.Process.myUid(),
+            prorootManager.foreignPrivateGatewayLockOwnerProbe(),
+        ) ?: return
+        // A proof belongs to one startup attempt, never to a reusable maintenance script.
+        val script = File.createTempFile(
+            ".andclaw-legacy-gateway-lock-", ".mjs", File(rootfsDir, "root"),
+        )
+        try {
+            script.writeText(buildOpenClawLegacyGatewayLockRecoveryScript(proof))
+            val result = prorootManager.executeWithResult(
+                command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
+                    "${ProrootManager.OPENCLAW_NODE_BIN} '/root/${script.name}' 2>&1",
+                timeoutMs = 15_000L,
+                extraEnv = buildOpenClawStartupMaintenanceEnv(),
+                captureViaTempFile = true,
+                runtime = runtime,
+                returnFailureDiagnostics = true,
+            )
+            if (result == null || result.timedOut || result.exitCode != 0) {
+                val exit = result?.exitCode?.toString() ?: "unavailable"
+                val detail = result?.output?.takeLast(4_000)?.trim()
+                    .orEmpty().ifBlank { "No diagnostic output." }
+                throw IllegalStateException(
+                    "OpenClaw legacy gateway lock recovery failed (exit: $exit). $detail",
+                )
+            }
+            addLog("[andClaw] Recovered an obsolete OpenClaw gateway lock with a foreign private-store owner.")
+        } finally {
+            script.delete()
+        }
     }
 
     private fun runOpenClawExecApprovalsMigrationPreflightIfNeeded(
@@ -4180,6 +4224,7 @@ class ProcessManager(
         val installedVersion = checkNotNull(readInstalledOpenClawVersion()) {
             "Cannot determine the installed OpenClaw version before startup maintenance."
         }
+        recoverLegacyOpenClawGatewayLockIfNeeded(runtime)
         val pluginTemplateFile = File(
             prorootManager.rootfsDir,
             "root/.openclaw/andclaw-bundled-plugins/install-records.json",
@@ -4328,6 +4373,7 @@ class ProcessManager(
         val patchFile = File(prorootManager.rootfsDir, "root/.openclaw-patch.js")
         val needsUpdate = !patchFile.exists() ||
             !patchFile.readText().contains("uncaughtException") ||
+            !patchFile.readText().contains("require('node:worker_threads').isMainThread") ||
             !patchFile.readText().contains("EAFNOSUPPORT") ||
             !patchFile.readText().contains("openrouter.ai/api/v1/models") ||
             !patchFile.readText().contains("raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json") ||
@@ -4347,15 +4393,18 @@ class ProcessManager(
             addLog("[andClaw] Creating Node.js compatibility patch...")
             patchFile.parentFile?.mkdirs()
             patchFile.writeText(buildString {
-                // Prevent undici TLS null-socket crash (e.g. Telegram fetch fallback)
-                appendLine("process.on('uncaughtException', function(err) {")
-                appendLine("  if (err && err.message && err.message.includes('setServername')) {")
-                appendLine("    console.error('[openclaw-patch] Suppressed TLS crash:', err.message);")
-                appendLine("    return;")
-                appendLine("  }")
-                appendLine("  console.error('[openclaw] Uncaught exception:', err);")
-                appendLine("  process.exit(1);")
-                appendLine("});")
+                // Worker failures belong to OpenClaw's parent-side error/admission handling.
+                // Keep the undici TLS workaround on the main thread only.
+                appendLine("if (require('node:worker_threads').isMainThread) {")
+                appendLine("  process.on('uncaughtException', function(err) {")
+                appendLine("    if (err && err.message && err.message.includes('setServername')) {")
+                appendLine("      console.error('[openclaw-patch] Suppressed TLS crash:', err.message);")
+                appendLine("      return;")
+                appendLine("    }")
+                appendLine("    console.error('[openclaw] Uncaught exception:', err);")
+                appendLine("    process.exit(1);")
+                appendLine("  });")
+                appendLine("}")
                 appendLine()
                 // Block IPv6 listen in proot — dual-stack binding (::1) breaks
                 // IPv4 127.0.0.1 connectivity on Android/proot.
