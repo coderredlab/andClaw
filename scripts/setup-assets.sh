@@ -441,8 +441,7 @@ else
 
         echo '--- Installing OpenClaw ---'
         # 일부 환경에서 node-gyp가 python 경로를 자동 감지하지 못해 명시적으로 지정한다.
-        OPENCLAW_EAGER_BUNDLED_PLUGIN_DEPS=1 \
-          PYTHON=/usr/bin/python3 \
+        PYTHON=/usr/bin/python3 \
           npm_config_python=/usr/bin/python3 \
           npm install -g $OPENCLAW_INSTALL_SPEC 2>&1
 
@@ -470,12 +469,14 @@ NODE
         ; do
             if [ -d \$sdk_root/_vendor/partial-json-parser ]; then
                 mkdir -p \$sdk_root/_vendor/json-parser
-                printf '%s\n' 'module.exports = require("../partial-json-parser/parser.js");' > \$sdk_root/_vendor/json-parser/json-parser.js
-                printf '%s\n' 'export * from "../partial-json-parser/parser.mjs";' > \$sdk_root/_vendor/json-parser/json-parser.mjs
+                printf '%s\n' 'module.exports = require(\"../partial-json-parser/parser.js\");' > \$sdk_root/_vendor/json-parser/json-parser.js
+                printf '%s\n' 'export * from \"../partial-json-parser/parser.mjs\";' > \$sdk_root/_vendor/json-parser/json-parser.mjs
+                node --check \$sdk_root/_vendor/json-parser/json-parser.js
+                node --check \$sdk_root/_vendor/json-parser/json-parser.mjs
             fi
         done
 
-        echo '--- Bundled plugin runtime dependencies: installed during asset build ---'
+        # 번들 의존성은 공식 dist에 인라인될 수 있다. 위 프로브는 SQLite 기능만 검증한다.
 
         echo '--- Installing andClaw-managed external/runtime plugins ---'
         OPENCLAW_ASSET_VERSION=\"\$(node -e 'console.log(require(\"/usr/local/lib/node_modules/openclaw/package.json\").version)')\"
@@ -593,7 +594,7 @@ const { pathToFileURL } = require('node:url');
   if (!refreshPersistedInstalledPluginIndex) {
     throw new Error('No installed-plugin-index-store-write candidate exports refreshPersistedInstalledPluginIndex. Candidates tried: ' + storeModuleCandidates.join(', '));
   }
-  const index = refreshPersistedInstalledPluginIndex({
+  const index = await refreshPersistedInstalledPluginIndex({
     reason: 'source-changed',
     installRecords,
     env: {
@@ -736,7 +737,6 @@ NODE
 
     AFTER=$(find . -type f | wc -l)
     echo "   Pruned: $BEFORE -> $AFTER files"
-
 
     tar cf /tmp/openclaw-arm64.tar usr/ root/.openclaw/andclaw-bundled-plugins
     cd / && rm -rf "$PRUNE_DIR"

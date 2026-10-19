@@ -14,6 +14,7 @@ import com.coderred.andclaw.data.PairingRequest
 import com.coderred.andclaw.data.SessionLogEntry
 import com.coderred.andclaw.data.readTextFileLinesBounded
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -727,7 +728,7 @@ class ProcessManager(
             """\[gateway](?:\s|\x1B\[[0-?]*[ -/]*[@-~])+(?:gateway )?ready(?:\s|\x1B\[[0-?]*[ -/]*[@-~])*$""",
         )
         private const val DEFAULT_MEMORY_SEARCH_PROVIDER = "auto"
-        private const val OPENCLAW_PATCH_VERSION = "openclaw-patch-v13-worker-error-ownership"
+        private const val OPENCLAW_PATCH_VERSION = "openclaw-patch-v15-cancellation-provenance-diagnostics"
         private const val OPENCLAW_STARTUP_MAINTENANCE_VERSION = "v8"
         private const val OPENCLAW_STARTUP_MAINTENANCE_MARKER =
             "root/.openclaw/.andclaw-startup-maintenance"
@@ -804,7 +805,12 @@ class ProcessManager(
         val generation: Long,
         val runtime: ExecutionRuntime,
         val startedAtElapsedMs: Long,
-    )
+        val commands: StartupCommandLifetime = StartupCommandLifetime(),
+        var pendingSurvivor: GatewaySurvivorMetadata? = null,
+    ) {
+        fun hasPendingSurvivor(): Boolean =
+            pendingSurvivor?.pid?.let { it > 0 && File("/proc/$it").exists() } == true
+    }
 
     private data class RunningAttempt(
         val generation: Long,
@@ -823,6 +829,7 @@ class ProcessManager(
         val process: Process?,
         val runningAttempt: RunningAttempt?,
         val alreadyStopped: Boolean,
+        val startupWriter: StartupAttempt?,
     )
 
     private val startupAttemptLock = Any()
@@ -857,6 +864,7 @@ class ProcessManager(
     private var scope: CoroutineScope? = null
     private var startupJob: Job? = null
     private var startupAttemptGeneration: Long = 0L
+    private var startupWriter: StartupAttempt? = null
 
     private val _dashboardUrl = MutableStateFlow<String?>(null)
     val dashboardUrl: StateFlow<String?> = _dashboardUrl.asStateFlow()
@@ -917,9 +925,22 @@ class ProcessManager(
     private fun beginStartupAttemptIfAllowed(
         runtime: ExecutionRuntime,
         nowElapsedMs: Long = SystemClock.elapsedRealtime(),
-    ): StartupAttempt? = synchronized(stopLock) {
-        synchronized(startupAttemptLock) {
+    ): StartupAttempt? = synchronized(stopLock) admission@ {
+        val finishingWriter = synchronized(startupAttemptLock) {
+            startupWriter.takeIf { gatewayAttemptSnapshot.status == GatewayStatus.ERROR }
+        }
+        if (finishingWriter != null && !finishingWriter.commands.awaitQuiescent(2_000L)) {
+            return@admission null
+        }
+        synchronized(startupAttemptLock) attemptLocked@ {
             var current = gatewayAttemptSnapshot
+            val previousWriter = startupWriter
+            if (previousWriter != null) {
+                if (!previousWriter.commands.isQuiescent() || previousWriter.hasPendingSurvivor()) {
+                    return@attemptLocked null
+                }
+                startupWriter = null
+            }
             val currentPid = _gatewayState.value.pid
             if (
                 shouldClearExitedProcesslessOwnership(
@@ -947,6 +968,8 @@ class ProcessManager(
                         runtime = runtime,
                         startedAtElapsedMs = nowElapsedMs,
                     )
+                    attempt.commands.beginWork()
+                    startupWriter = attempt
                     gatewayAttemptSnapshot = GatewayAttemptSnapshot(
                         status = GatewayStatus.STARTING,
                         startupAttempt = attempt,
@@ -1104,7 +1127,7 @@ class ProcessManager(
     }
 
     /**
-     * HTTP 요청 없이 프로세스 존재 + 포트 리스닝 여부만으로 헬스 판정.
+     * HTTP 요청 없이 프로세스 존재 + 포트 점유 여부만으로 헬스 판정.
      * proot 환경에서 AI 처리 중 이벤트 루프 포화로 HTTP 응답이 지연되는 문제를 우회한다.
      */
     fun probeGatewayHealthLightweight(): Boolean {
@@ -1114,8 +1137,8 @@ class ProcessManager(
         val pid = state.pid ?: return false
         // 프로세스 존재 확인
         if (!File("/proc/$pid").exists()) return false
-        // 포트 18789에서 리스닝 중인지 확인
-        return findListeningSocketInodes(GATEWAY_PORT).isNotEmpty()
+        // /proc/net 접근 권한과 무관하게 실제 엔드포인트 점유를 확인한다.
+        return GatewayPortProbe.probe(GATEWAY_PORT) == PortOccupancy.BUSY
     }
 
     suspend fun probeGatewayHealthDirect(timeoutMs: Long = 8_000L): Boolean {
@@ -1160,11 +1183,12 @@ class ProcessManager(
         probePhase: String = "gateway-start",
         openAiConnectionMode: OpenAiConnectionMode = OpenAiConnectionMode.CODEX_SUBSCRIPTION,
         runtimeOverride: ExecutionRuntime? = null,
-    ) {
+    ): Unit = synchronized(stopLock) startLocked@ {
         val runtimeSnapshot = runtimeOverride ?: prorootManager.selectedRuntime
         // STARTING 판단과 generation 소유권 생성을 한 snapshot 전환으로 묶는다.
         // duplicate START는 전환 전이면 startup generation에, 전환 후면 running generation에 합류한다.
-        val attempt = beginStartupAttemptIfAllowed(runtimeSnapshot) ?: return
+        val attempt = beginStartupAttemptIfAllowed(runtimeSnapshot) ?: return@startLocked
+        attempt.pendingSurvivor = survivorMetadata
 
         val normalizedMemorySearchProvider = normalizeMemorySearchProvider(memorySearchProvider)
         val normalizedMemorySearchApiKey = memorySearchApiKey.trim()
@@ -1192,7 +1216,7 @@ class ProcessManager(
         scope = newScope
         addLog("[andClaw] Starting gateway...")
 
-        startupJob = newScope.launch {
+        val attemptJob = newScope.launch(start = CoroutineStart.LAZY) {
             var launchedProcess: Process? = null
             var localOutputJob: Job? = null
             var localUptimeJob: Job? = null
@@ -1200,12 +1224,15 @@ class ProcessManager(
 
             suspend fun ensureStartupAttemptStillValid() {
                 currentCoroutineContext().ensureActive()
+                attempt.commands.ensureActive()
                 if (currentStartupAttempt(attempt.generation) !== attempt) {
                     throw kotlinx.coroutines.CancellationException("Startup attempt invalidated")
                 }
             }
 
             try {
+                prorootManager.awaitPreviousStartupCommands()
+                ensureStartupAttemptStillValid()
                 val survivorPidAlive = survivorMetadata?.pid?.let { pid ->
                     pid > 0 && File("/proc/$pid").exists()
                 } == true
@@ -1246,58 +1273,68 @@ class ProcessManager(
                                 errorMessage = runtimeUnavailableMessage,
                                 pid = null,
                             )
+                            addLog("[andClaw] $runtimeUnavailableMessage")
                         }
                     }
-                    addLog("[andClaw] $runtimeUnavailableMessage")
                     return@launch
                 }
 
-                // 패치 파일이 없으면 생성
-                ensurePatchFile()
-                ensureCodexAppServerDiagnosticsWrapper()
-                // .profile에 누락된 환경변수 보충 + 캐시 디렉토리 보장 (기존 사용자 대응)
-                ensureProfileEnvVars()
-                invalidateCompileCacheIfVersionChanged()
-                cleanupStalePidCacheDirs()
+                ensureStartupAttemptStillValid()
+                attempt.commands.commitIfActive {
+                    // 패치 파일과 기존 사용자 환경을 게이트웨이 시작 전에 준비한다.
+                    ensureCodexAppServerDiagnosticsWrapper()
+                    ensureProfileEnvVars()
+                    cleanupStalePidCacheDirs()
+                }
                 ensureStartupAttemptStillValid()
 
                 // 기존 게이트웨이 인스턴스 정리 (supervised + orphan 프로세스)
-                stopSupervisedGatewayIfRunning()
+                stopSupervisedGatewayIfRunning(attempt.commands)
                 ensureStartupAttemptStillValid()
                 killOrphanGatewayProcesses()
                 ensureStartupAttemptStillValid()
+                attempt.commands.commitIfActive {
+                    ensurePatchFile()
+                    invalidateCompileCacheIfVersionChanged()
+                }
+                ensureStartupAttemptStillValid()
 
                 // config 파일 생성/갱신 (모델, 게이트웨이, 브라우저 설정)
-                ensureOpenClawConfig(
-                    apiProvider = apiProvider,
-                    openAiConnectionMode = openAiConnectionMode,
-                    apiKey = effectiveApiKey,
-                    selectedModel = selectedModel,
-                    selectedModels = selectedModels,
-                    primaryModelId = primaryModelId,
-                    openAiCompatibleBaseUrl = openAiCompatibleBaseUrl,
-                    ollamaBaseUrl = ollamaBaseUrl,
-                    modelReasoning = modelReasoning,
-                    modelImages = modelImages,
-                    modelContext = modelContext,
-                    modelMaxOutput = modelMaxOutput,
-                    memorySearchEnabled = memorySearchEnabled.takeIf { applyMemorySearchConfig },
-                    memorySearchProvider = normalizedMemorySearchProvider.takeIf { applyMemorySearchConfig },
-                    memorySearchApiKey = normalizedMemorySearchApiKey.takeIf { applyMemorySearchConfig },
-                )
+                attempt.commands.commitIfActive {
+                    ensureOpenClawConfig(
+                        apiProvider = apiProvider,
+                        openAiConnectionMode = openAiConnectionMode,
+                        apiKey = effectiveApiKey,
+                        selectedModel = selectedModel,
+                        selectedModels = selectedModels,
+                        primaryModelId = primaryModelId,
+                        openAiCompatibleBaseUrl = openAiCompatibleBaseUrl,
+                        ollamaBaseUrl = ollamaBaseUrl,
+                        modelReasoning = modelReasoning,
+                        modelImages = modelImages,
+                        modelContext = modelContext,
+                        modelMaxOutput = modelMaxOutput,
+                        memorySearchEnabled = memorySearchEnabled.takeIf { applyMemorySearchConfig },
+                        memorySearchProvider = normalizedMemorySearchProvider.takeIf { applyMemorySearchConfig },
+                        memorySearchApiKey = normalizedMemorySearchApiKey.takeIf { applyMemorySearchConfig },
+                    )
+                }
                 ensureStartupAttemptStillValid()
 
                 // 채널 설정 기록
-                ensureChannelConfig(channelConfig)
+                attempt.commands.commitIfActive { ensureChannelConfig(channelConfig) }
                 ensureStartupAttemptStillValid()
 
-                prorootManager.prepareRuntime(runtimeSnapshot)
-                val osReleaseRepair = runCatching { prorootManager.repairRootfsOsReleaseFiles() }.getOrNull()
-                if (osReleaseRepair?.changed == true) {
-                    addLog("[andClaw] Rootfs OS release repaired before gateway start: ${osReleaseRepair.diagnosticSummary()}")
+                attempt.commands.commitIfActive {
+                    prorootManager.prepareRuntime(runtimeSnapshot)
+                    prorootManager.prepareRootfsTemporaryDirectories()
+                    val osReleaseRepair = runCatching { prorootManager.repairRootfsOsReleaseFiles() }.getOrNull()
+                    if (osReleaseRepair?.changed == true) {
+                        addLog("[andClaw] Rootfs OS release repaired before gateway start: ${osReleaseRepair.diagnosticSummary()}")
+                    }
                 }
                 ensureStartupAttemptStillValid()
-                runOpenClawStartupMigrationMaintenanceIfNeeded(runtimeSnapshot)
+                runOpenClawStartupMigrationMaintenanceIfNeeded(runtimeSnapshot, attempt.commands)
                 ensureStartupAttemptStillValid()
 
                 // proot/proroot 명령어 구성
@@ -1310,6 +1347,9 @@ class ProcessManager(
                     put("LANG", "C.UTF-8")
                     put("UV_USE_IO_URING", "0")
                     put("OPENCLAW_NO_RESPAWN", "1")
+                    put("ANDCLAW_OPENCLAW_OWNERSHIP_DIAGNOSTICS", "1")
+                    put("OPENCLAW_GATEWAY_STARTUP_TRACE", "1")
+                    put("PROROOT_LINK_METADATA_TRACE", "1")
                     put("OPENCLAW_DISABLE_BONJOUR", "1")
                     put("PLAYWRIGHT_BROWSERS_PATH", "/root/.cache/ms-playwright")
                     put("RUST_LOG", ProrootManager.CODEX_RUST_LOG_FILTER)
@@ -1381,28 +1421,27 @@ class ProcessManager(
                 addLog("[andClaw] Command: ${cmd.joinToString(" ")}")
 
                 ensureStartupAttemptStillValid()
-                val acceptedProcess = synchronized(stopLock) {
-                    synchronized(startupAttemptLock) {
-                        if (
-                            gatewayAttemptSnapshot.startupAttempt !== attempt ||
-                            gatewayAttemptSnapshot.status != GatewayStatus.STARTING
-                        ) {
-                            null
-                        } else {
-                            val startedProcess = pb.start()
-                            launchedProcess = startedProcess
-                            runCatching { startedProcess.outputStream.close() }
-                            process = startedProcess
-                            startTime = System.currentTimeMillis()
-                            launchedPid = getProcessId(startedProcess)
-                            _gatewayState.value = _gatewayState.value.copy(
-                                status = GatewayStatus.STARTING,
-                                uptime = 0L,
-                                pid = launchedPid,
-                                dashboardReady = false,
-                            )
-                            startedProcess
-                        }
+                val acceptedProcess = synchronized(startupAttemptLock) {
+                    if (
+                        gatewayAttemptSnapshot.startupAttempt !== attempt ||
+                        gatewayAttemptSnapshot.status != GatewayStatus.STARTING
+                    ) {
+                        null
+                    } else {
+                        val startedProcess = pb.start()
+                        launchedProcess = startedProcess
+                        runCatching { startedProcess.outputStream.close() }
+                        process = startedProcess
+                        attempt.pendingSurvivor = null
+                        startTime = System.currentTimeMillis()
+                        launchedPid = getProcessId(startedProcess)
+                        _gatewayState.value = _gatewayState.value.copy(
+                            status = GatewayStatus.STARTING,
+                            uptime = 0L,
+                            pid = launchedPid,
+                            dashboardReady = false,
+                        )
+                        startedProcess
                     }
                 } ?: throw kotlinx.coroutines.CancellationException(
                     "Gateway stop overtook process launch",
@@ -1503,12 +1542,12 @@ class ProcessManager(
                 }
                 clearStartupAttempt(attempt)
             } catch (e: Exception) {
-                addLog("[andClaw] Error: ${e.message}")
                 synchronized(startupAttemptLock) {
                     if (
                         gatewayAttemptSnapshot.startupAttempt === attempt ||
                         gatewayAttemptSnapshot.runningAttempt?.generation == attempt.generation
                     ) {
+                        addLog("[andClaw] Error: ${e.message}")
                         val ownsLaunchedProcess =
                             launchedProcess != null &&
                                 process === launchedProcess &&
@@ -1552,6 +1591,17 @@ class ProcessManager(
                 }
             }
         }
+        startupJob = attemptJob
+        attempt.commands.bindJob(attemptJob)
+        attemptJob.invokeOnCompletion {
+            attempt.commands.finishWork()
+            synchronized(startupAttemptLock) {
+                if (startupWriter === attempt && attempt.commands.isQuiescent() && !attempt.hasPendingSurvivor()) {
+                    startupWriter = null
+                }
+            }
+        }
+        attemptJob.start()
     }
 
     internal fun clearTerminatedOwnedProcess(
@@ -1669,22 +1719,29 @@ class ProcessManager(
 
     fun stop(): ProcessStopResult = synchronized(stopLock) {
         val stopClaim = synchronized(startupAttemptLock) {
-            val currentState = _gatewayState.value
+            val pendingSurvivor = startupWriter?.pendingSurvivor
+            val currentState = _gatewayState.value.let { state ->
+                state.copy(pid = state.pid ?: pendingSurvivor?.pid?.takeIf { it > 0 })
+            }
             val managedProcess = process
             val runningAttempt = gatewayAttemptSnapshot.runningAttempt
-                ?: gatewayAttemptSnapshot.startupAttempt
-                    ?.takeIf { managedProcess != null && currentState.pid != null }
+                ?: startupWriter
+                    ?.takeIf { managedProcess != null || currentState.pid != null }
                     ?.let { attempt ->
                         RunningAttempt(
                             generation = attempt.generation,
-                            runtime = attempt.runtime,
-                            startedAtEpochMs = startTime.takeIf { it > 0L },
+                            runtime = if (managedProcess != null) attempt.runtime
+                                else pendingSurvivor?.runtime ?: attempt.runtime,
+                            startedAtEpochMs = startTime.takeIf { it > 0L }
+                                ?: pendingSurvivor?.launchedAtEpochMs,
                         )
                     }
             val alreadyStopped =
                 gatewayAttemptSnapshot.status == GatewayStatus.STOPPED &&
                     managedProcess == null &&
+                    startupWriter == null &&
                     currentState.pid == null
+            startupWriter?.commands?.invalidate()
             startupAttemptGeneration += 1
             gatewayAttemptSnapshot = GatewayAttemptSnapshot(
                 status = if (alreadyStopped) GatewayStatus.STOPPED else GatewayStatus.STOPPING,
@@ -1698,22 +1755,33 @@ class ProcessManager(
                 process = managedProcess,
                 runningAttempt = runningAttempt,
                 alreadyStopped = alreadyStopped,
+                startupWriter = startupWriter,
             )
         }
         val currentState = stopClaim.state
         val managedProcess = stopClaim.process
         val runningAttempt = stopClaim.runningAttempt
         val alreadyStopped = stopClaim.alreadyStopped
-        if (alreadyStopped) {
-            stopPreWarmedChromium()
-            return@synchronized ProcessStopResult.STOPPED
-        }
-
-        stopPreWarmedChromium()
-        addLog("[andClaw] Stopping gateway...")
+        if (!alreadyStopped) addLog("[andClaw] Stopping gateway...")
+        val startupCommandsStopped = stopClaim.startupWriter?.commands?.cancelCommand() ?: true
 
         val pidFromState = currentState.pid
+        val beforeGatewayLaunch = managedProcess == null && pidFromState == null
+        if (beforeGatewayLaunch) startupJob?.cancel()
+        val preLaunchWriterStopped = !beforeGatewayLaunch ||
+            (startupCommandsStopped &&
+                (stopClaim.startupWriter?.commands?.awaitQuiescent(2_000L) ?: true))
+        val previousCommandsStopped = startupCommandsStopped && preLaunchWriterStopped && try {
+            prorootManager.awaitPreviousStartupCommands()
+            true
+        } catch (failure: Exception) {
+            addLog("[andClaw] Startup command recovery remains unconfirmed: ${failure.message}")
+            false
+        }
+        if (previousCommandsStopped) stopPreWarmedChromium()
         val terminationConfirmed = when {
+            !previousCommandsStopped -> false
+            alreadyStopped -> true
             managedProcess != null -> {
                 terminateProcessGracefully(
                     process = managedProcess,
@@ -1740,6 +1808,9 @@ class ProcessManager(
                 }
             }
         }
+        startupJob?.cancel()
+        val startupWriterStopped = previousCommandsStopped &&
+            (stopClaim.startupWriter?.commands?.awaitQuiescent(2_000L) ?: true)
 
 
         val result = synchronized(startupAttemptLock) {
@@ -1748,11 +1819,13 @@ class ProcessManager(
                     !managedProcess.isAlive &&
                     (process === managedProcess || process == null)
             if (
+                startupWriterStopped &&
                 (terminationConfirmed || managedProcessDeathConfirmed) &&
                 (process === managedProcess || process == null)
             ) {
                 process = null
                 startTime = 0L
+                if (startupWriter === stopClaim.startupWriter) startupWriter = null
                 gatewayAttemptSnapshot = GatewayAttemptSnapshot(status = GatewayStatus.STOPPED)
                 _gatewayState.value = GatewayState(status = GatewayStatus.STOPPED)
                 ProcessStopResult.STOPPED
@@ -1763,7 +1836,11 @@ class ProcessManager(
                 )
                 _gatewayState.value = _gatewayState.value.copy(
                     status = GatewayStatus.ERROR,
-                    errorMessage = "Gateway termination could not be confirmed.",
+                    errorMessage = if (!startupWriterStopped) {
+                        "Startup maintenance termination could not be confirmed."
+                    } else {
+                        "Gateway termination could not be confirmed."
+                    },
                 )
                 ProcessStopResult.TERMINATION_UNCONFIRMED
             }
@@ -2757,6 +2834,7 @@ class ProcessManager(
      */
     private fun killOrphanGatewayProcesses() {
         var killedCount = 0
+        val protectedSupervisors = prorootManager.awaitPreviousStartupCommands()
 
         try {
             val ps = ProcessBuilder("ps", "-ef").start()
@@ -2769,6 +2847,11 @@ class ProcessManager(
                     val parts = line.trim().split("\\s+".toRegex())
                     val pid = parts.getOrNull(1)?.toIntOrNull() ?: continue
                     if (pid == android.os.Process.myPid()) continue
+                    if (pid in protectedSupervisors) continue
+                    val argv = StartupCommandRecovery.readCommandLine(File("/proc/$pid"))
+                    // No proof may be destroyed by legacy process-name cleanup.
+                    // Inaccessible cmdline is not permission to kill a reaper.
+                    if (argv == null || StartupCommandRecovery.isSupervisorCommand(argv)) continue
                     try {
                         android.os.Process.killProcess(pid)
                         addLog("[andClaw] Killing orphan process: PID $pid")
@@ -2790,18 +2873,20 @@ class ProcessManager(
         }
 
         if (!waitForPortRelease(GATEWAY_PORT, timeoutMs = 2_500L)) {
-            addLog("[andClaw] Warning: port $GATEWAY_PORT is still occupied after cleanup")
+            throw IllegalStateException("Gateway port $GATEWAY_PORT release could not be confirmed after cleanup.")
         }
     }
 
-    private fun stopSupervisedGatewayIfRunning() {
+    private fun stopSupervisedGatewayIfRunning(startupLifetime: StartupCommandLifetime? = null) {
         try {
             val result = prorootManager.executeWithResult(
                 command =
                     "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
                         "openclaw gateway stop --force",
                 timeoutMs = 15_000L,
+                startupLifetime = startupLifetime,
             )
+            startupLifetime?.ensureActive()
             when {
                 result == null ->
                     addLog("[andClaw] Supervised gateway stop request could not be started; continuing fallback cleanup")
@@ -2815,6 +2900,10 @@ class ProcessManager(
                             "(exit code ${result.exitCode}); continuing fallback cleanup",
                     )
             }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (unconfirmed: StartupCommandTerminationException) {
+            throw unconfirmed
         } catch (_: Exception) {
             addLog("[andClaw] Supervised gateway stop request failed; continuing fallback cleanup")
         }
@@ -2905,20 +2994,20 @@ class ProcessManager(
     private fun waitForPortReleaseGracefully(port: Int, timeoutMs: Long): Boolean {
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (SystemClock.elapsedRealtime() < deadline) {
-            if (findListeningSocketInodes(port).isEmpty()) return true
+            if (GatewayPortProbe.probe(port) == PortOccupancy.FREE) return true
             Thread.sleep(200)
         }
-        return findListeningSocketInodes(port).isEmpty()
+        return GatewayPortProbe.probe(port) == PortOccupancy.FREE
     }
 
     private fun waitForPortRelease(port: Int, timeoutMs: Long): Boolean {
         val deadline = SystemClock.elapsedRealtime() + timeoutMs
         while (SystemClock.elapsedRealtime() < deadline) {
-            if (findListeningSocketInodes(port).isEmpty()) return true
+            if (GatewayPortProbe.probe(port) == PortOccupancy.FREE) return true
             killProcessesHoldingPort(port)
             Thread.sleep(200)
         }
-        return findListeningSocketInodes(port).isEmpty()
+        return GatewayPortProbe.probe(port) == PortOccupancy.FREE
     }
 
     /** The app's default model controls the owner used by OpenClaw system work. */
@@ -3866,6 +3955,13 @@ class ProcessManager(
             listOf("last_prompted_at", "INTEGER", 0),
         )
 
+    private fun invalidateOpenClawStartupMaintenanceMarkerForParticipantStaging() {
+        val markerFile = File(prorootManager.rootfsDir, OPENCLAW_STARTUP_MAINTENANCE_MARKER)
+        check(!markerFile.exists() || markerFile.delete()) {
+            "Cannot invalidate OpenClaw startup maintenance before preserving participant data."
+        }
+    }
+
     internal fun stageOpenClawIdentityParticipantsForMigrationIfNeeded(): Boolean {
         val databaseFile = File(prorootManager.rootfsDir, OPENCLAW_AGENT_DATABASE_PATH)
         if (!databaseFile.isFile) return false
@@ -3878,7 +3974,10 @@ class ProcessManager(
             SQLiteDatabase.OPEN_READWRITE,
         ).use { database ->
             database.rawQuery("PRAGMA busy_timeout = 5000", null).use { it.moveToFirst() }
-            if (database.hasTable(OPENCLAW_AGENT_PARTICIPANTS_STAGING_TABLE)) return false
+            if (database.hasTable(OPENCLAW_AGENT_PARTICIPANTS_STAGING_TABLE)) {
+                invalidateOpenClawStartupMaintenanceMarkerForParticipantStaging()
+                return false
+            }
             if (!database.hasTable("session_participants")) return false
 
             val userVersion = database.rawQuery("PRAGMA user_version", null).use { cursor ->
@@ -3920,6 +4019,7 @@ class ProcessManager(
                 cursor.getLong(0)
             }
             stagedFromVersion = userVersion
+            invalidateOpenClawStartupMaintenanceMarkerForParticipantStaging()
             database.beginTransaction()
             try {
                 database.execSQL(
@@ -4055,27 +4155,34 @@ class ProcessManager(
         put("UV_USE_IO_URING", "0")
         put("NODE_COMPILE_CACHE", "/root/.cache/node-compile-cache/startup-maintenance")
         put("OPENCLAW_NO_RESPAWN", "1")
+        put("ANDCLAW_OPENCLAW_OWNERSHIP_DIAGNOSTICS", "1")
+        put("OPENCLAW_GATEWAY_STARTUP_TRACE", "1")
+        put("PROROOT_LINK_METADATA_TRACE", "1")
         put("OPENCLAW_DISABLE_BONJOUR", "1")
         put("PLAYWRIGHT_BROWSERS_PATH", "/root/.cache/ms-playwright")
+        put("ANDCLAW_STARTUP_MAINTENANCE_MARKER", "/root/.openclaw/.andclaw-startup-maintenance")
         putAll(buildOpenClawCliEnv())
         put("PROROOT_PROBE_PHASE", "gateway-startup-maintenance")
     }
 
-    private fun recoverLegacyOpenClawGatewayLockIfNeeded(runtime: ExecutionRuntime) {
-        // Legacy proot emulates UID 0; only proroot uses the native app UID for this lock.
+    private fun recoverOpenClawGatewayLocksIfNeeded(
+        runtime: ExecutionRuntime,
+        startupLifetime: StartupCommandLifetime?,
+    ) {
+        // Only proroot exposes the native app UID used by its private ownership locks.
         if (runtime != ExecutionRuntime.PROROOT) return
         val rootfsDir = prorootManager.rootfsDir
-        val proof = OpenClawLegacyGatewayLockRecovery.capture(
+        val proof = OpenClawGatewayLockRecovery.capture(
             rootfsDir,
             android.os.Process.myUid(),
             prorootManager.foreignPrivateGatewayLockOwnerProbe(),
         ) ?: return
         // A proof belongs to one startup attempt, never to a reusable maintenance script.
         val script = File.createTempFile(
-            ".andclaw-legacy-gateway-lock-", ".mjs", File(rootfsDir, "root"),
+            ".andclaw-gateway-lock-recovery-", ".mjs", File(rootfsDir, "root"),
         )
         try {
-            script.writeText(buildOpenClawLegacyGatewayLockRecoveryScript(proof))
+            script.writeText(buildOpenClawGatewayLockRecoveryScript(proof))
             val result = prorootManager.executeWithResult(
                 command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
                     "${ProrootManager.OPENCLAW_NODE_BIN} '/root/${script.name}' 2>&1",
@@ -4084,16 +4191,63 @@ class ProcessManager(
                 captureViaTempFile = true,
                 runtime = runtime,
                 returnFailureDiagnostics = true,
+                startupLifetime = startupLifetime,
             )
+            startupLifetime?.ensureActive()
             if (result == null || result.timedOut || result.exitCode != 0) {
                 val exit = result?.exitCode?.toString() ?: "unavailable"
                 val detail = result?.output?.takeLast(4_000)?.trim()
                     .orEmpty().ifBlank { "No diagnostic output." }
                 throw IllegalStateException(
-                    "OpenClaw legacy gateway lock recovery failed (exit: $exit). $detail",
+                    "OpenClaw gateway ownership recovery failed (exit: $exit). $detail",
                 )
             }
-            addLog("[andClaw] Recovered an obsolete OpenClaw gateway lock with a foreign private-store owner.")
+            addLog(
+                "[andClaw] Recovered ${proof.getJSONArray("locks").length()} OpenClaw ownership locks " +
+                    "with native-proven foreign private-store owners.",
+            )
+        } finally {
+            script.delete()
+        }
+    }
+
+    private fun runOpenClawLegacyOAuthSidecarMigrationPreflight(
+        runtime: ExecutionRuntime,
+        maintenanceEnv: Map<String, String>,
+        startupLifetime: StartupCommandLifetime?,
+    ) {
+        val rootDirectory = File(prorootManager.rootfsDir, "root")
+        check(rootDirectory.isDirectory || rootDirectory.mkdirs()) {
+            "Cannot prepare the OpenClaw credential migration script directory."
+        }
+        val script = File.createTempFile(
+            ".andclaw-oauth-sidecar-migration-", ".mjs", rootDirectory,
+        )
+        try {
+            script.writeText(buildOpenClawLegacyOAuthSidecarMigrationScript())
+            val result = prorootManager.executeWithResult(
+                command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
+                    "${ProrootManager.OPENCLAW_NODE_BIN} '/root/${script.name}' 2>&1",
+                timeoutMs = OPENCLAW_STARTUP_MAINTENANCE_TIMEOUT_MS,
+                extraEnv = maintenanceEnv,
+                captureViaTempFile = true,
+                runtime = runtime,
+                returnFailureDiagnostics = true,
+                startupLifetime = startupLifetime,
+            )
+            startupLifetime?.ensureActive()
+            result?.output
+                ?.lineSequence()
+                ?.map { it.trim() }
+                ?.filter { it.startsWith("[andClaw]") }
+                ?.forEach(::addLog)
+            if (result == null || result.timedOut || result.exitCode != 0) {
+                val exit = result?.exitCode?.toString() ?: "unavailable"
+                throw IllegalStateException(
+                    "OpenClaw OAuth credential preservation failed (exit: $exit). " +
+                        "Original credential data remains preserved for recovery.",
+                )
+            }
         } finally {
             script.delete()
         }
@@ -4102,6 +4256,7 @@ class ProcessManager(
     private fun runOpenClawExecApprovalsMigrationPreflightIfNeeded(
         runtime: ExecutionRuntime,
         maintenanceEnv: Map<String, String>,
+        startupLifetime: StartupCommandLifetime?,
     ) {
         val rootfsDir = prorootManager.rootfsDir
         val legacyFile = File(rootfsDir, OPENCLAW_EXEC_APPROVALS_LEGACY_PATH)
@@ -4123,7 +4278,9 @@ class ProcessManager(
             captureViaTempFile = true,
             runtime = runtime,
             returnFailureDiagnostics = true,
+            startupLifetime = startupLifetime,
         )
+        startupLifetime?.ensureActive()
         result?.output
             ?.lineSequence()
             ?.map { it.trim() }
@@ -4145,6 +4302,7 @@ class ProcessManager(
     private fun runOpenClawDanglingTranscriptArchiveRecoveryPreflight(
         runtime: ExecutionRuntime,
         maintenanceEnv: Map<String, String>,
+        startupLifetime: StartupCommandLifetime?,
     ) {
         val rootfsDir = prorootManager.rootfsDir
         File(rootfsDir, OPENCLAW_TRANSCRIPT_ARCHIVE_RECOVERY_SCRIPT_PATH).apply {
@@ -4162,7 +4320,9 @@ class ProcessManager(
             captureViaTempFile = true,
             runtime = runtime,
             returnFailureDiagnostics = true,
+            startupLifetime = startupLifetime,
         )
+        startupLifetime?.ensureActive()
         result?.output
             ?.lineSequence()
             ?.map { it.trim() }
@@ -4185,6 +4345,7 @@ class ProcessManager(
         runtime: ExecutionRuntime,
         maintenanceEnv: Map<String, String>,
         installedVersion: String,
+        startupLifetime: StartupCommandLifetime?,
     ) {
         try {
             val diagnostic = OpenClawAgentLeaseDiagnostics.collect(prorootManager.rootfsDir)
@@ -4201,7 +4362,9 @@ class ProcessManager(
                 captureViaTempFile = true,
                 runtime = runtime,
                 returnFailureDiagnostics = true,
+                startupLifetime = startupLifetime,
             )
+            startupLifetime?.ensureActive()
             val guest = JSONObject()
                 .put("exitCode", probe?.exitCode ?: JSONObject.NULL)
                 .put("timedOut", probe?.timedOut ?: JSONObject.NULL)
@@ -4215,16 +4378,59 @@ class ProcessManager(
             diagnostic.put("guest", guest)
             file.writeText(diagnostic.toString(2))
             addLog("[andClaw] Captured read-only agent database lease diagnostics for the error report.")
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (unconfirmed: StartupCommandTerminationException) {
+            throw unconfirmed
         } catch (error: Exception) {
             addLog("[andClaw] Agent database lease diagnostics unavailable: ${error.javaClass.simpleName}")
         }
     }
 
-    internal fun runOpenClawStartupMigrationMaintenanceIfNeeded(runtime: ExecutionRuntime) {
+    private fun initializeOpenClawPluginIndex(
+        runtime: ExecutionRuntime,
+        startupLifetime: StartupCommandLifetime?,
+    ) {
+        val script = File.createTempFile(
+            ".andclaw-plugin-index-", ".mjs", File(prorootManager.rootfsDir, "root"),
+        )
+        try {
+            script.writeText(OpenClawPluginInstallStateStore.buildInitializationScript())
+            val result = prorootManager.executeWithResult(
+                command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
+                    "${ProrootManager.OPENCLAW_NODE_BIN} '/root/${script.name}' 2>&1",
+                timeoutMs = OPENCLAW_STARTUP_MAINTENANCE_TIMEOUT_MS,
+                extraEnv = buildOpenClawStartupMaintenanceEnv(),
+                captureViaTempFile = true,
+                runtime = runtime,
+                returnFailureDiagnostics = true,
+                startupLifetime = startupLifetime,
+            )
+            startupLifetime?.ensureActive()
+            if (result == null || result.timedOut || result.exitCode != 0) {
+                val exit = result?.exitCode?.toString() ?: "unavailable"
+                val detail = result?.output?.takeLast(4_000)?.trim()
+                    .orEmpty().ifBlank { "No diagnostic output." }
+                throw IllegalStateException(
+                    "OpenClaw plugin index initialization failed (exit: $exit). $detail",
+                )
+            }
+            addLog("[andClaw] Initialized bundled plugin records in canonical SQLite.")
+        } finally {
+            script.delete()
+        }
+    }
+
+    internal fun runOpenClawStartupMigrationMaintenanceIfNeeded(
+        runtime: ExecutionRuntime,
+        startupLifetime: StartupCommandLifetime? = null,
+    ) {
+        startupLifetime?.ensureActive()
         val installedVersion = checkNotNull(readInstalledOpenClawVersion()) {
             "Cannot determine the installed OpenClaw version before startup maintenance."
         }
-        recoverLegacyOpenClawGatewayLockIfNeeded(runtime)
+        recoverOpenClawGatewayLocksIfNeeded(runtime, startupLifetime)
+        var needsPluginIndexInitialization = false
         val pluginTemplateFile = File(
             prorootManager.rootfsDir,
             "root/.openclaw/andclaw-bundled-plugins/install-records.json",
@@ -4235,6 +4441,7 @@ class ProcessManager(
                 template = JSONObject(pluginTemplateFile.readText()),
                 nowEpochMs = System.currentTimeMillis(),
             )
+            needsPluginIndexInitialization = pluginMerge.mergedRecords == 0
             if (pluginMerge.changed) {
                 addLog("[andClaw] Updated ${pluginMerge.mergedRecords} bundled plugin records before gateway startup.")
             }
@@ -4248,13 +4455,20 @@ class ProcessManager(
         )
         if (recoveredLeases > 0) {
             addLog(
-                "[andClaw] Reclaimed $recoveredLeases OpenClaw database leases " +
+                "[andClaw] Reclaimed $recoveredLeases OpenClaw ownership leases " +
                     "with impossible boot identities or foreign private-store owners.",
             )
         }
+        val maintenanceEnv = buildOpenClawStartupMaintenanceEnv()
+        stageOpenClawIdentityParticipantsForMigrationIfNeeded()
+        runOpenClawLegacyOAuthSidecarMigrationPreflight(runtime, maintenanceEnv, startupLifetime)
+        startupLifetime?.ensureActive()
+        restoreStagedOpenClawIdentityParticipantsIfNeeded()
+        if (needsPluginIndexInitialization) {
+            initializeOpenClawPluginIndex(runtime, startupLifetime)
+        }
         if (markerFile.isFile && markerFile.readText().trim() == expectedMarker) return
 
-        restoreStagedOpenClawIdentityParticipantsIfNeeded()
         if (
             OpenClawAuthProfileStore.reconcileSharedAuthRelocationConflict(
                 prorootManager.rootfsDir,
@@ -4270,9 +4484,8 @@ class ProcessManager(
             prorootManager.rootfsDir,
             "root/.cache/node-compile-cache/startup-maintenance",
         ).mkdirs()
-        val maintenanceEnv = buildOpenClawStartupMaintenanceEnv()
-        runOpenClawExecApprovalsMigrationPreflightIfNeeded(runtime, maintenanceEnv)
-        stageOpenClawIdentityParticipantsForMigrationIfNeeded()
+        runOpenClawExecApprovalsMigrationPreflightIfNeeded(runtime, maintenanceEnv, startupLifetime)
+        startupLifetime?.ensureActive()
         addLog("[andClaw] Running stopped-writer OpenClaw startup maintenance...")
         val command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
             "openclaw doctor --fix 2>&1"
@@ -4283,7 +4496,9 @@ class ProcessManager(
             captureViaTempFile = true,
             runtime = runtime,
             returnFailureDiagnostics = true,
+            startupLifetime = startupLifetime,
         )
+        startupLifetime?.ensureActive()
         restoreStagedOpenClawIdentityParticipantsIfNeeded()
         if (result == null || result.timedOut || result.exitCode != 0) {
             val exit = result?.exitCode?.toString() ?: "unavailable"
@@ -4296,7 +4511,7 @@ class ProcessManager(
                 result != null && !result.timedOut &&
                 result.output.contains("OpenClawAgentDatabaseLeaseActiveError")
             ) {
-                captureOpenClawAgentLeaseDiagnostics(runtime, maintenanceEnv, installedVersion)
+                captureOpenClawAgentLeaseDiagnostics(runtime, maintenanceEnv, installedVersion, startupLifetime)
             }
             throw IllegalStateException(
                 "OpenClaw startup maintenance failed (exit: $exit). $detail",
@@ -4306,11 +4521,16 @@ class ProcessManager(
             "OpenClaw startup maintenance did not produce the identity participant schema " +
                 "needed to restore staged data."
         }
-        runOpenClawDanglingTranscriptArchiveRecoveryPreflight(runtime, maintenanceEnv)
+        runOpenClawDanglingTranscriptArchiveRecoveryPreflight(runtime, maintenanceEnv, startupLifetime)
+        startupLifetime?.ensureActive()
 
-        markerFile.parentFile?.mkdirs()
-        markerFile.writeText(expectedMarker)
-        addLog("[andClaw] OpenClaw startup maintenance completed.")
+        val completeMaintenance = {
+            markerFile.parentFile?.mkdirs()
+            markerFile.writeText(expectedMarker)
+            addLog("[andClaw] OpenClaw startup maintenance completed.")
+        }
+        if (startupLifetime == null) completeMaintenance()
+        else startupLifetime.commitIfActive(completeMaintenance)
     }
 
     /** Clean up stale per-PID compile cache directories from previous runs. */
@@ -4371,28 +4591,32 @@ class ProcessManager(
 
     private fun ensurePatchFile() {
         val patchFile = File(prorootManager.rootfsDir, "root/.openclaw-patch.js")
-        val needsUpdate = !patchFile.exists() ||
-            !patchFile.readText().contains("uncaughtException") ||
-            !patchFile.readText().contains("require('node:worker_threads').isMainThread") ||
-            !patchFile.readText().contains("EAFNOSUPPORT") ||
-            !patchFile.readText().contains("openrouter.ai/api/v1/models") ||
-            !patchFile.readText().contains("raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json") ||
-            !patchFile.readText().contains("Module._resolveFilename") ||
-            !patchFile.readText().contains("realpathSync.native") ||
-            !patchFile.readText().contains("dns.setServers") ||
-            !patchFile.readText().contains("andclawRecordHttpMetric") ||
-            !patchFile.readText().contains("codex-http-metrics.jsonl") ||
-            patchFile.readText().contains("scheduleCodexAppServerPrewarm") ||
-            patchFile.readText().contains("OPENCLAW_PREWARM_CODEX_APP_SERVER") ||
-            patchFile.readText().contains("openclaw-codex-prewarm") ||
-            patchFile.readText().contains("_origLookup.call") ||
-            patchFile.readText().contains("_cpSpawn") ||
-            patchFile.readText().contains("handle.sync") ||
-            patchFile.readText().contains("Suppressed self-SIGSYS kill")
+        val existingPatch = if (patchFile.exists()) patchFile.readText() else null
+        val needsUpdate = existingPatch == null ||
+            !existingPatch.contains(OPENCLAW_PATCH_VERSION) ||
+            !existingPatch.contains("uncaughtException") ||
+            !existingPatch.contains("require('node:worker_threads').isMainThread") ||
+            !existingPatch.contains("EAFNOSUPPORT") ||
+            !existingPatch.contains("openrouter.ai/api/v1/models") ||
+            !existingPatch.contains("raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json") ||
+            !existingPatch.contains("Module._resolveFilename") ||
+            !existingPatch.contains("realpathSync.native") ||
+            !existingPatch.contains("dns.setServers") ||
+            !existingPatch.contains("andclawRecordHttpMetric") ||
+            !existingPatch.contains("codex-http-metrics.jsonl") ||
+            existingPatch.contains("scheduleCodexAppServerPrewarm") ||
+            existingPatch.contains("OPENCLAW_PREWARM_CODEX_APP_SERVER") ||
+            existingPatch.contains("openclaw-codex-prewarm") ||
+            existingPatch.contains("_origLookup.call") ||
+            existingPatch.contains("_cpSpawn") ||
+            existingPatch.contains("handle.sync") ||
+            existingPatch.contains("Suppressed self-SIGSYS kill")
+        prorootManager.setupOwnershipDiagnostics(forceUpdate = needsUpdate)
         if (needsUpdate) {
             addLog("[andClaw] Creating Node.js compatibility patch...")
             patchFile.parentFile?.mkdirs()
             patchFile.writeText(buildString {
+                appendLine("// $OPENCLAW_PATCH_VERSION")
                 // Worker failures belong to OpenClaw's parent-side error/admission handling.
                 // Keep the undici TLS workaround on the main thread only.
                 appendLine("if (require('node:worker_threads').isMainThread) {")
@@ -4705,6 +4929,8 @@ class ProcessManager(
                 appendLine("    });")
                 appendLine("  });")
                 appendLine("};")
+                appendLine()
+                appendLine("require('./${ProrootManager.OPENCLAW_OWNERSHIP_DIAGNOSTICS_GUEST_PATH.substringAfterLast('/')}');")
             })
         }
     }
@@ -4898,8 +5124,7 @@ class ProcessManager(
                 }
 
                 val command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
-                    "(openclaw pairing approve '${escapeSingleQuotedShell(normalizedChannel)}' '${escapeSingleQuotedShell(normalizedCode)}' 2>&1 " +
-                    "|| openclaw pairing approve --channel '${escapeSingleQuotedShell(normalizedChannel)}' --code '${escapeSingleQuotedShell(normalizedCode)}' 2>&1)"
+                    "openclaw pairing approve '${escapeSingleQuotedShell(normalizedChannel)}' '${escapeSingleQuotedShell(normalizedCode)}' 2>&1"
                 val result = prorootManager.executeWithResult(
                     command = command,
                     timeoutMs = 120_000,

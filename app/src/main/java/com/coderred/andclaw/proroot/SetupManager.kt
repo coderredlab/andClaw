@@ -20,7 +20,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
-import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
@@ -318,8 +317,7 @@ class SetupManager(
         log("   Timezone: $deviceTz")
 
         // /tmp, /var/tmp
-        File(rootfsDir, "tmp").apply { mkdirs(); setWritable(true, false) }
-        File(rootfsDir, "var/tmp").mkdirs()
+        prorootManager.prepareRootfsTemporaryDirectories()
 
         // V8 compile cache 디렉토리
         File(rootfsDir, "root/.cache/node-compile-cache").mkdirs()
@@ -640,38 +638,9 @@ class SetupManager(
             return
         }
 
-        val registryFile = File(prorootManager.rootfsDir, "root/.openclaw/plugins/installs.json")
-        registryFile.parentFile?.mkdirs()
-        if (!registryFile.exists()) {
-            registryFile.writeText(template.toString(2))
-            log("   OpenClaw bundled plugin registry installed")
-            return
-        }
-        val registry = JSONObject(registryFile.readText())
-        val installRecords = registry.optJSONObject("installRecords") ?: JSONObject().also {
-            registry.put("installRecords", it)
-        }
-
-        val merged = OpenClawPluginInstallStateStore.mergeManagedInstallRecords(installRecords, templateRecords)
-
-        listOf(
-            "version",
-            "hostContractVersion",
-            "compatRegistryVersion",
-            "migrationVersion",
-        ).forEach { key ->
-            if (!registry.has(key) && template.has(key)) {
-                registry.put(key, template.get(key))
-            }
-        }
-
-        val existingPlugins = registry.optJSONArray("plugins") ?: JSONArray()
-        registry.put(
-            "plugins",
-            OpenClawPluginInstallStateStore.mergeManagedPluginEntries(existingPlugins, template),
-        )
-        registryFile.writeText(registry.toString(2))
-        log("   OpenClaw bundled plugin records merged ($merged)")
+        // Fresh installs keep the bundled template until stopped-writer startup publishes it
+        // through OpenClaw's canonical SQLite writer. Retired JSON is never created or changed.
+        log("   OpenClaw bundled plugin records prepared for startup")
     }
 
     private fun logOpenClawSharedPluginRecordMerge(result: OpenClawPluginInstallStateStore.MergeResult) {

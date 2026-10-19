@@ -64,6 +64,54 @@ internal object OpenClawPluginInstallStateStore {
         }
     }
 
+    fun buildInitializationScript(): String = """
+        import fs from "node:fs";
+        import path from "node:path";
+        import { pathToFileURL } from "node:url";
+        const stateDir = process.env.OPENCLAW_STATE_DIR || "/root/.openclaw";
+        const dist = process.env.OPENCLAW_DIST_DIR || "/usr/local/lib/node_modules/openclaw/dist";
+        const legacy = path.join(stateDir, "plugins/installs.json");
+        try {
+          fs.lstatSync(legacy);
+          throw new Error("Legacy OpenClaw plugin install JSON must be migrated with " +
+            "OpenClaw 2026.9.5 Doctor and a pre-update backup before upgrading; source preserved.");
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+        async function load(prefix, exportName) {
+          for (const name of fs.readdirSync(dist)) {
+            if (!name.startsWith(prefix) || !/\.(mjs|js)$/.test(name)) continue;
+            const mod = await import(pathToFileURL(path.join(dist, name)).href);
+            const fn = Object.values(mod).find(value =>
+              typeof value === "function" && value.name === exportName);
+            if (fn) return fn;
+          }
+          throw new Error("Missing official export: " + exportName);
+        }
+        const readRecords = await load("installed-plugin-index-record-reader-",
+          "readPersistedInstalledPluginIndexInstallRecords");
+        const refresh = await load("installed-plugin-index-store-write-",
+          "refreshPersistedInstalledPluginIndex");
+        const template = JSON.parse(fs.readFileSync(path.join(stateDir,
+          "andclaw-bundled-plugins/install-records.json"), "utf8"));
+        const installRecords = {...await readRecords({stateDir})};
+        const ids = ["whatsapp", "discord", "codex", "brave", "zai"];
+        for (const id of ids) {
+          const record = template.installRecords?.[id];
+          if (!record) throw new Error("Bundled plugin install record missing: " + id);
+          installRecords[id] = record;
+        }
+        await refresh({reason: "source-changed", installRecords, stateDir});
+        const consumed = await readRecords({stateDir});
+        for (const id of ids) {
+          if (consumed[id]?.installPath !== installRecords[id].installPath ||
+              consumed[id]?.resolvedVersion !== installRecords[id].resolvedVersion) {
+            throw new Error("Canonical plugin install record verification failed: " + id);
+          }
+        }
+        console.log("[andClaw] Initialized bundled plugin records in canonical SQLite.");
+    """.trimIndent()
+
     fun mergeManagedInstallRecords(
         installRecords: JSONObject,
         templateRecords: JSONObject,

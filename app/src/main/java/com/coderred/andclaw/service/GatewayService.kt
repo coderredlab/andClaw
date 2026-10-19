@@ -37,6 +37,7 @@ import com.coderred.andclaw.proroot.resolveOpenAiDefaultModel
 import com.coderred.andclaw.proroot.ProcessManager
 import com.coderred.andclaw.proroot.ProcessStopResult
 import com.coderred.andclaw.receiver.GatewayWatchdogReceiver
+import com.coderred.andclaw.receiver.GatewayWatchdogRecoveryWorker
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -945,6 +946,13 @@ class GatewayService : Service() {
             return status == GatewayStatus.STOPPED || status == GatewayStatus.ERROR
         }
 
+        internal fun shouldRequestUnexpectedExitRecovery(
+            previousStatus: GatewayStatus?,
+            status: GatewayStatus,
+            desiredRunning: Boolean,
+        ): Boolean = desiredRunning &&
+            previousStatus == GatewayStatus.RUNNING && status == GatewayStatus.ERROR
+
         internal fun survivorMetadataStartupAttemptActive(
             status: GatewayStatus,
             hasActiveStartupAttempt: Boolean,
@@ -1180,6 +1188,22 @@ class GatewayService : Service() {
                     lastPersistedSurvivorStartupAttemptActive = null
                     lastPersistedSurvivorRuntime = null
                     lastPersistedSurvivorStartedAtEpochMs = null
+                }
+                if (lastGatewayStatus == GatewayStatus.RUNNING && status == GatewayStatus.ERROR) {
+                    val desiredRunning = prefs.gatewayWasRunning.first()
+                    val recover = shouldRequestUnexpectedExitRecovery(
+                        lastGatewayStatus, status, desiredRunning,
+                    )
+                    pm.appendGatewayDiagnosticLog(
+                        "[andClaw][Diag] runtime_exit desired_running=$desiredRunning " +
+                            "startup_active=$hasActiveStartupAttempt " +
+                            "action=${if (recover) "enqueue_watchdog" else "preserve_stopped_intent"}",
+                    )
+                    if (recover) {
+                        // Reuse the serialized fresh-process recovery path, including its STOP barrier.
+                        // The worker rechecks user intent before starting; this is not an in-process retry.
+                        GatewayWatchdogRecoveryWorker.enqueue(applicationContext)
+                    }
                 }
                 if (status != lastGatewayStatus) {
                     val (updatedTracker, counterAction) = advanceInAppReviewRunTracker(

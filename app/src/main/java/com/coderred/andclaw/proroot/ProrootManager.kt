@@ -1,11 +1,18 @@
 package com.coderred.andclaw.proroot
 
 import android.content.Context
+import android.os.ParcelFileDescriptor
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import android.util.Log
 import com.coderred.andclaw.data.PreferencesManager
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.StandardCopyOption
+import java.util.PriorityQueue
 import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.flow.first
@@ -24,6 +31,16 @@ class ProrootManager(
 ) {
     @Volatile
     private var activeRuntime: ExecutionRuntime = ExecutionRuntime.PROROOT
+
+    private val startupCommandBootId by lazy { StartupCommandRecovery.readBootId() }
+
+    private fun startupCommandReceiptDirectory(): File = StartupCommandRecovery.ownedReceiptDirectory(
+        context.filesDir, android.os.Process.myUid(),
+    )
+
+    internal fun awaitPreviousStartupCommands(): Set<Int> = StartupCommandRecovery(
+        startupCommandReceiptDirectory(), android.os.Process.myUid(), startupCommandBootId,
+    ).awaitQuiescent()
 
     data class CommandResult(
         val exitCode: Int,
@@ -77,6 +94,8 @@ class ProrootManager(
         const val OPENCLAW_CODEX_APP_SERVER_BIN_FALLBACK = "$CODEX_PLUGINS_BASE/$CODEX_VENDOR_SUFFIX/codex/codex"
         const val OPENCLAW_CODEX_APP_SERVER_PATH_DIR_FALLBACK = "$CODEX_PLUGINS_BASE/$CODEX_VENDOR_SUFFIX/path"
         const val OPENCLAW_CODEX_APP_SERVER_WRAPPER = "/root/.openclaw/andclaw-codex-app-server.sh"
+        const val OPENCLAW_OWNERSHIP_DIAGNOSTICS_GUEST_PATH =
+            "/root/.andclaw-openclaw-ownership-diagnostics.cjs"
         const val CODEX_RUST_LOG_PATH = "/root/.openclaw/agents/main/agent/codex-home/codex-rust.log"
         const val CODEX_RUST_LOG_FILTER =
             "info,codex_api::endpoint::responses=debug,codex_api::sse::responses=debug,codex_app_server=debug"
@@ -475,6 +494,119 @@ class ProrootManager(
         prepareRuntime(selectedRuntime)
     }
 
+    internal fun setupOwnershipDiagnostics(forceUpdate: Boolean) {
+        if (Files.isSymbolicLink(rootfsDir.toPath())) {
+            throw IOException("Ownership diagnostic rootfs is a symlink")
+        }
+        val directory = File(rootfsDir, "root").toPath()
+        Files.createDirectories(directory)
+        if (Files.isSymbolicLink(directory)) {
+            throw IOException("Ownership diagnostic source directory is a symlink")
+        }
+        val destination = directory.resolve(".andclaw-openclaw-ownership-diagnostics.cjs")
+        if (forceUpdate || !Files.isRegularFile(destination, LinkOption.NOFOLLOW_LINKS)) {
+            val temporary = Files.createTempFile(directory, ".andclaw-ownership-", ".tmp")
+            try {
+                context.assets.open("openclaw-ownership-diagnostics.cjs").use { input ->
+                    Files.newOutputStream(temporary).use { output -> input.copyTo(output) }
+                }
+                Files.move(
+                    temporary, destination,
+                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING,
+                )
+            } finally {
+                Files.deleteIfExists(temporary)
+            }
+        }
+        // Called only after the startup stopped-writer barrier; never prune a live attempt.
+        val directoryDescriptor = openOwnershipLogDirectory() ?: return
+        directoryDescriptor.use {
+            val logs = File("/proc/self/fd/${it.fd}").toPath()
+            class RetainedLog(var path: java.nio.file.Path, var modified: Long)
+            val retained = PriorityQueue<RetainedLog>(16, compareBy { it.modified })
+            val ownedName = Regex("""andclaw-ownership-\d+-\d+-[01]\.jsonl""")
+            Files.newDirectoryStream(logs, "andclaw-ownership-*.jsonl").use { entries ->
+                for (entry in entries) {
+                    if (!ownedName.matches(entry.fileName.toString())) continue
+                    val attributes = Files.readAttributes(
+                        entry, java.nio.file.attribute.BasicFileAttributes::class.java,
+                        LinkOption.NOFOLLOW_LINKS,
+                    )
+                    if (!attributes.isRegularFile ||
+                        (Files.getAttribute(entry, "unix:nlink", LinkOption.NOFOLLOW_LINKS) as Number).toLong() != 1L) continue
+                    val modified = attributes.lastModifiedTime().toMillis()
+                    if (retained.size < 16) {
+                        retained.add(RetainedLog(entry, modified))
+                    } else if (modified > retained.element().modified) {
+                        val oldest = retained.remove()
+                        Files.delete(oldest.path)
+                        oldest.path = entry
+                        oldest.modified = modified
+                        retained.add(oldest)
+                    } else {
+                        Files.delete(entry)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun openOwnershipLogDirectory(): ParcelFileDescriptor? {
+        // Canonicalize only the framework-owned parent (/data/user/0 may alias
+        // /data/data). Guest descendants remain nofollow and descriptor-pinned.
+        val parent = rootfsDir.parentFile?.canonicalFile ?: return null
+        val rootComponents = File(parent, rootfsDir.name).absolutePath.split('/').filter { it.isNotEmpty() }
+        val components = rootComponents + listOf("root", ".openclaw", "logs", "andclaw-ownership")
+        if (components.size > 64 || components.any { it == "." || it == ".." }) return null
+        // Linux O_PATH opens search-only directories; Android exposes no public constant.
+        val flags = 0x200000 or OsConstants.O_NOFOLLOW or OsConstants.O_CLOEXEC
+        fun openDirectory(path: String): ParcelFileDescriptor? {
+            val descriptor = Os.open(path, flags, 0)
+            try {
+                if (!OsConstants.S_ISDIR(Os.fstat(descriptor).st_mode)) return null
+                return ParcelFileDescriptor.dup(descriptor)
+            } finally {
+                Os.close(descriptor)
+            }
+        }
+        var directory: ParcelFileDescriptor? = null
+        try {
+            val namedRoot = Os.lstat(rootfsDir.absolutePath)
+            if (!OsConstants.S_ISDIR(namedRoot.st_mode)) return null
+            directory = openDirectory("/") ?: return null
+            for (index in components.indices) {
+                val next = openDirectory("/proc/self/fd/${checkNotNull(directory).fd}/${components[index]}")
+                    ?: return null
+                directory.close()
+                directory = next
+                if (index == rootComponents.lastIndex) {
+                    val openedRoot = Os.fstat(next.fileDescriptor)
+                    if (openedRoot.st_dev != namedRoot.st_dev || openedRoot.st_ino != namedRoot.st_ino) return null
+                }
+            }
+            return directory.also { directory = null }
+        } catch (error: ErrnoException) {
+            if (error.errno == OsConstants.ENOENT || error.errno == OsConstants.ENOTDIR ||
+                error.errno == OsConstants.ELOOP) return null
+            throw IOException("Ownership diagnostic log directory unavailable", error)
+        } finally {
+            directory?.close()
+        }
+    }
+
+
+    fun prepareRootfsTemporaryDirectories() {
+        prepareSharedTemporaryDirectory(File(rootfsDir, "tmp"))
+        prepareSharedTemporaryDirectory(File(rootfsDir, "var/tmp"))
+    }
+
+    private fun prepareSharedTemporaryDirectory(directory: File) {
+        val path = directory.toPath()
+        Files.createDirectories(path)
+        // 01777: shared write requires sticky protection for fs-safe admission.
+        Files.setAttribute(path, "unix:mode", 0x3FF, LinkOption.NOFOLLOW_LINKS)
+    }
+
     fun repairRootfsOsReleaseFiles(): OsReleaseRepairResult {
         val etcDir = File(rootfsDir, "etc").apply { mkdirs() }
         val usrLibDir = File(rootfsDir, "usr/lib").apply { mkdirs() }
@@ -717,6 +849,10 @@ class ProrootManager(
             put("PROROOT_ROOTFS", rootfsDir.absolutePath)
             put("PROROOT_GUEST_EXE", OPENCLAW_NODE_BIN)
             put("PROROOT_TMP_DIR", context.filesDir.absolutePath)
+            // Android app policy does not expose reflink or copy_file_range.
+            put("PROROOT_DISABLE_FILE_COPY_ACCELERATION", "1")
+            // The runtime proves a kernel-wide singleton PID scope before exposing its metadata.
+            put("PROROOT_ANDROID_PID_SCOPE_COMPAT", "proc-singleton-v1")
             if (guestVforkShimHostPath.exists()) {
                 put("PROROOT_GUEST_LD_PRELOAD", GUEST_VFORK_SHIM_PATH)
             }
@@ -776,13 +912,31 @@ class ProrootManager(
         captureViaTempFile: Boolean = false,
         runtime: ExecutionRuntime = currentRuntime,
         returnFailureDiagnostics: Boolean = false,
+        startupLifetime: StartupCommandLifetime? = null,
     ): CommandResult? {
         var rawCmd: List<String>? = null
         var cmd: List<String>? = null
+        var tempOutputFile: File? = null
+        var receipt: File? = null
+        var ownedCommand: SupervisedCommand? = null
         return try {
             rawCmd = buildProrootCommand(command, runtime)
             cmd = if (wrapInHostShell) buildHostShellWrappedCommand(rawCmd) else rawCmd
-            val tempOutputFile = if (captureViaTempFile) File.createTempFile("proroot-capture-", ".log", context.cacheDir) else null
+            if (startupLifetime != null) {
+                startupLifetime.ensureActive()
+                receipt = File.createTempFile(
+                    "${StartupCommandRecovery.RECEIPT_PREFIX}$startupCommandBootId-", ".receipt",
+                    startupCommandReceiptDirectory(),
+                )
+                android.system.Os.chmod(receipt.absolutePath, 0x180) // 0600, native receipt contract
+                cmd = listOf(
+                    prorootBinaryPath, "--supervise-command",
+                    android.os.Process.myPid().toString(), receipt.absolutePath, "--",
+                ) + cmd
+            }
+            tempOutputFile = if (captureViaTempFile || startupLifetime != null) {
+                File.createTempFile("proroot-capture-", ".log", context.cacheDir)
+            } else null
             val pb = ProcessBuilder(cmd)
                 .redirectErrorStream(true)
                 .redirectInput(devNull)
@@ -792,17 +946,46 @@ class ProrootManager(
             }
             android.util.Log.d("ProrootManager", "exec: cmd_size=${cmd.size} cmd=${cmd.map { "[$it]" }}")
             android.util.Log.d("ProrootManager", "exec: PROROOT_LIB_PATH=${pb.environment()["PROROOT_LIB_PATH"]}")
-            val process = pb.start()
+            val process = if (startupLifetime == null) pb.start() else {
+                startupLifetime.launch(pb, checkNotNull(receipt)).also { ownedCommand = it }.process
+            }
             runCatching { process.outputStream.close() }
 
-            val finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            val finished = if (startupLifetime == null) {
+                process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+            } else {
+                val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+                var exited = false
+                while (!exited) {
+                    startupLifetime.ensureActive()
+                    val remaining = deadline - System.nanoTime()
+                    if (remaining <= 0) break
+                    exited = process.waitFor(
+                        minOf(remaining, TimeUnit.MILLISECONDS.toNanos(100)), TimeUnit.NANOSECONDS,
+                    )
+                }
+                exited
+            }
             if (!finished) {
-                process.destroyForcibly()
+                if (startupLifetime != null) {
+                    if (!startupLifetime.terminateCommand()) startupLifetime.failTermination()
+                } else {
+                    process.destroyForcibly()
+                    check(process.waitFor(2_000, TimeUnit.MILLISECONDS)) {
+                        "Command termination could not be confirmed."
+                    }
+                }
                 return CommandResult(
                     exitCode = -1,
                     output = readCommandOutput(tempOutputFile, process),
                     timedOut = true,
                 )
+            }
+            if (startupLifetime != null) {
+                if (!startupLifetime.release(checkNotNull(ownedCommand))) {
+                    startupLifetime.failTermination()
+                }
+                startupLifetime.ensureActive()
             }
 
             val output = readCommandOutput(tempOutputFile, process)
@@ -814,6 +997,11 @@ class ProrootManager(
                 exitCode = process.exitValue(),
                 output = output,
             )
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            startupLifetime?.cancelCommand()
+            throw cancelled
+        } catch (unconfirmed: StartupCommandTerminationException) {
+            throw unconfirmed
         } catch (e: Exception) {
             Log.e("ProrootManager", "executeWithResult failed: ${e.message}", e)
             if (returnFailureDiagnostics) {
@@ -831,6 +1019,13 @@ class ProrootManager(
             } else {
                 null
             }
+        } finally {
+            val owned = ownedCommand
+            val terminationUnconfirmed = owned != null && startupLifetime != null &&
+                !startupLifetime.release(owned) && !startupLifetime.terminateCommand()
+            if (owned == null) receipt?.delete()
+            tempOutputFile?.delete()
+            if (terminationUnconfirmed) checkNotNull(startupLifetime).failTermination()
         }
     }
 

@@ -13,6 +13,7 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Paths
 import kotlin.coroutines.coroutineContext
 
@@ -211,8 +212,14 @@ object ArchiveUtils {
     }
 
     private fun setFilePermissions(file: File, mode: Int) {
+        val isDirectory = file.isDirectory
+        if (isDirectory && (mode and 0x200) != 0) {
+            // Retain extraction's 0755 minimum while preserving sticky/shared bits.
+            Files.setAttribute(file.toPath(), "unix:mode", (mode and 0x3FF) or 0x1ED, LinkOption.NOFOLLOW_LINKS)
+            return
+        }
         // owner/group/other execute bit: 0111 = 0x49
-        val isExecutable = file.isDirectory || (mode and 73) != 0 // 0111 in octal = 73 in decimal
+        val isExecutable = isDirectory || (mode and 73) != 0 // 0111 in octal = 73 in decimal
         file.setReadable(true, false)
         file.setExecutable(isExecutable, false)
         file.setWritable(true, true)

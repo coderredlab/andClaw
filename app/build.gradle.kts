@@ -17,6 +17,7 @@ val keystoreProperties = Properties().apply {
 android {
     namespace = "com.coderred.andclaw"
     compileSdk = 36
+    ndkVersion = "28.0.13004108"
 
     signingConfigs {
         getByName("debug") {
@@ -37,13 +38,20 @@ android {
         applicationId = "com.coderred.andclaw"
         minSdk = 26
         targetSdk = 36
-        versionCode = 331
-        versionName = "2.3.24"
+        versionCode = 354
+        versionName = "2.3.47"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 
@@ -201,6 +209,57 @@ tasks.register<Test>("testDebugUnitTest") {
     val prodDebugTask = tasks.named<Test>("testProdDebugUnitTest").get()
     testClassesDirs = prodDebugTask.testClassesDirs
     classpath = prodDebugTask.classpath
+}
+
+// Exercise the production JNI reader on the host; each Test JVM gets its own build output.
+val gatewaySnapshotTestNames = android.productFlavors.flatMap { flavor ->
+    android.buildTypes.map { buildType ->
+        "test${flavor.name.replaceFirstChar { it.uppercaseChar() }}${buildType.name.replaceFirstChar { it.uppercaseChar() }}UnitTest"
+    }
+} + "testDebugUnitTest"
+val gatewaySnapshotSources = fileTree("src/main/cpp") {
+    include("CMakeLists.txt", "*.c")
+}
+val gatewaySnapshotCmake = android.sdkDirectory.resolve("cmake/3.22.1/bin/cmake")
+val gatewaySnapshotNinja = android.sdkDirectory.resolve("cmake/3.22.1/bin/ninja")
+val gatewaySnapshotLibraryProperty = "andclaw.gatewayLockSnapshotLibrary"
+
+gatewaySnapshotTestNames.forEach { testName ->
+    val suffix = testName.replaceFirstChar { it.uppercaseChar() }
+    val hostDirectory = layout.buildDirectory.dir("intermediates/gatewaySnapshotHost/$testName")
+    val hostLibrary = hostDirectory.map { it.file("library/libgateway-lock-snapshot.so") }
+    val configureNative = tasks.register<Exec>("configureGatewaySnapshotHost$suffix") {
+        inputs.files(gatewaySnapshotSources)
+        inputs.property("javaHome", System.getProperty("java.home"))
+        outputs.file(hostDirectory.map { it.file("CMakeCache.txt") })
+        environment("JAVA_HOME", System.getProperty("java.home"))
+        commandLine(
+            gatewaySnapshotCmake.absolutePath, "-S", file("src/main/cpp").absolutePath,
+            "-B", hostDirectory.get().asFile.absolutePath, "-G", "Ninja",
+            "-DCMAKE_MAKE_PROGRAM=${gatewaySnapshotNinja.absolutePath}",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=${hostLibrary.get().asFile.parentFile.absolutePath}",
+        )
+    }
+    val buildNative = tasks.register<Exec>("buildGatewaySnapshotHost$suffix") {
+        dependsOn(configureNative)
+        inputs.files(gatewaySnapshotSources)
+        outputs.file(hostLibrary)
+        commandLine(gatewaySnapshotCmake.absolutePath, "--build", hostDirectory.get().asFile.absolutePath)
+    }
+    tasks.withType<Test>().matching { it.name == testName }.configureEach {
+        dependsOn(buildNative)
+        doFirst {
+            if (!systemProperties.containsKey(gatewaySnapshotLibraryProperty) &&
+                jvmArgs.orEmpty().none { it.startsWith("-D$gatewaySnapshotLibraryProperty=") }
+            ) {
+                systemProperty(
+                    gatewaySnapshotLibraryProperty,
+                    System.getProperty(gatewaySnapshotLibraryProperty) ?: hostLibrary.get().asFile.absolutePath,
+                )
+            }
+        }
+    }
 }
 
 tasks.register("connectedDebugAndroidTest") {

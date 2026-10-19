@@ -18,14 +18,14 @@ internal object OpenClawPrivateStoreOwner {
         rootfsDir: File,
     ): ((Int, String) -> Boolean)? {
         val proof = prove(context, rootfsDir) ?: return null
-        val guestLockPath = "/tmp/openclaw-${proof.uid}/${OpenClawLegacyGatewayLockRecovery.LOCK_NAME}"
-        val configFile = File(proof.root, OpenClawLegacyGatewayLockRecovery.CONFIG_PATH.removePrefix("/"))
-        val lockFile = File(proof.root, guestLockPath.removePrefix("/"))
+        val allowedPaths = OpenClawGatewayLockRecovery.allowedLockPaths(proof.uid).keys
+        val configFile = File(proof.root, OpenClawGatewayLockRecovery.CONFIG_PATH.removePrefix("/"))
+        val databaseFile = File(proof.root, OpenClawGatewayLockRecovery.DATABASE_PATH.removePrefix("/"))
         try {
             // The guest and native host must resolve the same regular files without a symlink.
             if (rootfsDir.canonicalFile != proof.root ||
                 !proof.isCanonicalPrivateRegularFile(configFile) ||
-                !proof.isCanonicalPrivateRegularFile(lockFile)
+                !proof.isCanonicalPrivateFileOrMissing(databaseFile)
             ) return null
         } catch (_: IOException) {
             return null
@@ -36,10 +36,11 @@ internal object OpenClawPrivateStoreOwner {
         }
         return { pid, guestPath ->
             try {
-                guestPath == guestLockPath &&
+                guestPath in allowedPaths &&
                     rootfsDir.canonicalFile == proof.root &&
                     proof.isCanonicalPrivateRegularFile(configFile) &&
-                    proof.isCanonicalPrivateRegularFile(lockFile) &&
+                    proof.isCanonicalPrivateFileOrMissing(databaseFile) &&
+                    proof.isCanonicalPrivateRegularFile(File(proof.root, guestPath.removePrefix("/"))) &&
                     proof.isForeignOwner(pid)
             } catch (_: IOException) {
                 false
@@ -74,8 +75,20 @@ internal object OpenClawPrivateStoreOwner {
                 file.path.startsWith(root.path + File.separator) &&
                 isPrivateRegularFile(file)
 
+        fun isCanonicalPrivateFileOrMissing(file: File): Boolean {
+            if (file.absoluteFile != file.canonicalFile ||
+                !file.path.startsWith(root.path + File.separator)
+            ) return false
+            return try {
+                Os.lstat(file.path)
+                isPrivateRegularFile(file)
+            } catch (error: ErrnoException) {
+                error.errno == OsConstants.ENOENT
+            }
+        }
+
         fun isForeignOwner(pid: Int): Boolean {
-            if (pid <= 0) return false
+            if (pid <= 0 || pid == Process.myPid()) return false
             // A live same-UID process succeeds even if /proc is unreadable. EACCES stays unknown.
             return try {
                 Os.kill(pid, 0)
