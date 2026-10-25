@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.work.CoroutineWorker
@@ -55,12 +56,12 @@ class GatewayWatchdogRecoveryWorker(
                 ExecutionRuntime.PROROOT,
             ),
             runningUptimeSeconds: Long = Long.MAX_VALUE,
+            startupDeadlineExpired: Boolean? = null,
         ): RecoveryAction {
-            if (startupAttemptActive && startupUptimeSeconds < startupGracePeriodSeconds) {
+            if (status == GatewayStatus.STOPPING) return RecoveryAction.NONE
+            val startupExpired = startupDeadlineExpired ?: (startupUptimeSeconds >= startupGracePeriodSeconds)
+            if (startupAttemptActive && !startupExpired) {
                 return RecoveryAction.NONE
-            }
-            if (startupAttemptActive && startupUptimeSeconds >= startupGracePeriodSeconds) {
-                return RecoveryAction.RESTART
             }
 
             return when (status) {
@@ -77,7 +78,7 @@ class GatewayWatchdogRecoveryWorker(
                     }
                 }
                 GatewayStatus.STARTING -> {
-                    if (startupUptimeSeconds >= startupGracePeriodSeconds) {
+                    if (startupExpired) {
                         RecoveryAction.RESTART
                     } else {
                         RecoveryAction.NONE
@@ -150,6 +151,11 @@ class GatewayWatchdogRecoveryWorker(
             startupUptimeSeconds = startupAttemptAgeSeconds ?: 0L,
             startupGracePeriodSeconds = startupGracePeriodSeconds,
             runningUptimeSeconds = runningUptimeSeconds,
+            startupDeadlineExpired = GatewayWatchdogReceiver.resolveLiveStartupDeadlineExpired(
+                state = gatewayState,
+                runtime = runtime,
+                nowElapsedMs = SystemClock.elapsedRealtime(),
+            ),
         )
         val needsRecovery = recoveryAction != RecoveryAction.NONE
         if (!needsRecovery) {

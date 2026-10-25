@@ -733,6 +733,8 @@ class ProcessManager(
         private const val OPENCLAW_STARTUP_MAINTENANCE_MARKER =
             "root/.openclaw/.andclaw-startup-maintenance"
         private const val OPENCLAW_STARTUP_MAINTENANCE_TIMEOUT_MS = 300_000L
+        private const val OPENCLAW_DOCTOR_COMPLETION_OUTPUT_LINE = "Doctor complete."
+        private const val OPENCLAW_DOCTOR_CLEANUP_GRACE_MS = 10_000L
         private const val OPENCLAW_EXEC_APPROVALS_LEGACY_PATH =
             "root/.openclaw/exec-approvals.json"
         private const val OPENCLAW_EXEC_APPROVALS_CLAIM_PATH =
@@ -978,6 +980,11 @@ class ProcessManager(
                         status = GatewayStatus.STARTING,
                         uptime = 0L,
                         errorMessage = null,
+                        pid = null,
+                        dashboardReady = false,
+                        startupAttemptGeneration = attempt.generation,
+                        startupStartedAtElapsedMs = attempt.startedAtElapsedMs,
+                        gatewayStartedAtElapsedMs = -1L,
                     )
                     attempt
                 }
@@ -1349,7 +1356,6 @@ class ProcessManager(
                     put("OPENCLAW_NO_RESPAWN", "1")
                     put("ANDCLAW_OPENCLAW_OWNERSHIP_DIAGNOSTICS", "1")
                     put("OPENCLAW_GATEWAY_STARTUP_TRACE", "1")
-                    put("PROROOT_LINK_METADATA_TRACE", "1")
                     put("OPENCLAW_DISABLE_BONJOUR", "1")
                     put("PLAYWRIGHT_BROWSERS_PATH", "/root/.cache/ms-playwright")
                     put("RUST_LOG", ProrootManager.CODEX_RUST_LOG_FILTER)
@@ -1429,6 +1435,7 @@ class ProcessManager(
                         null
                     } else {
                         val startedProcess = pb.start()
+                        val gatewayStartedAtElapsedMs = SystemClock.elapsedRealtime()
                         launchedProcess = startedProcess
                         runCatching { startedProcess.outputStream.close() }
                         process = startedProcess
@@ -1440,6 +1447,7 @@ class ProcessManager(
                             uptime = 0L,
                             pid = launchedPid,
                             dashboardReady = false,
+                            gatewayStartedAtElapsedMs = gatewayStartedAtElapsedMs,
                         )
                         startedProcess
                     }
@@ -4157,7 +4165,6 @@ class ProcessManager(
         put("OPENCLAW_NO_RESPAWN", "1")
         put("ANDCLAW_OPENCLAW_OWNERSHIP_DIAGNOSTICS", "1")
         put("OPENCLAW_GATEWAY_STARTUP_TRACE", "1")
-        put("PROROOT_LINK_METADATA_TRACE", "1")
         put("OPENCLAW_DISABLE_BONJOUR", "1")
         put("PLAYWRIGHT_BROWSERS_PATH", "/root/.cache/ms-playwright")
         put("ANDCLAW_STARTUP_MAINTENANCE_MARKER", "/root/.openclaw/.andclaw-startup-maintenance")
@@ -4488,7 +4495,7 @@ class ProcessManager(
         startupLifetime?.ensureActive()
         addLog("[andClaw] Running stopped-writer OpenClaw startup maintenance...")
         val command = "export NODE_OPTIONS='--require /root/.openclaw-patch.js' && " +
-            "openclaw doctor --fix 2>&1"
+            "openclaw doctor --fix --non-interactive --no-workspace-suggestions 2>&1"
         val result = prorootManager.executeWithResult(
             command = command,
             timeoutMs = OPENCLAW_STARTUP_MAINTENANCE_TIMEOUT_MS,
@@ -4497,6 +4504,12 @@ class ProcessManager(
             runtime = runtime,
             returnFailureDiagnostics = true,
             startupLifetime = startupLifetime,
+            successfulOutputLine = startupLifetime?.let {
+                OPENCLAW_DOCTOR_COMPLETION_OUTPUT_LINE
+            },
+            successfulOutputGraceMs = startupLifetime?.let {
+                OPENCLAW_DOCTOR_CLEANUP_GRACE_MS
+            } ?: 0,
         )
         startupLifetime?.ensureActive()
         restoreStagedOpenClawIdentityParticipantsIfNeeded()
@@ -4515,6 +4528,12 @@ class ProcessManager(
             }
             throw IllegalStateException(
                 "OpenClaw startup maintenance failed (exit: $exit). $detail",
+            )
+        }
+        if (result.completedByOutputLine) {
+            addLog(
+                "[andClaw] OpenClaw Doctor completed; confirmed cleanup of its lingering " +
+                    "command tree after the grace period.",
             )
         }
         check(!hasStagedOpenClawIdentityParticipants()) {

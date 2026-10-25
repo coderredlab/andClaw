@@ -32,7 +32,7 @@ ASSETS_DIR="$PROJECT_DIR/install_time_assets/src/main/assets"
 
 # URLs & Versions
 ROOTFS_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.3-base-arm64.tar.gz"
-NODEJS_VERSION="v24.18.0"
+NODEJS_VERSION="v24.22.1"
 NODEJS_URL="https://nodejs.org/dist/$NODEJS_VERSION/node-$NODEJS_VERSION-linux-arm64.tar.gz"
 PLAYWRIGHT_VERSION="1.49.1"
 BUNDLE_FINGERPRINT_NEEDS_UPDATE="false"

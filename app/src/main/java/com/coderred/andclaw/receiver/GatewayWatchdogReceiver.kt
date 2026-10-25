@@ -8,8 +8,10 @@ import android.content.Intent
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
+import com.coderred.andclaw.data.GatewayState
 import com.coderred.andclaw.data.GatewayStatus
 import com.coderred.andclaw.data.PreferencesManager
+import com.coderred.andclaw.data.gatewayStartupDeadlineElapsedMs
 import com.coderred.andclaw.data.resolveGatewaySurvivorRuntime
 import com.coderred.andclaw.data.resolveGatewaySurvivorStartupAttemptAgeSeconds
 import com.coderred.andclaw.proroot.ExecutionRuntime
@@ -78,6 +80,18 @@ class GatewayWatchdogReceiver : BroadcastReceiver() {
             }
         }
 
+        internal fun resolveLiveStartupDeadlineExpired(
+            state: GatewayState?,
+            runtime: ExecutionRuntime,
+            nowElapsedMs: Long,
+        ): Boolean? {
+            if (runtime != ExecutionRuntime.PROROOT || state?.status != GatewayStatus.STARTING) {
+                return null
+            }
+            val deadlineElapsedMs = gatewayStartupDeadlineElapsedMs(state)
+            return if (deadlineElapsedMs >= 0L) nowElapsedMs >= deadlineElapsedMs else null
+        }
+
         internal data class RecoveryDecision(
             val needsRecovery: Boolean,
             val nextRunningUnhealthyFailures: Int,
@@ -92,18 +106,18 @@ class GatewayWatchdogReceiver : BroadcastReceiver() {
             startupGracePeriodSeconds: Long = STARTING_RECOVERY_GRACE_PERIOD_SECONDS,
             previousRunningUnhealthyFailures: Int = 0,
             runningUnhealthyRecoveryThreshold: Int = RUNNING_UNHEALTHY_RECOVERY_THRESHOLD,
+            startupDeadlineExpired: Boolean? = null,
         ): RecoveryDecision {
-            if (startupAttemptActive && startupUptimeSeconds < startupGracePeriodSeconds) {
-                // 시작 시도 중이고 grace period 내 → 서비스 재생성/재시작 중일 수 있으므로 복구하지 않음
+            if (status == GatewayStatus.STOPPING) {
                 return RecoveryDecision(
                     needsRecovery = false,
                     nextRunningUnhealthyFailures = 0,
                 )
             }
-            if (startupAttemptActive && startupUptimeSeconds >= startupGracePeriodSeconds) {
-                // grace period 초과 → 시작 실패로 판단
+            val startupExpired = startupDeadlineExpired ?: (startupUptimeSeconds >= startupGracePeriodSeconds)
+            if (startupAttemptActive && !startupExpired) {
                 return RecoveryDecision(
-                    needsRecovery = true,
+                    needsRecovery = false,
                     nextRunningUnhealthyFailures = 0,
                 )
             }
@@ -137,7 +151,7 @@ class GatewayWatchdogReceiver : BroadcastReceiver() {
                     }
                 }
                 GatewayStatus.STARTING -> {
-                    if (startupUptimeSeconds >= startupGracePeriodSeconds) {
+                    if (startupExpired) {
                         RecoveryDecision(
                             needsRecovery = true,
                             nextRunningUnhealthyFailures = 0,
@@ -253,6 +267,11 @@ class GatewayWatchdogReceiver : BroadcastReceiver() {
                     startupUptimeSeconds = startupAttemptAgeSeconds ?: 0L,
                     startupGracePeriodSeconds = startupGracePeriodSeconds,
                     previousRunningUnhealthyFailures = previousRunningUnhealthyFailures,
+                    startupDeadlineExpired = resolveLiveStartupDeadlineExpired(
+                        state = gatewayState,
+                        runtime = runtime,
+                        nowElapsedMs = SystemClock.elapsedRealtime(),
+                    ),
                 )
                 runningUnhealthyFailures.set(decision.nextRunningUnhealthyFailures)
 

@@ -134,7 +134,9 @@ fun DashboardScreen(
     val runtimeChangeGuidanceDialog by viewModel.runtimeChangeGuidanceDialog.collectAsState()
     val setupState by viewModel.setupState.collectAsState()
     val context = LocalContext.current
-    KeepScreenOnEffect(enabled = bundleActionInProgress)
+    KeepScreenOnEffect(
+        enabled = bundleActionInProgress || gatewayUiState.status == GatewayStatus.STARTING,
+    )
 
     var showApiKeyWarning by remember { mutableStateOf(false) }
     var apiKeyWarningProvider by remember { mutableStateOf<String?>(null) }

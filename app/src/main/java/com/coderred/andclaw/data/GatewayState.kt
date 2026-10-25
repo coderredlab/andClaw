@@ -19,6 +19,9 @@ data class GatewayState(
     val pid: Int? = null,
     val channelStatus: ChannelStatus = ChannelStatus(),
     val dashboardReady: Boolean = false,
+    val startupAttemptGeneration: Long = -1L,
+    val startupStartedAtElapsedMs: Long = -1L,
+    val gatewayStartedAtElapsedMs: Long = -1L,
 )
 
 data class SetupState(

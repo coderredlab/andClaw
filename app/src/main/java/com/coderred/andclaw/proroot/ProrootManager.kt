@@ -8,6 +8,9 @@ import android.system.OsConstants
 import android.util.Log
 import com.coderred.andclaw.data.PreferencesManager
 import java.io.File
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.InputStream
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.LinkOption
@@ -46,7 +49,58 @@ class ProrootManager(
         val exitCode: Int,
         val output: String,
         val timedOut: Boolean = false,
+        val completedByOutputLine: Boolean = false,
     )
+
+    private class AppendedOutputLineObserver(
+        private val input: InputStream,
+        private val expectedLine: String,
+    ) : Closeable {
+        private val readBuffer = ByteArray(4_096)
+        private val lineBuffer = ByteArrayOutputStream(256)
+        private var discardingOversizedLine = false
+
+        fun poll(): Boolean {
+            while (input.available() > 0) {
+                val count = input.read(readBuffer, 0, minOf(readBuffer.size, input.available()))
+                if (count <= 0) break
+                for (index in 0 until count) {
+                    val byte = readBuffer[index]
+                    if (byte == '\n'.code.toByte()) {
+                        val matches = !discardingOversizedLine && matchesExpectedLine()
+                        lineBuffer.reset()
+                        discardingOversizedLine = false
+                        if (matches) return true
+                    } else if (!discardingOversizedLine) {
+                        if (lineBuffer.size() < MAX_OBSERVED_OUTPUT_LINE_BYTES) {
+                            lineBuffer.write(byte.toInt())
+                        } else {
+                            lineBuffer.reset()
+                            discardingOversizedLine = true
+                        }
+                    }
+                }
+            }
+            return false
+        }
+
+        private fun matchesExpectedLine(): Boolean {
+            val plain = ANSI_ESCAPE_SEQUENCE.replace(
+                lineBuffer.toString(Charsets.UTF_8.name()),
+                "",
+            ).trim()
+            if (plain == expectedLine) return true
+            if (!plain.startsWith('└')) return false
+            return plain.drop(1).trimStart() == expectedLine
+        }
+
+        override fun close() = input.close()
+
+        companion object {
+            private const val MAX_OBSERVED_OUTPUT_LINE_BYTES = 1_024
+            private val ANSI_ESCAPE_SEQUENCE = Regex("\\u001B\\[[0-?]*[ -/]*[@-~]")
+        }
+    }
 
     data class OsReleaseRepairResult(
         val changed: Boolean,
@@ -78,7 +132,7 @@ class ProrootManager(
         const val ROOTFS_ASSET = "rootfs.tar.gz.bin"
 
         // Node.js 24 LTS arm64 linux (bundled in assets)
-        const val NODEJS_VERSION = "v24.2.0"
+        const val NODEJS_VERSION = "v24.22.1"
         const val NODEJS_ASSET = "node-arm64.tar.gz.bin"
         const val NODEJS_DIR_NAME = "node-$NODEJS_VERSION-linux-arm64"
 
@@ -913,6 +967,8 @@ class ProrootManager(
         runtime: ExecutionRuntime = currentRuntime,
         returnFailureDiagnostics: Boolean = false,
         startupLifetime: StartupCommandLifetime? = null,
+        successfulOutputLine: String? = null,
+        successfulOutputGraceMs: Long = 0,
     ): CommandResult? {
         var rawCmd: List<String>? = null
         var cmd: List<String>? = null
@@ -951,33 +1007,72 @@ class ProrootManager(
             }
             runCatching { process.outputStream.close() }
 
-            val finished = if (startupLifetime == null) {
-                process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-            } else {
-                val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
-                var exited = false
-                while (!exited) {
-                    startupLifetime.ensureActive()
-                    val remaining = deadline - System.nanoTime()
-                    if (remaining <= 0) break
-                    exited = process.waitFor(
-                        minOf(remaining, TimeUnit.MILLISECONDS.toNanos(100)), TimeUnit.NANOSECONDS,
-                    )
+            val outputObserver = successfulOutputLine?.let { expectedLine ->
+                require(startupLifetime != null) {
+                    "Successful output completion requires supervised startup command ownership."
                 }
-                exited
+                require(captureViaTempFile) {
+                    "Successful output completion requires temporary-file capture."
+                }
+                require(successfulOutputGraceMs >= 0) {
+                    "Successful output completion grace must not be negative."
+                }
+                AppendedOutputLineObserver(checkNotNull(tempOutputFile).inputStream(), expectedLine)
+            }
+            var completionObservedAtNanos: Long? = null
+            val finished = try {
+                if (startupLifetime == null) {
+                    process.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
+                } else {
+                    val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+                    var exited = false
+                    while (!exited) {
+                        startupLifetime.ensureActive()
+                        val now = System.nanoTime()
+                        if (completionObservedAtNanos == null && outputObserver?.poll() == true) {
+                            completionObservedAtNanos = now
+                            android.util.Log.i(
+                                "ProrootManager",
+                                "Observed supervised command completion output; allowing cleanup grace.",
+                            )
+                        }
+                        val completionDeadline = completionObservedAtNanos?.let {
+                            it + TimeUnit.MILLISECONDS.toNanos(successfulOutputGraceMs)
+                        }
+                        val waitDeadline = completionDeadline?.let { minOf(deadline, it) } ?: deadline
+                        val remaining = waitDeadline - now
+                        if (remaining <= 0) break
+                        exited = process.waitFor(
+                            minOf(remaining, TimeUnit.MILLISECONDS.toNanos(100)),
+                            TimeUnit.NANOSECONDS,
+                        )
+                    }
+                    exited
+                }
+            } finally {
+                outputObserver?.close()
             }
             if (!finished) {
                 if (startupLifetime != null) {
                     if (!startupLifetime.terminateCommand()) startupLifetime.failTermination()
+                    startupLifetime.ensureActive()
                 } else {
                     process.destroyForcibly()
                     check(process.waitFor(2_000, TimeUnit.MILLISECONDS)) {
                         "Command termination could not be confirmed."
                     }
                 }
+                val output = readCommandOutput(tempOutputFile, process)
+                if (completionObservedAtNanos != null) {
+                    return CommandResult(
+                        exitCode = 0,
+                        output = output,
+                        completedByOutputLine = true,
+                    )
+                }
                 return CommandResult(
                     exitCode = -1,
-                    output = readCommandOutput(tempOutputFile, process),
+                    output = output,
                     timedOut = true,
                 )
             }
